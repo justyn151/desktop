@@ -144,6 +144,7 @@ typedef struct {
 	struct wl_listener commit;
 	struct wl_listener map;
 	struct wl_listener maximize;
+	struct wl_listener move;
 	struct wl_listener unmap;
 	struct wl_listener destroy;
 	struct wl_listener set_title;
@@ -276,6 +277,7 @@ static void arrangelayer(Monitor *m, struct wl_list *list,
 		struct wlr_box *usable_area, int exclusive);
 static void arrangelayers(Monitor *m);
 static void axisnotify(struct wl_listener *listener, void *data);
+static void beginmove(Client *c);
 static void buttonpress(struct wl_listener *listener, void *data);
 static void capturerequest(struct wl_listener *listener, void *data);
 static void chvt(const Arg *arg);
@@ -353,6 +355,7 @@ static void rendermon(struct wl_listener *listener, void *data);
 static void requestdecorationmode(struct wl_listener *listener, void *data);
 static void requeststartdrag(struct wl_listener *listener, void *data);
 static void requestmonstate(struct wl_listener *listener, void *data);
+static void requestmove(struct wl_listener *listener, void *data);
 static void resize(Client *c, struct wlr_box geo, int interact);
 static void run(char *startup_cmd);
 static void setcursor(struct wl_listener *listener, void *data);
@@ -732,6 +735,16 @@ axisnotify(struct wl_listener *listener, void *data)
 }
 
 void
+beginmove(Client *c)
+{
+	grabc = c;
+	cursor_mode = CurMove;
+	grabcx = (int)round(cursor->x) - c->geom.x;
+	grabcy = (int)round(cursor->y) - c->geom.y;
+	wlr_cursor_set_xcursor(cursor, cursor_mgr, "all-scroll");
+}
+
+void
 buttonpress(struct wl_listener *listener, void *data)
 {
 	struct wlr_pointer_button_event *event = data;
@@ -773,6 +786,7 @@ buttonpress(struct wl_listener *listener, void *data)
 		/* If you released any buttons, we exit interactive move/resize mode. */
 		if (!locked && cursor_mode != CurNormal && cursor_mode != CurPressed) {
 			cursor_mode = CurNormal;
+			wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
 			/* Update the cursor */
 			wlr_seat_pointer_clear_focus(seat);
 			motionnotify(0, NULL, 0, 0, 0, 0);
@@ -1346,6 +1360,7 @@ createnotify(struct wl_listener *listener, void *data)
 	LISTEN(&toplevel->events.destroy, &c->destroy, destroynotify);
 	LISTEN(&toplevel->events.request_fullscreen, &c->fullscreen, fullscreennotify);
 	LISTEN(&toplevel->events.request_maximize, &c->maximize, maximizenotify);
+	LISTEN(&toplevel->events.request_move, &c->move, requestmove);
 	LISTEN(&toplevel->events.set_title, &c->set_title, updatetitle);
 }
 
@@ -1603,6 +1618,7 @@ destroynotify(struct wl_listener *listener, void *data)
 		wl_list_remove(&c->map.link);
 		wl_list_remove(&c->unmap.link);
 		wl_list_remove(&c->maximize.link);
+		wl_list_remove(&c->move.link);
 		if (c->decoration) {
 			wl_list_remove(&c->set_decoration_mode.link);
 			wl_list_remove(&c->destroy_decoration.link);
@@ -2349,13 +2365,12 @@ moveresize(const Arg *arg)
 
 	/* Float the window and tell motionnotify to grab it */
 	setfloating(grabc, 1);
-	switch (cursor_mode = arg->ui) {
+	switch (arg->ui) {
 	case CurMove:
-		grabcx = (int)round(cursor->x) - grabc->geom.x;
-		grabcy = (int)round(cursor->y) - grabc->geom.y;
-		wlr_cursor_set_xcursor(cursor, cursor_mgr, "all-scroll");
+		beginmove(grabc);
 		break;
 	case CurResize:
+		cursor_mode = CurResize;
 		/* Doesn't work for X11 output - the next absolute motion event
 		 * returns the cursor to where it started */
 		wlr_cursor_warp_closest(cursor, NULL,
@@ -2611,6 +2626,21 @@ requestmonstate(struct wl_listener *listener, void *data)
 	struct wlr_output_event_request_state *event = data;
 	wlr_output_commit_state(event->output, event->state);
 	updatemons(NULL, NULL);
+}
+
+void
+requestmove(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, move);
+	struct wlr_xdg_toplevel_move_event *event = data;
+	struct wlr_surface *focus = seat->pointer_state.focused_surface;
+
+	if (locked || cursor_mode != CurPressed || !c->mon || c->isfullscreen
+			|| (!c->isfloating && c->mon->lt[c->mon->sellt]->arrange)
+			|| !focus || wlr_surface_get_root_surface(focus) != client_surface(c)
+			|| !wlr_seat_validate_pointer_grab_serial(event->seat->seat, focus, event->serial))
+		return;
+	beginmove(c);
 }
 
 void
