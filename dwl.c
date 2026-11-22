@@ -2144,6 +2144,7 @@ mapnotify(struct wl_listener *listener, void *data)
 			foreign_toplevel_list, &foreign_toplevel_state);
 	c->foreign_toplevel_handle->data = c;
 	c->image_capture_scene = wlr_scene_create();
+	c->image_capture_scene->restack_xwayland_surfaces = 0;
 	if (c->type == XDGShell)
 		c->capture.image_capture_tree = wlr_scene_xdg_surface_create(&c->image_capture_scene->tree, c->surface.xdg);
 #ifdef XWAYLAND
