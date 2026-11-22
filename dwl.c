@@ -2782,10 +2782,11 @@ void
 setfloating(Client *c, int floating)
 {
 	c->isfloating = floating;
-	/* If in floating layout do not change the client's layer */
-	if (!c->mon || !client_surface(c)->mapped || !c->mon->lt[c->mon->sellt]->arrange)
+	if (!c->mon || !client_surface(c)->mapped)
 		return;
-	arrange(c->mon);
+	/* If in floating layout do not change the client's layer */
+	if (c->mon->lt[c->mon->sellt]->arrange)
+		arrange(c->mon);
 	printstatus();
 }
 
