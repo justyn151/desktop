@@ -2411,6 +2411,15 @@ outputmgrapplyortest(struct wlr_output_configuration_v1 *config, int test)
 		return;
 	}
 
+	/* Outputs that reconnected while off were never modeset, so clients
+	 * enabling them without choosing a mode request a 0x0 custom mode */
+	for (i = 0; i < states_len; i++) {
+		struct wlr_output_state *state = &states[i].base;
+		if (state->enabled && state->mode_type == WLR_OUTPUT_STATE_MODE_CUSTOM
+				&& !state->custom_mode.width && !state->custom_mode.height)
+			wlr_output_state_set_mode(state, wlr_output_preferred_mode(states[i].output));
+	}
+
 	wlr_output_swapchain_manager_init(&swapchain_manager, backend);
 
 	ok = wlr_output_swapchain_manager_prepare(&swapchain_manager, states, states_len);
