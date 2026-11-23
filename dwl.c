@@ -2361,11 +2361,12 @@ moveresize(const Arg *arg)
 	if (cursor_mode != CurNormal && cursor_mode != CurPressed)
 		return;
 	xytonode(cursor->x, cursor->y, NULL, &grabc, NULL, NULL, NULL);
-	if (!grabc || client_is_unmanaged(grabc) || grabc->isfullscreen)
+	if (!grabc || client_is_unmanaged(grabc) || grabc->isfullscreen || !grabc->mon)
 		return;
 
 	/* Float the window and tell motionnotify to grab it */
-	setfloating(grabc, 1);
+	if (grabc->mon->lt[grabc->mon->sellt]->arrange)
+		setfloating(grabc, 1);
 	switch (arg->ui) {
 	case CurMove:
 		beginmove(grabc);
