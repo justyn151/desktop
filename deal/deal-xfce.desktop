@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=X-XFCE-Helper
+Name=deal
+Icon=utilities-terminal
+X-XFCE-Category=TerminalEmulator
+X-XFCE-Binaries=deal;
+X-XFCE-Commands=%B;
+X-XFCE-CommandsWithParameter=%B -e %s;
