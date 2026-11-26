@@ -1,74 +1,123 @@
-# deal 0.9.0
+# deal 0.10.3
 
-deal is a C11 terminal emulator for Linux X11. It uses GLX/OpenGL for drawing, FreeType and Fontconfig for fonts, Lua 5.4 for configuration, and a Linux PTY for the shell or command.
+Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-## Build and install
+Version 0.10.3 adds text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
-Install a C compiler, pkg-config, and the development packages for Xlib, OpenGL/GLX, Lua 5.4, FreeType, and Fontconfig. The build also uses Linux libc and libutil. The optional ncurses `tic` tool compiles the custom terminfo, and `xdg-open` handles activated links.
+## Build on Arch Linux
+
+| Purpose | Packages |
+|---|---|
+| Compiler, Make and pkg-config | `gcc`, `make`, `pkgconf` |
+| Wayland client, EGL window glue, scanner and protocol XML | `wayland`, `wayland-protocols` |
+| Desktop OpenGL and EGL | `libglvnd` and a compatible graphics driver such as `mesa` |
+| Fonts and keyboard input | `freetype2`, `fontconfig`, `libxkbcommon`, and a monospace font such as `ttf-dejavu` |
+| Optional custom terminfo compiler | `ncurses` for `tic` |
+| Optional HTTP/HTTPS opener | `xdg-utils` for `xdg-open` |
+
+Linux's libc and libutil provide PTY support. Make generates bindings for xdg-shell and `primary-selection-unstable-v1` in `.build/`. Use `make clean` to remove the executable and generated bindings.
+
+From the repository root:
 
 ```sh
-./build.sh
-./deal
-./build.sh install
-./build.sh uninstall
+cd deal
+make
 ```
 
-The default prefix is `$HOME/.local`. Installation adds `bin/deal`, a desktop launcher, an Xfce preferred-terminal helper, and an example configuration under `share/deal`. The desktop launcher uses the installation's executable path. Window class `deal` lets desktop launchers match the running application. Select **deal** in Xfce's preferred applications when the desktop discovers the helper.
+From a terminal in your dwl session:
 
-For a system-wide install, build first and run `sudo env PREFIX=/usr/local ./install.sh install`. Set `DESTDIR` for package staging. Reuse the same prefix and staging root to uninstall. Uninstallation removes unmodified files recorded by the installer and leaves user configuration and other files in place.
+```sh
+./deal
+./deal --diagnostics
+./deal --title "Color check" --working-directory "$PWD" -e sh -c 'printf "\033[32mdeal\033[0m\n"; sleep 5'
+```
+
+Optional installation uses `make install`. The default prefix is `$HOME/.local`. Installation adds the executable, desktop launcher, Xfce preferred-terminal helper, the configuration template under `share/deal/deal.conf`, and custom terminfo. The Makefile generates the desktop and terminfo files during installation. The launcher's desktop file matches the default application ID `deal`. The launcher uses the installed executable path.
+
+For a system-wide install, build first and use `sudo make PREFIX=/usr/local install`. Set `DESTDIR` for package staging. Use `make uninstall` with the same prefix and staging root. The installer tracks its files and preserves modified files on uninstall.
 
 ## Command line
 
 | Argument | Effect |
 |---|---|
 | `--help`, `--version` | Print usage or version and exit. |
-| `--config PATH` | Use a different Lua configuration file, including on reload. |
+| `--config PATH` | Use an alternate configuration file at startup and on reload. |
 | `--working-directory PATH` | Set the child's starting directory. |
-| `--title TITLE`, `--class CLASS` | Set the initial title or X11 class. OSC titles can still change the title when enabled. |
-| `--columns N`, `--rows N` | Set the initial grid size. |
-| `--diagnostics` | Report configuration, terminal type, font, X11, OpenGL, and compositor availability without opening a shell. |
-| `-e COMMAND [ARGS...]` | Pass the remaining arguments directly to a program and return its exit status. Place this option last. |
+| `--title TITLE` | Override the configured title. Enabled OSC titles can still change it. |
+| `--app-id ID`, `--class ID` | Override the Wayland application ID. `--class` is an alias for existing launch commands. |
+| `--columns N`, `--rows N` | Request an initial grid size. A compositor configure can supersede the requested size. |
+| `--diagnostics` | Probe Wayland, xdg-shell, EGL and the OpenGL renderer. Report clipboard protocol availability, configuration path, font and TERM without launching a child. |
+| `-e COMMAND [ARGS...]` | Run a program with the remaining arguments and return its exit status. Place this option last. |
 
-The window options override Lua. For example:
+## Configuration and migration
 
-```sh
-deal --working-directory "$PWD" --title Build --columns 100 --rows 30 -e make -j4
-```
+The default path is `$XDG_CONFIG_HOME/deal/deal.conf`. When `XDG_CONFIG_HOME` is unset, empty, or relative, deal uses `~/.config/deal/deal.conf`. An absent default file uses built-in defaults at startup. If the default file cannot be parsed, deal reports the error and uses defaults. If its font spacing produces invalid cell dimensions, deal reports the error and uses default spacing. An unreadable or invalid file selected by `--config` fails startup.
 
-## Configuration
+Copy [deal.conf](deal.conf) to that path and transfer your settings from `init.lua`. Each former Lua table maps to an INI section with the same name. Move `window.padding.horizontal` and `window.padding.vertical` to `padding_horizontal` and `padding_vertical` under `[window]`. Put numeric `colors.palette` entries under `[palette]` using the same indices from 1 through 16. Omit `terminal.shell` to use `$SHELL` and then `/bin/sh`. Resolve any dynamic Lua expressions into literal values. Existing user Lua files are left in place.
 
-deal creates `$XDG_CONFIG_HOME/deal/init.lua` on first launch, using `~/.config/deal/init.lua` when `XDG_CONFIG_HOME` is unset. Existing files are preserved. See [init.example.lua](init.example.lua) for the supported settings and their defaults.
+Section names and keys are case-sensitive. Use `key = value` with optional surrounding whitespace. Strings can be bare or enclosed in single or double quotes. Quoted content is literal. Booleans use `true` and `false`. Opacity accepts a decimal from `0.0` to `1.0`. Colors use `#RRGGBB`. Blank lines and full-line comments beginning with `#` or `;` are allowed. Put comments on their own lines. Later assignments override earlier ones, so put individual padding overrides after `padding`.
 
-```lua
-return {
-    window = { padding = { horizontal = 10, vertical = 6 }, opacity = 0.90 },
-    font = { family = "monospace", size = 14, line_spacing = 2 },
-    cursor = { style = "bar", thickness = 2, blink = false },
-    scrollback = { capacity = 10000, scroll_on_input = true },
-    bell = { audible = false, visual = false, urgency = false },
-}
-```
+Reload with **Ctrl+Shift+R** or send **SIGHUP** to the deal process with `kill -HUP <deal-pid>`. The same file is reread and validated before applying changes. Syntax and value errors include the file and line in standard error. Failed reloads keep the active settings. Fonts and spacing, colors, opacity, padding, cursor, title, application ID, visual bell, shortcuts and scrollback can update while the shell runs. The initial rows and columns, shell, TERM, working directory and command apply when a new terminal starts.
 
-All bell modes default to off. Enable them individually in Lua. Reload applies visual settings, bell modes, shortcuts, and scrollback settings. Initial grid dimensions, shell, and terminal type apply to new sessions.
-
-| Shortcut | Action |
+| Default shortcut | Action |
 |---|---|
-| Ctrl+Shift+C / Ctrl+Shift+V | Copy selection / paste clipboard |
-| Middle click | Paste X11 PRIMARY |
+| Ctrl+Shift+R | Reload configuration |
+| Ctrl+Shift+Plus or Equal / Ctrl+Shift+Minus | Zoom in / out. Hold to repeat. |
+| Ctrl+Shift+0 | Reset to the configured font size |
+| Ctrl+wheel up / down | Zoom in / out |
+| Wheel up / down | Scroll history or send wheel reports to an application |
 | Shift+Page Up / Page Down, Shift+Home / End | Browse scrollback |
-| Shift+mouse | Select text while an application uses mouse reporting |
-| Ctrl+Left Click | Open an OSC 8 HTTP or HTTPS link |
-| Ctrl+Shift+= / Ctrl+Shift+- | Zoom in / out |
-| Ctrl+Shift+R | Reload Lua configuration |
-| F11 | Toggle fullscreen through the window manager |
+| Left drag / double-click / triple-click | Select a range / word / logical line |
+| Ctrl+Shift+C / Ctrl+Shift+V | Copy to / paste from the clipboard |
+| Middle click | Paste the primary selection when available |
+| Ctrl+left click | Open an HTTP or HTTPS OSC 8 link |
+| F11 | Request fullscreen or return to the previous layout |
 
-## Terminal compatibility and troubleshooting
+Under `[font]`, set `zoom_min` and `zoom_max` between 6 and 96 pixels and keep `size` within those limits. `zoom_step` is a positive number of pixels from 1 to 90. The `[shortcuts]` keys `zoom_in`, `zoom_out`, and `zoom_reset` are configurable. Zoom keeps the window dimensions and updates the terminal grid and PTY. With the default configuration path, deal remembers the runtime size separately in `font-zoom`. Zoom leaves `deal.conf` untouched.
 
-deal supports UTF-8 cells, common ANSI and DEC editing controls, 256 and RGB colors, alternate screens, scroll regions, cursor modes, SGR and legacy mouse reporting, focus events, bracketed paste, OSC titles and links, and the X11 clipboard. Width changes reflow the primary transcript in its normal scrolling mode. Alternate-screen layouts and primary layouts using a custom scroll region resize by position. Reflow can clear the current selection highlight. Scrollback is bounded by its line count and a 64 MiB cell-data budget.
+Key repeat follows the compositor's rate and delay for XKB-repeatable keys. Reload, fullscreen, copy and paste are single-press actions. Vertical wheel zoom consumes the gesture locally. High-resolution wheels accumulate fractional detents, and touchpads accumulate logical scroll distance. Set `[scrollback] scroll_lines` from 1 to 100 to change the number of history lines per detent. It defaults to 3.
 
-The default `terminal.term` is `"xterm-color"`, which is suitable for remote systems with the standard entry installed. Use `"deal"` to opt into the [custom terminfo](deal.terminfo). Installation compiles it when `tic` is available. deal falls back to `xterm-color` when it cannot find the custom entry. A remote host also needs the custom entry before it can use it. For a one-off connection use `TERM=xterm-color ssh host`.
+With `mouse.reporting` enabled, applications can request button, motion and wheel reports in legacy or SGR format. Hold `mouse.selection_override` (Shift by default) for local selection, primary paste or scrollback. Set selection colors under `[selection]`. Set `click_interval` from 100 to 1000 milliseconds to change the double- and triple-click interval. Set `primary = false` to disable primary selection.
 
-- If the window fails to open, run `deal --diagnostics` from an X11 session. GLX and a usable OpenGL context are required.
-- If the background is opaque, check compositor and ARGB visual availability in diagnostics. Fullscreen and decorations depend on window-manager support.
-- If reload fails, check the process's standard error for Lua errors or invalid values. The running configuration stays active.
-- Glyph coverage depends on installed fonts. Complex shaping, graphics protocols, and full xterm emulation are outside the supported subset.
+## Clipboard and primary selection
+
+The regular clipboard uses the core Wayland `wl_data_device_manager` protocol. Primary selection uses `zwp_primary_selection_device_manager_v1` when advertised by the compositor. Completing a selection publishes it to primary selection. Ctrl+Shift+C publishes it to the separate regular clipboard. Local selection and the regular clipboard remain available when the primary protocol is absent.
+
+Both channels transfer UTF-8 plain text with nonblocking pipes. Paste uses the PTY queue and follows the application's bracketed paste mode. It preserves UTF-8 and line breaks using the terminal's carriage-return convention. Pressing Ctrl+Shift+V or middle-clicking while a transfer is pending leaves that transfer in progress.
+
+## Terminal compatibility and limitations
+
+The PTY, UTF-8 and wide cells, ANSI and DEC parsing, 256-color and RGB rendering, alternate screens, focus reports, cursor modes, OSC titles, link storage and scrollback reflow remain available. Scrollback is limited by its configured line count and a 64 MiB cell-data budget. The primary grid reflows in normal scrolling mode. Alternate screens and primary layouts with a custom scroll region resize by position.
+
+The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custom terminfo defined in the [Makefile](Makefile). `make install` compiles the entry when `tic` is available. deal falls back to `xterm-color` if the custom entry is unavailable. Remote hosts also need the custom entry. Use `TERM=xterm-color ssh host` for a one-off connection.
+
+- Keyboard support covers XKB text, terminal keys and key repeat. Compose/dead-key composition, IME integration and multiple seats are deferred.
+- Clipboard transfers support plain text, with a 32 MiB limit and a ten-second inactivity timeout. Clipboard persistence after the source exits depends on the compositor or a clipboard manager. File drag and drop and rich clipboard formats are outside this milestone.
+- Local scrollback is vertical. Applications requesting mouse reports can receive wheel reports on both axes. Selection highlighting can clear during reflow. An already copied selection retains its text.
+- Visual bell is available. Audible and urgency bells are deferred. Decoration policy is left to the compositor. The corresponding legacy settings remain accepted.
+- Rendering uses scale-1 buffers. HiDPI and fractional output scaling may appear soft. Font coverage depends on the installed fonts. Complex text shaping and terminal graphics protocols are outside this milestone.
+- A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
+
+## Manual verification on dwl
+
+- [ ] Build and check `./deal --version` reports 0.10.3. Inspect `readelf -d ./deal` for direct dependencies and launch with `env -u DISPLAY ./deal`.
+- [ ] Run diagnostics. Check xdg-shell configure, EGL vendor/version, desktop OpenGL, the expected renderer, and clipboard and primary-selection availability.
+- [ ] Verify an interactive prompt, UTF-8 and wide glyphs, ANSI and RGB colors, alternate-screen entry and exit, and a known `-e` exit status.
+- [ ] Hold a letter, Backspace, and an arrow. Check the compositor's delay and repeat rate, then release the key, change focus, and change Shift while holding a letter. Check modified arrows, Home, End, Page Up and Page Down, and F1–F12 with the fullscreen shortcut disabled.
+- [ ] Hold both zoom shortcuts and reset with Ctrl+Shift+0. Verify the configured step and limits and release Ctrl before the zoom key to check for stray shell input. Try customized zoom bindings.
+- [ ] Try Ctrl+wheel with a detented wheel, a high-resolution wheel, and a touchpad. Verify smaller movements accumulate and ordinary scrolling still works. In an application using mouse reporting, verify ordinary wheel reports and the Shift override. Check that Ctrl+wheel sends no wheel report to the application.
+- [ ] Single-drag across rows containing wide and combining characters. Double-click a word across a soft wrap and triple-click a wrapped logical line. Check the copied text for missing or extra line breaks. Drag above and below the grid while in scrollback.
+- [ ] Copy and paste in both directions between two deal windows and between deal and another Wayland application. Paste large multiline UTF-8 text, check that the UI stays responsive, and close the source or destination during a transfer.
+- [ ] Copy one string to the regular clipboard, select another, then use Ctrl+Shift+V and middle click to check that the two channels remain independent. Repeat with `primary = false` and on a compositor without the primary-selection protocol if available.
+- [ ] Check paste with bracketed mode enabled and disabled. In Neovim with mouse enabled, exercise press, drag, release and both wheel axes. Hold Shift for local selection and test release after pressing Shift partway through an application drag.
+- [ ] Change `scroll_lines`, selection colors and `click_interval` and reload. Verify one change per detent on a wheel emitting both distance and detent metadata.
+- [ ] Use Ctrl+left click on an HTTP or HTTPS OSC 8 link. Check that normal clicks start selection when mouse reporting is inactive and unsupported URL schemes do not open.
+- [ ] While zooming, verify the window stays the same size, `stty size` follows the grid, the shell stays running, and existing scrollback reflows. Reload with changed zoom limits and verify a reset uses the configured size.
+- [ ] Tile, float, resize and toggle fullscreen. Confirm the shell sees new dimensions with `stty size`. Generate scrollback and verify reflow and the scrollback shortcuts.
+- [ ] Set opacity below 1 and compare the background, padding, explicit cell backgrounds, and text edges. Leave a shell idle with cursor blink disabled and confirm frame submissions stop.
+- [ ] Change the font, opacity, palette and padding. Reload once through the shortcut and once with SIGHUP. Check that the shell PID and scrollback survive and that invalid input reports its line while preserving the active settings.
+- [ ] Verify compositor close, shell exit and compositor disconnection in a disposable session. Exercise the desktop entry, custom terminfo and uninstall if testing installation.
+
+## Recommended next work
+
+Add Compose and IME support and verify fractional scaling on dwl.

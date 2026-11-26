@@ -1,0 +1,37 @@
+--- a/config.h
++++ b/config.h
+@@ -119,16 +119,17 @@
+ 
+ /* commands */
+ static const char *termcmd[] = { "foot", NULL };
+-static const char *menucmd[] = { "wmenu-run", NULL };
++static const char *menucmd[] = { "run", NULL };
+ 
+ static const Key keys[] = {
+ 	/* modifier                  key                  function          argument */
++	{ WLR_MODIFIER_LOGO,         XKB_KEY_d,           spawn,            {.v = menucmd} },
+ 	{ MODKEY,                    XKB_KEY_p,           spawn,            {.v = menucmd} },
+ 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Return,      spawn,            {.v = termcmd} },
+ 	{ MODKEY,                    XKB_KEY_j,           focusstack,       {.i = +1} },
+ 	{ MODKEY,                    XKB_KEY_k,           focusstack,       {.i = -1} },
+ 	{ MODKEY,                    XKB_KEY_i,           incnmaster,       {.i = +1} },
+-	{ MODKEY,                    XKB_KEY_d,           incnmaster,       {.i = -1} },
++	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_d,           incnmaster,       {.i = -1} },
+ 	{ MODKEY,                    XKB_KEY_h,           setmfact,         {.f = -0.05f} },
+ 	{ MODKEY,                    XKB_KEY_l,           setmfact,         {.f = +0.05f} },
+ 	{ MODKEY,                    XKB_KEY_Return,      zoom,             {0} },
+--- a/config.def.h
++++ b/config.def.h
+@@ -119,10 +119,11 @@
+ 
+ /* commands */
+ static const char *termcmd[] = { "foot", NULL };
+-static const char *menucmd[] = { "wmenu-run", NULL };
++static const char *menucmd[] = { "run", NULL };
+ 
+ static const Key keys[] = {
+ 	/* modifier                  key                  function          argument */
++	{ WLR_MODIFIER_LOGO,         XKB_KEY_d,           spawn,            {.v = menucmd} },
+ 	{ MODKEY,                    XKB_KEY_p,           spawn,            {.v = menucmd} },
+ 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Return,      spawn,            {.v = termcmd} },
+ 	{ MODKEY,                    XKB_KEY_j,           focusstack,       {.i = +1} },

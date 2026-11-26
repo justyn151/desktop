@@ -3,43 +3,43 @@
 
 #define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
-#include <GL/glx.h>
-#include <X11/Xlib.h>
-#include <X11/Xatom.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <wayland-client.h>
+#include <wayland-egl.h>
+#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
+#include "primary-selection-unstable-v1-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
-#include <lua.h>
-#include <lauxlib.h>
-#include <lualib.h>
-
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/input-event-codes.h>
 #include <locale.h>
 #include <poll.h>
 #include <pty.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/signalfd.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
 #include <wctype.h>
-
-#if LUA_VERSION_NUM != 504
-#error deal requires Lua 5.4
-#endif
 
 enum {
     INITIAL_COLUMNS = 80,
@@ -57,7 +57,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.9.0";
+static const char deal_version[] = "0.10.3";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -166,29 +166,31 @@ enum { TITLE_LIMIT = 512, LINK_LIMIT = 2048, LINK_SLOTS = 512, OSC_LIMIT = 2304 
 
 typedef enum { CURSOR_BLOCK, CURSOR_UNDERLINE, CURSOR_BAR } CursorStyle;
 static const char *const cursor_style_names[] = {"block", "underline", "bar"};
+enum { MOD_SHIFT = 1, MOD_CTRL = 2, MOD_ALT = 4 };
 static const char default_zoom_in[] = "Ctrl+Shift+=";
 static const char default_zoom_out[] = "Ctrl+Shift+-";
+static const char default_zoom_reset[] = "Ctrl+Shift+0";
 static const char default_reload[] = "Ctrl+Shift+R";
 static const char default_fullscreen[] = "F11";
 
 typedef struct {
-    KeySym key;
+    xkb_keysym_t key;
     unsigned int modifiers;
 } Shortcut;
 
-static KeySym shortcut_key(KeySym key)
+static xkb_keysym_t shortcut_key(xkb_keysym_t key)
 {
-    if (key >= XK_A && key <= XK_Z) return XK_a + (key - XK_A);
-    if (key == XK_plus) return XK_equal;
-    if (key == XK_underscore) return XK_minus;
+    if (key >= XKB_KEY_A && key <= XKB_KEY_Z) return XKB_KEY_a + (key - XKB_KEY_A);
+    if (key == XKB_KEY_plus) return XKB_KEY_equal;
+    if (key == XKB_KEY_underscore) return XKB_KEY_minus;
     return key;
 }
 
 static unsigned int modifier_parse(const char *text, size_t length)
 {
-    if (length == 4 && memcmp(text, "Ctrl", 4) == 0) return ControlMask;
-    if (length == 5 && memcmp(text, "Shift", 5) == 0) return ShiftMask;
-    if (length == 3 && memcmp(text, "Alt", 3) == 0) return Mod1Mask;
+    if (length == 4 && memcmp(text, "Ctrl", 4) == 0) return MOD_CTRL;
+    if (length == 5 && memcmp(text, "Shift", 5) == 0) return MOD_SHIFT;
+    if (length == 3 && memcmp(text, "Alt", 3) == 0) return MOD_ALT;
     return 0;
 }
 
@@ -196,7 +198,7 @@ static bool shortcut_parse(const char *text, Shortcut *shortcut, bool allow_bare
 {
     unsigned int modifiers = 0;
     const char *part;
-    while ((part = strchr(text, '+')) != NULL) {
+    while ((part = strchr(text, '+')) != NULL && part != text) {
         unsigned int modifier = modifier_parse(text, (size_t)(part - text));
         if (modifier == 0 || (modifiers & modifier)) return false;
         modifiers |= modifier;
@@ -204,8 +206,8 @@ static bool shortcut_parse(const char *text, Shortcut *shortcut, bool allow_bare
     }
     if ((!allow_bare && modifiers == 0) || *text == '\0') return false;
     unsigned char first = (unsigned char)*text;
-    KeySym key = first > ' ' && first <= '~' && text[1] == '\0' ? first : XStringToKeysym(text);
-    if (key == NoSymbol) return false;
+    xkb_keysym_t key = first > ' ' && first <= '~' && text[1] == '\0' ? first : xkb_keysym_from_name(text, XKB_KEYSYM_NO_FLAGS);
+    if (key == XKB_KEY_NoSymbol) return false;
     *shortcut = (Shortcut){shortcut_key(key), modifiers};
     return true;
 }
@@ -215,7 +217,7 @@ typedef struct {
 } Padding;
 
 typedef struct {
-    const char *config_path, *directory, *title, *window_class;
+    const char *config_path, *directory, *title, *app_id;
     char **command;
     int columns, rows;
     bool diagnostics;
@@ -223,14 +225,17 @@ typedef struct {
 
 typedef struct {
     char *title;
+    char *app_id;
     char *shell;
     char *font_family;
     const Options *options;
     bool custom_term, audible_bell, visual_bell, bell_urgency;
     int font_size, letter_spacing, line_spacing;
+    int zoom_min, zoom_max, zoom_step;
     Padding padding;
     int columns, rows;
     int history_capacity;
+    int scroll_lines, click_interval;
     float opacity;
     int blink_interval, cursor_thickness;
     TerminalColor foreground;
@@ -242,27 +247,29 @@ typedef struct {
     unsigned int mouse_override, link_modifier;
     CursorStyle cursor_style;
     bool blink, decorations;
-    bool scroll_on_input;
-    Shortcut zoom_in;
-    Shortcut zoom_out, reload, fullscreen;
-    bool dynamic_title, mouse_reporting, hyperlinks, invalid;
+    bool scroll_on_input, primary_selection;
+    Shortcut zoom_in, zoom_out, zoom_reset, reload, fullscreen;
+    bool dynamic_title, mouse_reporting, hyperlinks;
 } Config;
 
 static Config config_defaults(void)
 {
     Config defaults = {.padding = {DEFAULT_PADDING, DEFAULT_PADDING}, .font_size = DEFAULT_FONT_SIZE,
+                    .zoom_min = MIN_FONT_SIZE, .zoom_max = MAX_FONT_SIZE, .zoom_step = 1,
                     .columns = INITIAL_COLUMNS, .rows = INITIAL_ROWS, .decorations = true, .opacity = 1.0f,
                     .blink_interval = DEFAULT_BLINK_INTERVAL, .cursor_thickness = DEFAULT_CURSOR_THICKNESS,
-                    .history_capacity = 10000, .scroll_on_input = true,
+                    .history_capacity = 10000, .scroll_on_input = true, .scroll_lines = 3,
+                    .click_interval = 350, .primary_selection = true,
                     .foreground = blank_cell.foreground,
                     .background = blank_cell.background, .cursor = blank_cell.foreground,
                     .cursor_style = CURSOR_UNDERLINE, .selection_foreground = {16, 22, 30},
                     .selection_background = {138, 193, 222},
                     .dynamic_title = true, .mouse_reporting = true, .hyperlinks = true,
-                    .mouse_override = ShiftMask, .link_modifier = ControlMask};
+                    .mouse_override = MOD_SHIFT, .link_modifier = MOD_CTRL};
     memcpy(defaults.palette, ansi_colors, sizeof defaults.palette);
     shortcut_parse(default_zoom_in, &defaults.zoom_in, false);
     shortcut_parse(default_zoom_out, &defaults.zoom_out, false);
+    shortcut_parse(default_zoom_reset, &defaults.zoom_reset, false);
     shortcut_parse(default_reload, &defaults.reload, false);
     shortcut_parse(default_fullscreen, &defaults.fullscreen, true);
     return defaults;
@@ -287,6 +294,7 @@ static TerminalColor cell_color(const Config *config, uint8_t source, TerminalCo
 static void config_destroy(Config *config)
 {
     free(config->title);
+    free(config->app_id);
     free(config->shell);
     free(config->font_family);
 }
@@ -328,91 +336,8 @@ static int config_make_parents(char *path)
     return 0;
 }
 
-static unsigned int config_rgb(TerminalColor color)
-{
-    return ((unsigned int)color.red << 16) | ((unsigned int)color.green << 8) | color.blue;
-}
-
-static int config_write_template(FILE *file, const void *data)
-{
-    const Config *defaults = data;
-    return fprintf(file,
-        "-- deal configuration\n"
-        "-- Shortcuts are active. Commented entries show the built-in defaults.\n"
-        "-- Uncomment an entry to customize it.\n"
-        "return {\n"
-        "    shortcuts = {\n"
-        "        zoom_in = \"%s\",\n"
-        "        zoom_out = \"%s\",\n"
-        "    },\n"
-        "    keybinds = {\n"
-        "        reload_config = \"%s\",\n"
-        "        fullscreen = \"%s\", -- Set to false to disable.\n"
-        "    },\n"
-        "    window = {\n"
-        "        -- dynamic_title = true,\n"
-        "        -- title = \"%s\",\n"
-        "        -- padding = %d, -- Or { horizontal = %d, vertical = %d }.\n"
-        "        -- opacity = 1.0, -- Default background opacity with an X11 compositor.\n"
-        "        -- decorations = true,\n"
-        "        -- columns = %d, -- Initial size in cells.\n"
-        "        -- rows = %d,\n"
-        "    },\n"
-        "    font = {\n"
-        "        -- family = \"%s\",\n"
-        "        -- size = %d, -- Pixels. Changing this overrides the last remembered zoom.\n"
-        "        -- letter_spacing = 0, -- Pixels added to each column.\n"
-        "        -- line_spacing = 0, -- Pixels added to each row.\n"
-        "    },\n"
-        "    colors = {\n"
-        "        -- foreground = \"#%06x\",\n"
-        "        -- background = \"#%06x\",\n"
-        "        -- cursor = \"#%06x\",\n"
-        "        -- palette = { [1] = \"#%06x\" }, -- Entries 1 through 16 override the ANSI palette.\n"
-        "    },\n"
-        "    mouse = {\n"
-        "        -- reporting = true,\n"
-        "        -- selection_override = \"Shift\",\n"
-        "    },\n"
-        "    hyperlinks = {\n"
-        "        -- enabled = true,\n"
-        "        -- modifier = \"Ctrl\",\n"
-        "    },\n"
-        "    cursor = {\n"
-        "        -- style = \"%s\", -- block, underline, or bar\n"
-        "        -- blink = %s,\n"
-        "        -- blink_interval = %d, -- Milliseconds between visible and hidden.\n"
-        "        -- thickness = %d, -- Pixels for the underline and bar.\n"
-        "    },\n"
-        "    terminal = {\n"
-        "        -- shell = nil, -- Uses $SHELL, then /bin/sh. Set an absolute path to override it.\n"
-        "        -- term = \"xterm-color\", -- Use deal after installing its terminfo.\n"
-        "    },\n"
-        "    bell = {\n"
-        "        -- audible = false,\n"
-        "        -- visual = false,\n"
-        "        -- urgency = false,\n"
-        "    },\n"
-        "    scrollback = {\n"
-        "        -- capacity = %d, -- Lines. Set to 0 to disable history.\n"
-        "        -- scroll_on_input = %s, -- Return to the bottom when typing or pasting.\n"
-        "    },\n"
-        "    selection = {\n"
-        "        -- foreground = \"#%06x\",\n"
-        "        -- background = \"#%06x\",\n"
-        "    },\n"
-        "}\n",
-        default_zoom_in, default_zoom_out, default_reload, default_fullscreen, default_title,
-        defaults->padding.horizontal, defaults->padding.horizontal, defaults->padding.vertical,
-        defaults->columns, defaults->rows, default_font_family, defaults->font_size,
-        config_rgb(defaults->foreground), config_rgb(defaults->background), config_rgb(defaults->cursor), config_rgb(defaults->palette[0]),
-        cursor_style_names[defaults->cursor_style], defaults->blink ? "true" : "false",
-        defaults->blink_interval, defaults->cursor_thickness, defaults->history_capacity, defaults->scroll_on_input ? "true" : "false",
-        config_rgb(defaults->selection_foreground), config_rgb(defaults->selection_background));
-}
-
 static int config_write_file(char *path, int (*write_contents)(FILE *, const void *),
-                             const void *data, bool replace)
+                             const void *data)
 {
     if (config_make_parents(path) < 0) return -1;
     char *temporary;
@@ -429,9 +354,7 @@ static int config_write_file(char *path, int (*write_contents)(FILE *, const voi
         } else {
             if (write_contents(file, data) < 0) error = errno;
             if (fclose(file) == EOF && error == 0) error = errno;
-            if (error == 0 && replace && rename(temporary, path) < 0) error = errno;
-            /* Publish the complete template only if another launch has not created it. */
-            if (error == 0 && !replace && link(temporary, path) < 0 && errno != EEXIST) error = errno;
+            if (error == 0 && rename(temporary, path) < 0) error = errno;
         }
         unlink(temporary);
     }
@@ -451,8 +374,16 @@ static int config_write_zoom(FILE *file, const void *data)
     return fprintf(file, "%d:%d\n", zoom->configured, zoom->size);
 }
 
-static int config_read_zoom(const char *path, int configured)
+static int config_zoom_size(const Config *config, int64_t size)
 {
+    if (size < config->zoom_min) return config->zoom_min;
+    if (size > config->zoom_max) return config->zoom_max;
+    return (int)size;
+}
+
+static int config_read_zoom(const char *path, const Config *config)
+{
+    int configured = config->font_size;
     if (path == NULL) return configured;
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return configured;
@@ -468,13 +399,13 @@ static int config_read_zoom(const char *path, int configured)
     bool valid = fscanf(file, "%3d:%3d %c", &zoom.configured, &zoom.size, &extra) == 2 &&
                  zoom.configured == configured && zoom.size >= MIN_FONT_SIZE && zoom.size <= MAX_FONT_SIZE;
     fclose(file);
-    return valid ? zoom.size : configured;
+    return valid ? config_zoom_size(config, zoom.size) : configured;
 }
 
 static void config_save_zoom(char *path, int configured, int size)
 {
     SavedZoom zoom = {configured, size};
-    if (path != NULL && config_write_file(path, config_write_zoom, &zoom, true) < 0) {
+    if (path != NULL && config_write_file(path, config_write_zoom, &zoom) < 0) {
         fprintf(stderr, "deal: could not save zoom in %s: %s\n", path, strerror(errno));
     }
 }
@@ -501,315 +432,288 @@ static bool config_parse_color(const char *value, size_t length, TerminalColor *
     return true;
 }
 
-static void config_warning(lua_State *lua, const char *path, const char *key, const char *expected)
+enum ConfigType {
+    CFG_INT, CFG_BOOL, CFG_STRING, CFG_SHELL, CFG_COLOR, CFG_OPACITY,
+    CFG_PADDING, CFG_SHORTCUT, CFG_OPTIONAL_SHORTCUT, CFG_MODIFIER, CFG_CURSOR, CFG_TERM
+};
+
+typedef struct {
+    const char *section, *key;
+    enum ConfigType type;
+    size_t offset;
+    int low, high;
+} ConfigKey;
+
+#define SETTING(section, key, type, field) {section, key, type, offsetof(Config, field), 0, 0}
+#define INTEGER(section, key, field, low, high) {section, key, CFG_INT, offsetof(Config, field), low, high}
+static const ConfigKey config_keys[] = {
+    SETTING("window", "title", CFG_STRING, title),
+    SETTING("window", "app_id", CFG_STRING, app_id),
+    SETTING("window", "dynamic_title", CFG_BOOL, dynamic_title),
+    SETTING("window", "padding", CFG_PADDING, padding),
+    INTEGER("window", "padding_horizontal", padding.horizontal, 0, 128),
+    INTEGER("window", "padding_vertical", padding.vertical, 0, 128),
+    SETTING("window", "opacity", CFG_OPACITY, opacity),
+    SETTING("window", "decorations", CFG_BOOL, decorations),
+    INTEGER("window", "columns", columns, 1, 512),
+    INTEGER("window", "rows", rows, 1, 256),
+    SETTING("font", "family", CFG_STRING, font_family),
+    INTEGER("font", "size", font_size, MIN_FONT_SIZE, MAX_FONT_SIZE),
+    INTEGER("font", "zoom_min", zoom_min, MIN_FONT_SIZE, MAX_FONT_SIZE),
+    INTEGER("font", "zoom_max", zoom_max, MIN_FONT_SIZE, MAX_FONT_SIZE),
+    INTEGER("font", "zoom_step", zoom_step, 1, MAX_FONT_SIZE - MIN_FONT_SIZE),
+    INTEGER("font", "letter_spacing", letter_spacing, -16, 32),
+    INTEGER("font", "line_spacing", line_spacing, -32, 64),
+    SETTING("cursor", "style", CFG_CURSOR, cursor_style),
+    SETTING("cursor", "blink", CFG_BOOL, blink),
+    INTEGER("cursor", "blink_interval", blink_interval, 50, 5000),
+    INTEGER("cursor", "thickness", cursor_thickness, 1, 32),
+    SETTING("colors", "foreground", CFG_COLOR, foreground),
+    SETTING("colors", "background", CFG_COLOR, background),
+    SETTING("colors", "cursor", CFG_COLOR, cursor),
+    SETTING("selection", "foreground", CFG_COLOR, selection_foreground),
+    SETTING("selection", "background", CFG_COLOR, selection_background),
+    SETTING("selection", "primary", CFG_BOOL, primary_selection),
+    INTEGER("selection", "click_interval", click_interval, 100, 1000),
+    SETTING("terminal", "shell", CFG_SHELL, shell),
+    SETTING("terminal", "term", CFG_TERM, custom_term),
+    INTEGER("scrollback", "capacity", history_capacity, 0, 1000000),
+    SETTING("scrollback", "scroll_on_input", CFG_BOOL, scroll_on_input),
+    INTEGER("scrollback", "scroll_lines", scroll_lines, 1, 100),
+    SETTING("mouse", "reporting", CFG_BOOL, mouse_reporting),
+    SETTING("mouse", "selection_override", CFG_MODIFIER, mouse_override),
+    SETTING("hyperlinks", "enabled", CFG_BOOL, hyperlinks),
+    SETTING("hyperlinks", "modifier", CFG_MODIFIER, link_modifier),
+    SETTING("bell", "audible", CFG_BOOL, audible_bell),
+    SETTING("bell", "visual", CFG_BOOL, visual_bell),
+    SETTING("bell", "urgency", CFG_BOOL, bell_urgency),
+    SETTING("shortcuts", "zoom_in", CFG_SHORTCUT, zoom_in),
+    SETTING("shortcuts", "zoom_out", CFG_SHORTCUT, zoom_out),
+    SETTING("shortcuts", "zoom_reset", CFG_SHORTCUT, zoom_reset),
+    SETTING("keybinds", "reload_config", CFG_SHORTCUT, reload),
+    SETTING("keybinds", "fullscreen", CFG_OPTIONAL_SHORTCUT, fullscreen),
+};
+#undef INTEGER
+#undef SETTING
+
+static bool osc_text_valid(const char *text, size_t length, bool url);
+
+static char *config_trim(char *text)
 {
-    Config *config = lua_touserdata(lua, 1);
-    config->invalid = true;
-    fprintf(stderr, "deal: %s: %s must be %s\n", path, key, expected);
+    while (isspace((unsigned char)*text)) ++text;
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) --end;
+    *end = '\0';
+    return text;
 }
 
-static int config_get(lua_State *lua, const char *key)
+static bool config_parse_int(const char *text, int low, int high, int *number)
 {
-    lua_pushstring(lua, key);
-    return lua_rawget(lua, -2);
+    char *end;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    if (errno || end == text || *end || value < low || value > high) return false;
+    *number = (int)value;
+    return true;
 }
 
-static void config_string(lua_State *lua, const char *path, const char *key,
-                          const char *label, char **target, size_t limit, bool absolute)
+static const char *config_set_value(const ConfigKey *key, Config *config, const char *value,
+                                    char expected[80])
 {
-    int type = config_get(lua, key);
-    if (type != LUA_TNIL) {
-        size_t length = 0;
-        const char *value = type == LUA_TSTRING ? lua_tolstring(lua, -1, &length) : NULL;
-        bool valid = value != NULL && length > 0 && length <= limit && memchr(value, 0, length) == NULL;
-        if (valid && absolute) {
-            struct stat attributes;
-            valid = value[0] == '/' && stat(value, &attributes) == 0 &&
-                    S_ISREG(attributes.st_mode) && access(value, X_OK) == 0;
+    void *field = (char *)config + key->offset;
+    size_t length = strlen(value);
+    switch (key->type) {
+    case CFG_INT:
+        if (config_parse_int(value, key->low, key->high, field)) return NULL;
+        snprintf(expected, 80, "expected an integer from %d to %d", key->low, key->high);
+        return expected;
+    case CFG_BOOL:
+        if (strcmp(value, "true") == 0 || strcmp(value, "false") == 0) {
+            *(bool *)field = value[0] == 't';
+            return NULL;
         }
-        if (!valid) {
-            config_warning(lua, path, label, absolute ? "an absolute executable path" : "a nonempty string up to 512 bytes");
+        return "expected true or false";
+    case CFG_STRING:
+    case CFG_SHELL: {
+        bool shell = key->type == CFG_SHELL;
+        if (shell) {
+            struct stat st;
+            if (length >= PATH_MAX || value[0] != '/' || stat(value, &st) < 0 ||
+                !S_ISREG(st.st_mode) || access(value, X_OK) < 0)
+                return "expected an absolute executable path";
+        } else if (length == 0 || length > TITLE_LIMIT || !osc_text_valid(value, length, false)) {
+            return "expected a nonempty UTF-8 string up to 512 bytes";
+        }
+        char *copy = strdup(value);
+        if (copy == NULL) return "out of memory";
+        free(*(char **)field);
+        *(char **)field = copy;
+        return NULL;
+    }
+    case CFG_COLOR:
+        return config_parse_color(value, length, field) ? NULL : "expected a #RRGGBB color";
+    case CFG_OPACITY: {
+        char *end;
+        errno = 0;
+        double number = strtod(value, &end);
+        if (errno || end == value || *end || !(number >= 0.0 && number <= 1.0))
+            return "expected a number from 0.0 to 1.0";
+        *(float *)field = (float)number;
+        return NULL;
+    }
+    case CFG_PADDING: {
+        int pixels;
+        if (!config_parse_int(value, 0, 128, &pixels)) return "expected an integer from 0 to 128";
+        *(Padding *)field = (Padding){pixels, pixels};
+        return NULL;
+    }
+    case CFG_SHORTCUT:
+    case CFG_OPTIONAL_SHORTCUT:
+        if (key->type == CFG_OPTIONAL_SHORTCUT && strcmp(value, "false") == 0) {
+            *(Shortcut *)field = (Shortcut){0};
+            return NULL;
+        }
+        if (length <= 64 && shortcut_parse(value, field, key->type == CFG_OPTIONAL_SHORTCUT))
+            return NULL;
+        return key->type == CFG_OPTIONAL_SHORTCUT ? "expected a shortcut such as F11, or false"
+                                                   : "expected a shortcut such as Ctrl+Shift+R";
+    case CFG_MODIFIER: {
+        unsigned int modifier = modifier_parse(value, length);
+        if (!modifier) return "expected Shift, Alt, or Ctrl";
+        *(unsigned int *)field = modifier;
+        return NULL;
+    }
+    case CFG_CURSOR:
+        for (size_t i = 0; i < sizeof cursor_style_names / sizeof *cursor_style_names; ++i) {
+            if (strcmp(value, cursor_style_names[i]) == 0) {
+                *(CursorStyle *)field = (CursorStyle)i;
+                return NULL;
+            }
+        }
+        return "expected block, underline, or bar";
+    case CFG_TERM:
+        if (strcmp(value, "deal") != 0 && strcmp(value, compatibility_term) != 0)
+            return "expected deal or xterm-color";
+        *(bool *)field = strcmp(value, "deal") == 0;
+        return NULL;
+    }
+    return "unknown setting type";
+}
+
+static bool config_parse_file(FILE *file, Config *config, const char *path)
+{
+    char line[PATH_MAX + 256], section[32] = "";
+    size_t number = 0, zoom_bounds_line = 0;
+    for (;;) {
+        size_t length = 0;
+        int byte;
+        const char *error = NULL;
+        char expected[80];
+        while ((byte = fgetc(file)) != EOF && byte != '\n') {
+            if (byte == 0 || length == sizeof line - 1) {
+                error = "line is too long or contains a NUL byte";
+                break;
+            }
+            line[length++] = (char)byte;
+        }
+        if (ferror(file)) error = "could not read configuration";
+        if (byte == EOF && length == 0 && error == NULL) break;
+        ++number;
+        line[length] = '\0';
+        char *key = config_trim(line), *value = NULL;
+        if (error != NULL) goto invalid;
+        if (*key == '\0' || *key == '#' || *key == ';') continue;
+        if (*key == '[') {
+            char *end = strrchr(key, ']');
+            if (end == NULL || end[1] != '\0') {
+                error = "expected [section]";
+                goto invalid;
+            }
+            *end = '\0';
+            key = config_trim(key + 1);
+            bool known = strcmp(key, "palette") == 0;
+            for (size_t i = 0; i < sizeof config_keys / sizeof *config_keys; ++i)
+                known |= strcmp(key, config_keys[i].section) == 0;
+            if (!known) {
+                error = "unknown section";
+                goto invalid;
+            }
+            snprintf(section, sizeof section, "%s", key);
+            continue;
+        }
+        value = strchr(key, '=');
+        if (!value || !*section) {
+            error = "expected key = value inside a section";
+            goto invalid;
+        }
+        *value++ = '\0';
+        key = config_trim(key);
+        value = config_trim(value);
+        if (*value == '"' || *value == '\'') {
+            length = strlen(value);
+            if (length < 2 || value[length - 1] != value[0]) {
+                error = "unterminated quoted value";
+                goto invalid;
+            }
+            value[length - 1] = '\0';
+            ++value;
+        }
+        if (strcmp(section, "palette") == 0) {
+            int index;
+            if (!config_parse_int(key, 1, 16, &index)) error = "expected a palette index from 1 to 16";
+            else if (!config_parse_color(value, strlen(value), &config->palette[index - 1]))
+                error = "expected a #RRGGBB color";
         } else {
-            *target = strdup(value);
-            if (*target == NULL) luaL_error(lua, "could not allocate %s", label);
-        }
-    }
-    lua_pop(lua, 1);
-}
-
-static void config_color(lua_State *lua, const char *path, const char *key,
-                         const char *label, TerminalColor *target)
-{
-    int type = config_get(lua, key);
-    if (type != LUA_TNIL) {
-        size_t length = 0;
-        const char *value = type == LUA_TSTRING ? lua_tolstring(lua, -1, &length) : NULL;
-        if (value == NULL || !config_parse_color(value, length, target)) {
-            config_warning(lua, path, label, "a #RRGGBB color");
-        }
-    }
-    lua_pop(lua, 1);
-}
-
-static bool config_section(lua_State *lua, const char *path, const char *key)
-{
-    int type = config_get(lua, key);
-    if (type == LUA_TTABLE) return true;
-    if (type != LUA_TNIL) config_warning(lua, path, key, "a table");
-    lua_pop(lua, 1);
-    return false;
-}
-
-static void config_integer(lua_State *lua, const char *path, const char *key, const char *label,
-                           int *target, int low, int high)
-{
-    int type = config_get(lua, key);
-    if (type != LUA_TNIL) {
-        int is_integer;
-        lua_Integer value = lua_tointegerx(lua, -1, &is_integer);
-        if (type == LUA_TNUMBER && is_integer && value >= low && value <= high) {
-            *target = (int)value;
-        } else {
-            char expected[64];
-            snprintf(expected, sizeof expected, "an integer from %d to %d", low, high);
-            config_warning(lua, path, label, expected);
-        }
-    }
-    lua_pop(lua, 1);
-}
-
-static void config_padding(lua_State *lua, const char *path, Padding *padding)
-{
-    int type = config_get(lua, "padding");
-    if (type == LUA_TTABLE) {
-        config_integer(lua, path, "horizontal", "window.padding.horizontal", &padding->horizontal, 0, 128);
-        config_integer(lua, path, "vertical", "window.padding.vertical", &padding->vertical, 0, 128);
-    } else if (type != LUA_TNIL) {
-        int integral;
-        lua_Integer pixels = lua_tointegerx(lua, -1, &integral);
-        if (type == LUA_TNUMBER && integral && pixels >= 0 && pixels <= 128) {
-            *padding = (Padding){(int)pixels, (int)pixels};
-        } else {
-            config_warning(lua, path, "window.padding", "an integer from 0 to 128 or a table");
-        }
-    }
-    lua_pop(lua, 1);
-}
-
-static void config_opacity(lua_State *lua, const char *path, float *opacity)
-{
-    int type = config_get(lua, "opacity");
-    if (type != LUA_TNIL) {
-        lua_Number value = lua_tonumber(lua, -1);
-        if (type == LUA_TNUMBER && value >= 0.0 && value <= 1.0) *opacity = (float)value;
-        else config_warning(lua, path, "window.opacity", "a number from 0.0 to 1.0");
-    }
-    lua_pop(lua, 1);
-}
-
-static void config_shortcut(lua_State *lua, const char *path, const char *key, const char *label,
-                            Shortcut *shortcut, bool optional)
-{
-    int type = config_get(lua, key);
-    if (optional && type == LUA_TBOOLEAN && !lua_toboolean(lua, -1)) {
-        *shortcut = (Shortcut){0};
-    } else if (type != LUA_TNIL) {
-        size_t length = 0;
-        const char *value = type == LUA_TSTRING ? lua_tolstring(lua, -1, &length) : NULL;
-        if (value == NULL || length > 64 || memchr(value, 0, length) != NULL ||
-            !shortcut_parse(value, shortcut, optional)) {
-            config_warning(lua, path, label, optional ? "a shortcut such as F11, or false" : "a shortcut such as Ctrl+Shift+=");
-        }
-    }
-    lua_pop(lua, 1);
-}
-
-static void config_boolean(lua_State *lua, const char *path, const char *key, const char *label, bool *target)
-{
-    int type = config_get(lua, key);
-    if (type == LUA_TBOOLEAN) *target = lua_toboolean(lua, -1);
-    else if (type != LUA_TNIL) config_warning(lua, path, label, "a boolean");
-    lua_pop(lua, 1);
-}
-
-static void config_modifier(lua_State *lua, const char *path, const char *key, const char *label,
-                            unsigned int *target)
-{
-    int type = config_get(lua, key);
-    if (type != LUA_TNIL) {
-        size_t length = 0;
-        const char *text = type == LUA_TSTRING ? lua_tolstring(lua, -1, &length) : NULL;
-        unsigned int modifier = text != NULL ? modifier_parse(text, length) : 0;
-        if (modifier == 0) config_warning(lua, path, label, "Shift, Alt, or Ctrl");
-        else *target = modifier;
-    }
-    lua_pop(lua, 1);
-}
-
-static void config_palette(lua_State *lua, const char *path, TerminalColor palette[16])
-{
-    int type = config_get(lua, "palette");
-    if (type == LUA_TTABLE) {
-        for (int i = 0; i < 16; ++i) {
-            type = lua_rawgeti(lua, -1, i + 1);
-            if (type != LUA_TNIL) {
-                size_t length = 0;
-                const char *text = type == LUA_TSTRING ? lua_tolstring(lua, -1, &length) : NULL;
-                if (text == NULL || !config_parse_color(text, length, &palette[i])) {
-                    char label[32];
-                    snprintf(label, sizeof label, "colors.palette[%d]", i + 1);
-                    config_warning(lua, path, label, "a #RRGGBB color");
+            error = "unknown setting";
+            for (size_t i = 0; i < sizeof config_keys / sizeof *config_keys; ++i) {
+                if (strcmp(section, config_keys[i].section) == 0 && strcmp(key, config_keys[i].key) == 0) {
+                    error = config_set_value(&config_keys[i], config, value, expected);
+                    if (config_keys[i].offset == offsetof(Config, font_size) ||
+                        config_keys[i].offset == offsetof(Config, zoom_min) ||
+                        config_keys[i].offset == offsetof(Config, zoom_max))
+                        zoom_bounds_line = number;
+                    break;
                 }
             }
-            lua_pop(lua, 1);
         }
-    } else if (type != LUA_TNIL) config_warning(lua, path, "colors.palette", "a table");
-    lua_pop(lua, 1);
-}
-
-/* Run both evaluation and table reads under Lua's protected call. */
-static int config_evaluate(lua_State *lua)
-{
-    Config *config = lua_touserdata(lua, 1);
-    const char *path = lua_touserdata(lua, 2);
-    luaL_openlibs(lua);
-    if (luaL_loadfilex(lua, path, "t") != LUA_OK) return lua_error(lua);
-    lua_call(lua, 0, 1);
-    if (!lua_istable(lua, -1)) return luaL_error(lua, "expected a configuration table");
-
-    if (config_section(lua, path, "shortcuts")) {
-        config_shortcut(lua, path, "zoom_in", "shortcuts.zoom_in", &config->zoom_in, false);
-        config_shortcut(lua, path, "zoom_out", "shortcuts.zoom_out", &config->zoom_out, false);
-        lua_pop(lua, 1);
+        if (error == NULL) continue;
+invalid:
+        fprintf(stderr, "deal: %s:%zu: %s%s%s: %s\n", path, number, section,
+                *section ? "." : "", key, error);
+        return false;
     }
-    if (config_section(lua, path, "keybinds")) {
-        config_shortcut(lua, path, "reload_config", "keybinds.reload_config", &config->reload, false);
-        config_shortcut(lua, path, "fullscreen", "keybinds.fullscreen", &config->fullscreen, true);
-        lua_pop(lua, 1);
+    if (config->font_size < config->zoom_min || config->font_size > config->zoom_max) {
+        fprintf(stderr, "deal: %s:%zu: [font] requires zoom_min <= size <= zoom_max\n", path, zoom_bounds_line);
+        return false;
     }
-    if (config_section(lua, path, "window")) {
-        config_string(lua, path, "title", "window.title", &config->title, TITLE_LIMIT, false);
-        config_padding(lua, path, &config->padding);
-        config_opacity(lua, path, &config->opacity);
-        config_boolean(lua, path, "decorations", "window.decorations", &config->decorations);
-        config_integer(lua, path, "columns", "window.columns", &config->columns, 1, 512);
-        config_integer(lua, path, "rows", "window.rows", &config->rows, 1, 256);
-        config_boolean(lua, path, "dynamic_title", "window.dynamic_title", &config->dynamic_title);
-        lua_pop(lua, 1);
-    }
-    if (config_section(lua, path, "mouse")) {
-        config_boolean(lua, path, "reporting", "mouse.reporting", &config->mouse_reporting);
-        config_modifier(lua, path, "selection_override", "mouse.selection_override", &config->mouse_override);
-        lua_pop(lua, 1);
-    }
-    if (config_section(lua, path, "hyperlinks")) {
-        config_boolean(lua, path, "enabled", "hyperlinks.enabled", &config->hyperlinks);
-        config_modifier(lua, path, "modifier", "hyperlinks.modifier", &config->link_modifier);
-        lua_pop(lua, 1);
-    }
-    if (config_section(lua, path, "font")) {
-        config_string(lua, path, "family", "font.family", &config->font_family, 512, false);
-        config_integer(lua, path, "size", "font.size", &config->font_size, MIN_FONT_SIZE, MAX_FONT_SIZE);
-        config_integer(lua, path, "letter_spacing", "font.letter_spacing", &config->letter_spacing, -16, 32);
-        config_integer(lua, path, "line_spacing", "font.line_spacing", &config->line_spacing, -32, 64);
-        lua_pop(lua, 1);
-    }
-    if (config_section(lua, path, "colors")) {
-        config_color(lua, path, "foreground", "colors.foreground", &config->foreground);
-        config_color(lua, path, "background", "colors.background", &config->background);
-        config_color(lua, path, "cursor", "colors.cursor", &config->cursor);
-        config_palette(lua, path, config->palette);
-        lua_pop(lua, 1);
-    }
-    if (config_section(lua, path, "cursor")) {
-        int type = config_get(lua, "style");
-        if (type != LUA_TNIL) {
-            size_t length = 0;
-            const char *style = type == LUA_TSTRING ? lua_tolstring(lua, -1, &length) : "";
-            if (length == 5 && memcmp(style, "block", 5) == 0) config->cursor_style = CURSOR_BLOCK;
-            else if (length == 9 && memcmp(style, "underline", 9) == 0) config->cursor_style = CURSOR_UNDERLINE;
-            else if (length == 3 && memcmp(style, "bar", 3) == 0) config->cursor_style = CURSOR_BAR;
-            else config_warning(lua, path, "cursor.style", "block, underline, or bar");
-        }
-        lua_pop(lua, 1);
-        config_boolean(lua, path, "blink", "cursor.blink", &config->blink);
-        config_integer(lua, path, "blink_interval", "cursor.blink_interval", &config->blink_interval, 50, 5000);
-        config_integer(lua, path, "thickness", "cursor.thickness", &config->cursor_thickness, 1, 32);
-        lua_pop(lua, 1);
-    }
-    if (config_section(lua, path, "terminal")) {
-        config_string(lua, path, "shell", "terminal.shell", &config->shell, PATH_MAX - 1, true);
-        int type = config_get(lua, "term");
-        if (type != LUA_TNIL) {
-            size_t length = 0;
-            const char *name = type == LUA_TSTRING ? lua_tolstring(lua, -1, &length) : "";
-            if (length == 4 && memcmp(name, "deal", 4) == 0) config->custom_term = true;
-            else if (length != sizeof compatibility_term - 1 ||
-                     memcmp(name, compatibility_term, sizeof compatibility_term - 1) != 0)
-                config_warning(lua, path, "terminal.term", "deal or xterm-color");
-        }
-        lua_pop(lua, 2);
-    }
-    if (config_section(lua, path, "bell")) {
-        config_boolean(lua, path, "audible", "bell.audible", &config->audible_bell);
-        config_boolean(lua, path, "visual", "bell.visual", &config->visual_bell);
-        config_boolean(lua, path, "urgency", "bell.urgency", &config->bell_urgency);
-        lua_pop(lua, 1);
-    }
-    if (config_section(lua, path, "scrollback")) {
-        config_integer(lua, path, "capacity", "scrollback.capacity", &config->history_capacity, 0, 1000000);
-        int type = config_get(lua, "scroll_on_input");
-        if (type == LUA_TBOOLEAN) config->scroll_on_input = lua_toboolean(lua, -1);
-        else if (type != LUA_TNIL) config_warning(lua, path, "scrollback.scroll_on_input", "a boolean");
-        lua_pop(lua, 2);
-    }
-    if (config_section(lua, path, "selection")) {
-        config_color(lua, path, "foreground", "selection.foreground", &config->selection_foreground);
-        config_color(lua, path, "background", "selection.background", &config->selection_background);
-        lua_pop(lua, 1);
-    }
-    return 0;
+    return true;
 }
 
 static bool config_read(Config *config, bool startup)
 {
-    const Options *options = config->options;
-    const char *explicit_path = options != NULL ? options->config_path : NULL;
-    char *default_path = explicit_path == NULL ? config_path("init.lua", false) : NULL;
+    const char *explicit_path = config->options->config_path;
+    char *default_path = explicit_path == NULL ? config_path("deal.conf", false) : NULL;
     const char *path = explicit_path != NULL ? explicit_path : default_path;
-    if (path == NULL) return false;
-    struct stat attributes;
-    int status = stat(path, &attributes);
-    if (startup && status < 0 && errno == ENOENT && explicit_path == NULL) {
-        if (options != NULL && options->diagnostics) {
-            free(default_path);
-            return true;
-        }
-        if (config_write_file(default_path, config_write_template, config, false) == 0)
-            status = stat(path, &attributes);
-    }
+    if (path == NULL) return startup;
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     bool okay = false;
-    if (status < 0) {
-        fprintf(stderr, "deal: %s: %s\n", path, strerror(errno));
-    } else if (!S_ISREG(attributes.st_mode)) {
-        fprintf(stderr, "deal: %s: configuration must be a regular file\n", path);
+    if (fd < 0) {
+        okay = startup && explicit_path == NULL && errno == ENOENT;
+        if (!okay) fprintf(stderr, "deal: %s: %s\n", path, strerror(errno));
     } else {
-        lua_State *lua = luaL_newstate();
-        if (lua == NULL) {
-            fprintf(stderr, "deal: %s: could not initialize Lua 5.4\n", path);
+        struct stat attributes;
+        if (fstat(fd, &attributes) < 0 || !S_ISREG(attributes.st_mode)) {
+            fprintf(stderr, "deal: %s: configuration must be a readable regular file\n", path);
+            close(fd);
         } else {
-            lua_pushcfunction(lua, config_evaluate);
-            lua_pushlightuserdata(lua, config);
-            lua_pushlightuserdata(lua, (void *)path);
-            if (lua_pcall(lua, 2, 0, 0) == LUA_OK) {
-                okay = startup || !config->invalid;
+            FILE *file = fdopen(fd, "r");
+            if (file == NULL) {
+                fprintf(stderr, "deal: %s: %s\n", path, strerror(errno));
+                close(fd);
             } else {
-                const char *message = lua_type(lua, -1) == LUA_TSTRING ? lua_tostring(lua, -1) : "Lua evaluation failed";
-                size_t length = strlen(path);
-                if (strncmp(message, path, length) == 0 && message[length] == ':') fprintf(stderr, "deal: %s\n", message);
-                else fprintf(stderr, "deal: %s: %s\n", path, message);
+                okay = config_parse_file(file, config, path);
+                fclose(file);
             }
-            lua_close(lua);
         }
     }
     free(default_path);
@@ -832,7 +736,7 @@ static bool config_load(Config *config, const Options *options)
         config_destroy(config);
         *config = config_defaults();
         config->options = options;
-        if (options != NULL && options->config_path != NULL) return false;
+        if (options->config_path != NULL) return false;
     }
     config_overrides(config);
     return true;
@@ -1196,11 +1100,11 @@ static bool font_apply_spacing(FontMetrics *metrics, const Config *config)
     return true;
 }
 
-static const char *font_open(FontRenderer *renderer, const Config *config)
+static const char *font_open(FontRenderer *renderer, const Config *config, FcConfig *font_config)
 {
     renderer->size = config->font_size;
     if (FT_Init_FreeType(&renderer->library) != 0) return "could not initialize FreeType";
-    renderer->config = FcInitLoadConfigAndFonts();
+    renderer->config = font_config != NULL ? FcConfigReference(font_config) : FcInitLoadConfigAndFonts();
     if (renderer->config == NULL) return "could not initialize Fontconfig";
     FcPattern *pattern = FcPatternCreate();
     if (pattern == NULL) return "could not allocate a font pattern";
@@ -1466,7 +1370,7 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
     glLoadIdentity();
 
     TerminalColor background = config->background;
-    /* An ARGB X11 compositor consumes premultiplied color channels. */
+    /* Wayland buffers use premultiplied alpha. */
     float background_scale = opacity / 255.0f;
     glClearColor(background.red * background_scale, background.green * background_scale,
                  background.blue * background_scale, opacity);
@@ -1591,276 +1495,679 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
 
 /* Platform and window management */
 
+typedef enum { KEY_PRESS, KEY_REPEAT, KEY_REPEAT_SHORTCUT } KeyEvent;
+typedef enum { SCROLL_NONE, SCROLL_DETENTS, SCROLL_WHEEL_DISTANCE, SCROLL_DISTANCE } ScrollMode;
+enum { WHEEL_DETENT = 120 };
+
 typedef struct {
-    Display *display;
-    Window window, root;
-    Colormap colormap;
-    GLXContext context;
-    GLXWindow glx_window;
-    Atom wm_protocols;
-    Atom wm_delete_window, net_wm_name, utf8_string;
-    Atom net_wm_state, net_wm_fullscreen, motif_hints, compositor_selection;
-    bool argb, composited;
-    int64_t compositor_check;
-    unsigned int alt_mask;
-    bool focused, urgent;
-    int width;
-    int height;
-    bool mapped;
+    xkb_keycode_t key;
+    int32_t rate, delay;
+    int64_t first, deadline;
+    bool shortcut;
+} KeyRepeat;
+
+typedef struct {
+    double distance, remainder;
+    int64_t value120, discrete;
+    ScrollMode mode;
+    bool has_value120, has_discrete, stopped, zoom, wheel_source;
+} PointerAxis;
+
+typedef struct {
+    struct wl_display *display;
+    struct wl_registry *registry;
+    struct wl_compositor *compositor;
+    struct wl_surface *surface;
+    struct xdg_wm_base *wm_base;
+    struct xdg_surface *xdg_surface;
+    struct xdg_toplevel *toplevel;
+    struct wl_callback *frame;
+    struct wl_seat *seat;
+    struct wl_data_device_manager *clipboard_manager;
+    struct zwp_primary_selection_device_manager_v1 *primary_manager;
+    struct wl_keyboard *keyboard;
+    struct wl_pointer *pointer;
+    struct xkb_context *xkb;
+    struct xkb_state *keys;
+    uint32_t seat_name, clipboard_name, primary_name;
+    KeyRepeat repeat;
+    PointerAxis scroll[2];
+    double pointer_x, pointer_y;
+    bool pointer_inside;
+    struct wl_egl_window *window;
+    EGLDisplay egl;
+    EGLContext context;
+    EGLSurface egl_surface;
+    EGLint egl_major, egl_minor;
+    bool egl_initialized;
+    int width, height, pending_width, pending_height;
+    bool configured, needs_redraw, closed, focused, fullscreen, pending_fullscreen;
+    const char *error;
+    char egl_error[160];
+    bool (*key_pressed)(void *data, xkb_keycode_t key, KeyEvent event, uint32_t serial);
+    void (*scrolled)(void *data, uint32_t axis, int steps, unsigned int modifiers);
+    void (*pointer_button_event)(void *data, uint32_t button, bool pressed, uint32_t serial, uint32_t time);
+    void (*pointer_moved)(void *data);
+    void (*pointer_left)(void *data);
+    void *input_data;
 } Platform;
 
-static void platform_title(Platform *platform, const Config *config, const char *dynamic)
+static int64_t monotonic_milliseconds(void);
+
+static const char *platform_app_id(const Config *config)
+{
+    if (config->options->app_id != NULL) return config->options->app_id;
+    return config->app_id != NULL ? config->app_id : "deal";
+}
+
+static void platform_title(const Platform *platform, const Config *config, const char *dynamic)
 {
     const char *title = config->title != NULL ? config->title : default_title;
-    if (config->options != NULL && config->options->title != NULL) title = config->options->title;
+    if (config->options->title != NULL) title = config->options->title;
     if (*dynamic) title = dynamic;
-    XStoreName(platform->display, platform->window, title);
-    XChangeProperty(platform->display, platform->window, platform->net_wm_name,
-                    platform->utf8_string, 8, PropModeReplace,
-                    (const unsigned char *)title, (int)strlen(title));
-}
-
-static void platform_modifiers(Platform *platform)
-{
-    Display *display = platform->display;
-    XModifierKeymap *map = XGetModifierMapping(display);
-    unsigned int alt = 0;
-    if (map != NULL) {
-        KeyCode left = XKeysymToKeycode(display, XK_Alt_L), right = XKeysymToKeycode(display, XK_Alt_R);
-        for (int slot = 3; slot < 8; ++slot) {
-            for (int i = 0; i < map->max_keypermod; ++i) {
-                KeyCode code = map->modifiermap[slot * map->max_keypermod + i];
-                if (code != 0 && (code == left || code == right)) alt |= 1u << slot;
-            }
-        }
-        XFreeModifiermap(map);
-    }
-    platform->alt_mask = alt ? alt : Mod1Mask;
-}
-
-static unsigned int event_modifiers(const Platform *platform, unsigned int state)
-{
-    unsigned int alt = platform->alt_mask ? platform->alt_mask : Mod1Mask;
-    return (state & (ShiftMask | ControlMask)) | ((state & alt) ? Mod1Mask : 0);
+    xdg_toplevel_set_title(platform->toplevel, title);
 }
 
 static void platform_size_hints(const Platform *platform, Padding padding, const FontMetrics *metrics)
 {
-    XSizeHints hints = {
-        .flags = PBaseSize | PMinSize,
-        .base_width = 2 * padding.horizontal, .base_height = 2 * padding.vertical,
-        .min_width = 2 * padding.horizontal + metrics->width,
-        .min_height = 2 * padding.vertical + metrics->height
-    };
-    XSetWMNormalHints(platform->display, platform->window, &hints);
-}
-
-static void platform_decorations(const Platform *platform, bool enabled)
-{
-    /* Motif flags: decorations are specified, with all or no decorations. */
-    unsigned long hints[] = {2, 0, enabled ? 1u : 0u, 0, 0};
-    XChangeProperty(platform->display, platform->window, platform->motif_hints,
-                    platform->motif_hints, 32, PropModeReplace, (const unsigned char *)hints, 5);
+    xdg_toplevel_set_min_size(platform->toplevel, 2 * padding.horizontal + metrics->width,
+                             2 * padding.vertical + metrics->height);
 }
 
 static void platform_fullscreen(const Platform *platform)
 {
-    XEvent request = {.xclient = {
-        .type = ClientMessage, .display = platform->display, .window = platform->window,
-        .message_type = platform->net_wm_state, .format = 32,
-        .data.l = {2, (long)platform->net_wm_fullscreen, 0, 1, 0}
-    }};
-    XSendEvent(platform->display, platform->root, False,
-               SubstructureRedirectMask | SubstructureNotifyMask, &request);
+    if (platform->fullscreen) xdg_toplevel_unset_fullscreen(platform->toplevel);
+    else xdg_toplevel_set_fullscreen(platform->toplevel, NULL);
 }
 
-static int initial_extent(int limit, int cells, int cell_size, int padding)
+static int initial_extent(int cells, int cell_size, int padding)
 {
-    if (limit > 4096) limit = 4096;
-    int fit = grid_extent(limit, padding) / cell_size;
-    if (fit == 0) return limit > 0 ? limit : 1;
+    int fit = grid_extent(4096, padding) / cell_size;
+    if (fit == 0) return 4096;
     return 2 * padding + (fit < cells ? fit : cells) * cell_size;
 }
 
-static XVisualInfo *platform_argb_visual(Display *display, int screen, GLXFBConfig *chosen)
+static unsigned int keyboard_modifiers(struct xkb_state *keys)
 {
-    int major, minor, opcode, event, error;
-    if (!glXQueryVersion(display, &major, &minor) || (major < 1 || (major == 1 && minor < 3)) ||
-        !XQueryExtension(display, "RENDER", &opcode, &event, &error)) return NULL;
+    if (keys == NULL) return 0;
+    unsigned int modifiers = 0;
+    if (xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0)
+        modifiers |= MOD_SHIFT;
+    if (xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0)
+        modifiers |= MOD_CTRL;
+    if (xkb_state_mod_name_is_active(keys, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0)
+        modifiers |= MOD_ALT;
+    return modifiers;
+}
 
-    const int attributes[] = {
-        GLX_X_RENDERABLE, True, GLX_DRAWABLE_TYPE, GLX_WINDOW_BIT, GLX_RENDER_TYPE, GLX_RGBA_BIT,
-        GLX_X_VISUAL_TYPE, GLX_TRUE_COLOR, GLX_DOUBLEBUFFER, True, GLX_RED_SIZE, 8,
-        GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, GLX_ALPHA_SIZE, 8, None
-    };
-    int count = 0;
-    GLXFBConfig *configs = glXChooseFBConfig(display, screen, attributes, &count);
-    XVisualInfo *visual = NULL;
-    int best = INT_MAX;
-    for (int i = 0; i < count; ++i) {
-        XVisualInfo *candidate = glXGetVisualFromFBConfig(display, configs[i]);
-        /* Select the usual X11 ARGB8888 visual, with the high byte for alpha. */
-        if (candidate == NULL) continue;
-        if (candidate->depth == 32 && candidate->red_mask == 0x00ff0000 &&
-            candidate->green_mask == 0x0000ff00 && candidate->blue_mask == 0x000000ff) {
-            int depth = 0, stencil = 0, multisample = 0;
-            glXGetFBConfigAttrib(display, configs[i], GLX_DEPTH_SIZE, &depth);
-            glXGetFBConfigAttrib(display, configs[i], GLX_STENCIL_SIZE, &stencil);
-            glXGetFBConfigAttrib(display, configs[i], GLX_SAMPLE_BUFFERS, &multisample);
-            int score = depth + stencil + 256 * multisample;
-            if (score < best) {
-                if (visual != NULL) XFree(visual);
-                *chosen = configs[i];
-                visual = candidate;
-                best = score;
-                if (score == 0) break;
-                continue;
+static void platform_repeat_arm(KeyRepeat *repeat, int64_t now)
+{
+    if (now < 0 || repeat->rate <= 0) {
+        repeat->key = 0;
+        return;
+    }
+    repeat->first = repeat->deadline = now + repeat->delay;
+}
+
+static void platform_repeat_key(Platform *platform, int64_t now)
+{
+    KeyRepeat *repeat = &platform->repeat;
+    if (repeat->key == 0 || now < repeat->deadline) return;
+    /* Skip missed ticks and keep the compositor's rate without accumulating rounding error. */
+    int64_t elapsed = now - repeat->first;
+    int64_t tick = elapsed * repeat->rate / 1000 + 1;
+    repeat->deadline = repeat->first + (tick * 1000 + repeat->rate - 1) / repeat->rate;
+    platform->key_pressed(platform->input_data, repeat->key,
+                          repeat->shortcut ? KEY_REPEAT_SHORTCUT : KEY_REPEAT, 0);
+}
+
+static void platform_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format,
+                            int32_t fd, uint32_t size)
+{
+    (void)keyboard;
+    Platform *platform = data;
+    struct xkb_state *keys = NULL;
+    if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && size > 1) {
+        void *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (map != MAP_FAILED) {
+            struct xkb_keymap *keymap = xkb_keymap_new_from_buffer(platform->xkb, map, size - 1,
+                XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+            if (keymap != NULL) {
+                keys = xkb_state_new(keymap);
+                xkb_keymap_unref(keymap);
             }
+            munmap(map, size);
         }
-        XFree(candidate);
     }
-    if (configs != NULL) XFree(configs);
-    return visual;
+    close(fd);
+    xkb_state_unref(platform->keys);
+    platform->keys = keys;
+    platform->repeat.key = 0;
+    platform->scroll[0].remainder = platform->scroll[1].remainder = 0;
+    if (keys == NULL) fprintf(stderr, "deal: Wayland did not provide a usable keyboard keymap\n");
 }
 
-static bool platform_drawable(Platform *platform, XVisualInfo *visual, GLXFBConfig framebuffer)
+static void platform_keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                    struct wl_surface *surface, struct wl_array *keys)
 {
-    Display *display = platform->display;
-    platform->colormap = XCreateColormap(display, platform->root, visual->visual, AllocNone);
-    XSetWindowAttributes attributes = {
-        .colormap = platform->colormap,
-        .border_pixel = 0,
-        .event_mask = ExposureMask | StructureNotifyMask | KeyPressMask |
-                      ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                      EnterWindowMask | LeaveWindowMask | FocusChangeMask
-    };
-    platform->window = XCreateWindow(display, platform->root, 0, 0, platform->width,
-                                     platform->height, 0, visual->depth, InputOutput,
-                                     visual->visual, CWColormap | CWBorderPixel | CWEventMask, &attributes);
-    GLXDrawable drawable = platform->window;
-    if (framebuffer != NULL) {
-        platform->glx_window = glXCreateWindow(display, framebuffer, platform->window, NULL);
-        if (platform->glx_window == None) return false;
-        drawable = platform->glx_window;
-        platform->context = glXCreateNewContext(display, framebuffer, GLX_RGBA_TYPE, NULL, True);
-    } else {
-        platform->context = glXCreateContext(display, visual, NULL, True);
-    }
-    return platform->context != NULL && glXMakeCurrent(display, drawable, platform->context);
+    (void)keyboard;
+    (void)serial;
+    (void)keys;
+    Platform *platform = data;
+    platform->focused = surface == platform->surface;
+    platform->repeat.key = 0;
 }
 
-static void platform_drop_drawable(Platform *platform)
+static void platform_keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                    struct wl_surface *surface)
 {
-    Display *display = platform->display;
-    if (platform->context != NULL) {
-        glXMakeCurrent(display, None, NULL);
-        glXDestroyContext(display, platform->context);
-        platform->context = NULL;
-    }
-    if (platform->glx_window != None) {
-        glXDestroyWindow(display, platform->glx_window);
-        platform->glx_window = None;
-    }
-    if (platform->window != None) {
-        XDestroyWindow(display, platform->window);
-        platform->window = None;
-    }
-    if (platform->colormap != None) {
-        XFreeColormap(display, platform->colormap);
-        platform->colormap = None;
+    (void)keyboard;
+    (void)serial;
+    Platform *platform = data;
+    if (surface == platform->surface) {
+        platform->focused = false;
+        platform->repeat.key = 0;
+        platform->scroll[0].remainder = platform->scroll[1].remainder = 0;
+        if (platform->keys != NULL) xkb_state_update_mask(platform->keys, 0, 0, 0, 0, 0, 0);
     }
 }
 
-/* GLX and window creation can report errors asynchronously through Xlib. */
-static bool drawable_x_error;
-
-static int platform_drawable_error(Display *display, XErrorEvent *event)
+static void platform_keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                  uint32_t time, uint32_t key, uint32_t state)
 {
-    (void)display;
-    (void)event;
-    drawable_x_error = true;
-    return 0;
+    (void)keyboard;
+    (void)time;
+    Platform *platform = data;
+    if (key > UINT32_MAX - 8) return;
+    xkb_keycode_t code = key + 8;
+    if (state == WL_KEYBOARD_KEY_STATE_RELEASED && platform->repeat.key == code)
+        platform->repeat.key = 0;
+    if (state != WL_KEYBOARD_KEY_STATE_PRESSED || platform->keys == NULL ||
+        !platform->focused || platform->key_pressed == NULL) return;
+    bool shortcut = platform->key_pressed(platform->input_data, code, KEY_PRESS, serial);
+    if (xkb_keymap_key_repeats(xkb_state_get_keymap(platform->keys), code)) {
+        platform->repeat.key = code;
+        platform->repeat.shortcut = shortcut;
+        platform_repeat_arm(&platform->repeat, monotonic_milliseconds());
+    }
 }
 
-static bool platform_try_argb(Platform *platform, XVisualInfo *visual, GLXFBConfig framebuffer)
+static void platform_keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                        uint32_t depressed, uint32_t latched, uint32_t locked,
+                                        uint32_t group)
 {
-    XSync(platform->display, False);
-    XErrorHandler previous = XSetErrorHandler(platform_drawable_error);
-    drawable_x_error = false;
-    bool ready = platform_drawable(platform, visual, framebuffer);
-    XSync(platform->display, False);
-    ready &= !drawable_x_error;
-    if (!ready) {
-        platform_drop_drawable(platform);
-        XSync(platform->display, False);
+    (void)keyboard;
+    (void)serial;
+    Platform *platform = data;
+    if (platform->keys != NULL) {
+        unsigned int before = keyboard_modifiers(platform->keys);
+        xkb_state_update_mask(platform->keys, depressed, latched, locked, 0, 0, group);
+        if ((before ^ keyboard_modifiers(platform->keys)) & MOD_CTRL)
+            platform->scroll[0].remainder = platform->scroll[1].remainder = 0;
     }
-    XSetErrorHandler(previous);
-    return ready;
 }
+
+static void platform_keyboard_repeat(void *data, struct wl_keyboard *keyboard,
+                                     int32_t rate, int32_t delay)
+{
+    (void)keyboard;
+    Platform *platform = data;
+    KeyRepeat *repeat = &platform->repeat;
+    repeat->rate = rate > 1000 ? 1000 : rate;
+    repeat->delay = delay >= 0 ? delay : 0;
+    if (repeat->key != 0) platform_repeat_arm(repeat, monotonic_milliseconds());
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap = platform_keymap, .enter = platform_keyboard_enter, .leave = platform_keyboard_leave,
+    .key = platform_keyboard_key, .modifiers = platform_keyboard_modifiers,
+    .repeat_info = platform_keyboard_repeat
+};
+
+static void platform_drop_keyboard(Platform *platform)
+{
+    if (platform->keyboard != NULL) {
+        if (wl_keyboard_get_version(platform->keyboard) >= WL_KEYBOARD_RELEASE_SINCE_VERSION)
+            wl_keyboard_release(platform->keyboard);
+        else wl_keyboard_destroy(platform->keyboard);
+        platform->keyboard = NULL;
+    }
+    xkb_state_unref(platform->keys);
+    platform->keys = NULL;
+    platform->focused = false;
+    platform->repeat = (KeyRepeat){0};
+    platform->scroll[0].remainder = platform->scroll[1].remainder = 0;
+}
+
+static void platform_pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
+                                    wl_fixed_t x, wl_fixed_t y)
+{
+    (void)pointer;
+    (void)time;
+    Platform *platform = data;
+    platform->pointer_x = wl_fixed_to_double(x);
+    platform->pointer_y = wl_fixed_to_double(y);
+    if (platform->pointer_inside && platform->pointer_moved != NULL)
+        platform->pointer_moved(platform->input_data);
+}
+
+static void platform_pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                   struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
+{
+    (void)pointer;
+    (void)serial;
+    Platform *platform = data;
+    platform->pointer_inside = surface == platform->surface;
+    memset(platform->scroll, 0, sizeof platform->scroll);
+    platform->pointer_x = wl_fixed_to_double(x);
+    platform->pointer_y = wl_fixed_to_double(y);
+}
+
+static void platform_pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                   struct wl_surface *surface)
+{
+    (void)pointer;
+    (void)serial;
+    Platform *platform = data;
+    if (surface == platform->surface) {
+        platform->pointer_inside = false;
+        memset(platform->scroll, 0, sizeof platform->scroll);
+        if (platform->pointer_left != NULL) platform->pointer_left(platform->input_data);
+    }
+}
+
+static void platform_pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                    uint32_t time, uint32_t button, uint32_t state)
+{
+    (void)pointer;
+    Platform *platform = data;
+    if (platform->pointer_inside && platform->pointer_button_event != NULL)
+        platform->pointer_button_event(platform->input_data, button,
+                                       state == WL_POINTER_BUTTON_STATE_PRESSED, serial, time);
+}
+
+static void platform_scroll_frame(Platform *platform, uint32_t index)
+{
+    PointerAxis *axis = &platform->scroll[index];
+    bool detents = axis->has_value120 || axis->has_discrete;
+    if (platform->pointer_inside && (detents || axis->distance != 0)) {
+        unsigned int modifiers = keyboard_modifiers(platform->keys);
+        bool zoom = (modifiers & MOD_CTRL) != 0;
+        ScrollMode mode = detents ? SCROLL_DETENTS :
+                          axis->wheel_source ? SCROLL_WHEEL_DISTANCE : SCROLL_DISTANCE;
+        if (mode != axis->mode || zoom != axis->zoom) axis->remainder = 0;
+        axis->mode = mode;
+        axis->zoom = zoom;
+        /* Prefer modern detents, then legacy detents, then continuous distance. */
+        double movement = axis->has_value120 ? (double)axis->value120 :
+                          axis->has_discrete ? (double)axis->discrete : axis->distance;
+        double threshold = detents ? WHEEL_DETENT : zoom && mode == SCROLL_DISTANCE ? 48.0 : 15.0;
+        double total = axis->remainder + movement;
+        double whole = total / threshold;
+        int steps = whole >= INT_MAX ? INT_MAX : whole <= -INT_MAX ? -INT_MAX : (int)whole;
+        axis->remainder = whole >= INT_MAX || whole <= -INT_MAX ? 0 : total - steps * threshold;
+        if (steps != 0 && platform->scrolled != NULL)
+            platform->scrolled(platform->input_data, index, steps, modifiers);
+    }
+    if (axis->stopped) axis->remainder = 0;
+    axis->distance = 0;
+    axis->value120 = axis->discrete = 0;
+    axis->has_value120 = axis->has_discrete = axis->stopped = axis->wheel_source = false;
+}
+
+static void platform_pointer_frame(void *data, struct wl_pointer *pointer)
+{
+    (void)pointer;
+    Platform *platform = data;
+    for (uint32_t axis = 0; axis < sizeof platform->scroll / sizeof *platform->scroll; ++axis)
+        platform_scroll_frame(platform, axis);
+}
+
+static void platform_pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
+                                 uint32_t axis, wl_fixed_t value)
+{
+    (void)time;
+    Platform *platform = data;
+    if (axis >= sizeof platform->scroll / sizeof *platform->scroll) return;
+    platform->scroll[axis].distance += wl_fixed_to_double(value);
+    if (wl_pointer_get_version(pointer) < WL_POINTER_FRAME_SINCE_VERSION)
+        platform_scroll_frame(platform, axis);
+}
+
+static void platform_pointer_source(void *data, struct wl_pointer *pointer, uint32_t source)
+{
+    (void)pointer;
+    Platform *platform = data;
+    bool wheel = source == WL_POINTER_AXIS_SOURCE_WHEEL;
+#ifdef WL_POINTER_AXIS_SOURCE_WHEEL_TILT_SINCE_VERSION
+    wheel |= source == WL_POINTER_AXIS_SOURCE_WHEEL_TILT;
+#endif
+    for (size_t i = 0; i < sizeof platform->scroll / sizeof *platform->scroll; ++i)
+        platform->scroll[i].wheel_source = wheel;
+}
+
+static void platform_pointer_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis)
+{
+    (void)pointer;
+    (void)time;
+    Platform *platform = data;
+    if (axis < sizeof platform->scroll / sizeof *platform->scroll) platform->scroll[axis].stopped = true;
+}
+
+static void platform_pointer_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t steps)
+{
+    (void)pointer;
+    Platform *platform = data;
+    if (axis < sizeof platform->scroll / sizeof *platform->scroll) {
+        platform->scroll[axis].has_discrete = true;
+        platform->scroll[axis].discrete += (int64_t)steps * WHEEL_DETENT;
+    }
+}
+
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+static void platform_pointer_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120)
+{
+    (void)pointer;
+    Platform *platform = data;
+    if (axis < sizeof platform->scroll / sizeof *platform->scroll) {
+        platform->scroll[axis].has_value120 = true;
+        platform->scroll[axis].value120 += value120;
+    }
+}
+#define PLATFORM_SEAT_VERSION WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+#else
+#define PLATFORM_SEAT_VERSION WL_POINTER_AXIS_DISCRETE_SINCE_VERSION
+#endif
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = platform_pointer_enter, .leave = platform_pointer_leave,
+    .motion = platform_pointer_motion, .button = platform_pointer_button,
+    .axis = platform_pointer_axis, .frame = platform_pointer_frame,
+    .axis_source = platform_pointer_source, .axis_stop = platform_pointer_stop,
+    .axis_discrete = platform_pointer_discrete,
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+    .axis_value120 = platform_pointer_value120,
+#endif
+};
+
+static void platform_drop_pointer(Platform *platform)
+{
+    if (platform->pointer == NULL) return;
+    if (wl_pointer_get_version(platform->pointer) >= WL_POINTER_RELEASE_SINCE_VERSION)
+        wl_pointer_release(platform->pointer);
+    else wl_pointer_destroy(platform->pointer);
+    platform->pointer = NULL;
+    platform->pointer_inside = false;
+    memset(platform->scroll, 0, sizeof platform->scroll);
+    if (platform->pointer_left != NULL) platform->pointer_left(platform->input_data);
+}
+
+static void platform_drop_seat(Platform *platform)
+{
+    platform_drop_keyboard(platform);
+    platform_drop_pointer(platform);
+    if (platform->seat == NULL) return;
+    if (wl_seat_get_version(platform->seat) >= WL_SEAT_RELEASE_SINCE_VERSION)
+        wl_seat_release(platform->seat);
+    else wl_seat_destroy(platform->seat);
+    platform->seat = NULL;
+}
+
+static void platform_seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities)
+{
+    Platform *platform = data;
+    if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD)) {
+        platform_drop_keyboard(platform);
+    } else if (platform->keyboard == NULL) {
+        platform->keyboard = wl_seat_get_keyboard(seat);
+        if (platform->keyboard == NULL ||
+            wl_keyboard_add_listener(platform->keyboard, &keyboard_listener, platform) < 0)
+            platform->error = "could not initialize the Wayland keyboard";
+    }
+    if (!(capabilities & WL_SEAT_CAPABILITY_POINTER)) {
+        platform_drop_pointer(platform);
+    } else if (platform->pointer == NULL) {
+        platform->pointer = wl_seat_get_pointer(seat);
+        if (platform->pointer == NULL ||
+            wl_pointer_add_listener(platform->pointer, &pointer_listener, platform) < 0)
+            platform->error = "could not initialize the Wayland pointer";
+    }
+}
+
+static void platform_seat_name(void *data, struct wl_seat *seat, const char *name)
+{
+    (void)data;
+    (void)seat;
+    (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = platform_seat_capabilities, .name = platform_seat_name
+};
+
+static void platform_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial)
+{
+    (void)data;
+    xdg_wm_base_pong(wm_base, serial);
+}
+
+static const struct xdg_wm_base_listener wm_base_listener = {.ping = platform_ping};
+
+static void platform_global(void *data, struct wl_registry *registry, uint32_t name,
+                            const char *interface, uint32_t version)
+{
+    Platform *platform = data;
+    if (strcmp(interface, wl_compositor_interface.name) == 0 && platform->compositor == NULL) {
+        platform->compositor = wl_registry_bind(registry, name, &wl_compositor_interface,
+                                                version < 4 ? version : 4);
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0 && platform->wm_base == NULL) {
+        platform->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+        if (platform->wm_base == NULL ||
+            xdg_wm_base_add_listener(platform->wm_base, &wm_base_listener, platform) < 0)
+            platform->error = "could not initialize xdg-shell";
+    } else if (strcmp(interface, wl_seat_interface.name) == 0 && platform->seat == NULL) {
+        platform->seat = wl_registry_bind(registry, name, &wl_seat_interface,
+                                         version < PLATFORM_SEAT_VERSION ? version : PLATFORM_SEAT_VERSION);
+        platform->seat_name = name;
+        if (platform->seat == NULL || wl_seat_add_listener(platform->seat, &seat_listener, platform) < 0)
+            platform->error = "could not initialize the Wayland seat";
+    } else if (strcmp(interface, wl_data_device_manager_interface.name) == 0 && platform->clipboard_manager == NULL) {
+        platform->clipboard_manager = wl_registry_bind(registry, name, &wl_data_device_manager_interface,
+                                                       version < 2 ? version : 2);
+        platform->clipboard_name = name;
+    } else if (strcmp(interface, zwp_primary_selection_device_manager_v1_interface.name) == 0 &&
+               platform->primary_manager == NULL) {
+        platform->primary_manager = wl_registry_bind(registry, name,
+                                                     &zwp_primary_selection_device_manager_v1_interface, 1);
+        platform->primary_name = name;
+    }
+}
+
+static void platform_global_remove(void *data, struct wl_registry *registry, uint32_t name)
+{
+    (void)registry;
+    Platform *platform = data;
+    if (platform->seat != NULL && platform->seat_name == name) platform_drop_seat(platform);
+    if (platform->clipboard_manager != NULL && platform->clipboard_name == name) {
+        wl_data_device_manager_destroy(platform->clipboard_manager);
+        platform->clipboard_manager = NULL;
+    }
+    if (platform->primary_manager != NULL && platform->primary_name == name) {
+        zwp_primary_selection_device_manager_v1_destroy(platform->primary_manager);
+        platform->primary_manager = NULL;
+    }
+}
+
+static const struct wl_registry_listener registry_listener = {
+    .global = platform_global, .global_remove = platform_global_remove
+};
+
+static void platform_configure(void *data, struct xdg_surface *surface, uint32_t serial)
+{
+    Platform *platform = data;
+    xdg_surface_ack_configure(surface, serial);
+    if (platform->pending_width > 0) platform->width = platform->pending_width;
+    if (platform->pending_height > 0) platform->height = platform->pending_height;
+    platform->fullscreen = platform->pending_fullscreen;
+    platform->configured = true;
+    platform->needs_redraw = true;
+}
+
+static const struct xdg_surface_listener surface_listener = {.configure = platform_configure};
+
+static void platform_toplevel_configure(void *data, struct xdg_toplevel *toplevel,
+                                        int32_t width, int32_t height, struct wl_array *states)
+{
+    (void)toplevel;
+    Platform *platform = data;
+    platform->pending_width = width;
+    platform->pending_height = height;
+    platform->pending_fullscreen = false;
+    uint32_t *state;
+    wl_array_for_each(state, states) {
+        if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN) platform->pending_fullscreen = true;
+    }
+}
+
+static void platform_toplevel_close(void *data, struct xdg_toplevel *toplevel)
+{
+    (void)toplevel;
+    Platform *platform = data;
+    platform->closed = true;
+}
+
+static const struct xdg_toplevel_listener toplevel_listener = {
+    .configure = platform_toplevel_configure, .close = platform_toplevel_close
+};
 
 static const char *platform_open(Platform *platform, const Config *config, const FontMetrics *metrics)
 {
-    Display *display = platform->display = XOpenDisplay(NULL);
-    if (display == NULL) return "could not open the X11 display";
+    platform->display = wl_display_connect(NULL);
+    if (platform->display == NULL) return "could not connect to the Wayland display";
+    platform->xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (platform->xkb == NULL) return "could not create the XKB context";
+    platform->registry = wl_display_get_registry(platform->display);
+    if (platform->registry == NULL ||
+        wl_registry_add_listener(platform->registry, &registry_listener, platform) < 0 ||
+        wl_display_roundtrip(platform->display) < 0)
+        return "could not discover Wayland globals";
+    if (platform->error != NULL) return platform->error;
+    if (platform->compositor == NULL || platform->wm_base == NULL)
+        return "the Wayland compositor must provide wl_compositor and xdg_wm_base";
 
-    int screen = DefaultScreen(display);
-    platform->root = RootWindow(display, screen);
-    platform->width = initial_extent(DisplayWidth(display, screen), config->columns,
-                                     metrics->width, config->padding.horizontal);
-    platform->height = initial_extent(DisplayHeight(display, screen), config->rows,
-                                      metrics->height, config->padding.vertical);
+    platform->surface = wl_compositor_create_surface(platform->compositor);
+    if (platform->surface == NULL) return "could not create the Wayland surface";
+    platform->xdg_surface = xdg_wm_base_get_xdg_surface(platform->wm_base, platform->surface);
+    if (platform->xdg_surface == NULL ||
+        xdg_surface_add_listener(platform->xdg_surface, &surface_listener, platform) < 0)
+        return "could not create the xdg surface";
+    platform->toplevel = xdg_surface_get_toplevel(platform->xdg_surface);
+    if (platform->toplevel == NULL ||
+        xdg_toplevel_add_listener(platform->toplevel, &toplevel_listener, platform) < 0)
+        return "could not create the xdg toplevel";
 
-    GLXFBConfig framebuffer = NULL;
-    XVisualInfo *visual = platform_argb_visual(display, screen, &framebuffer);
-    if (visual != NULL) {
-        platform->argb = platform_try_argb(platform, visual, framebuffer);
-        XFree(visual);
-    }
-    if (!platform->argb) {
-        int attributes[] = {GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8,
-                            GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None};
-        visual = glXChooseVisual(display, screen, attributes);
-        if (visual == NULL) return "could not find a double-buffered GLX visual";
-        bool ready = platform_drawable(platform, visual, NULL);
-        XFree(visual);
-        if (!ready) return "could not initialize the GLX context";
-    }
-
-    char compositor[40];
-    snprintf(compositor, sizeof compositor, "_NET_WM_CM_S%d", screen);
-    platform->compositor_selection = XInternAtom(display, compositor, False);
-    platform->net_wm_state = XInternAtom(display, "_NET_WM_STATE", False);
-    platform->net_wm_fullscreen = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
-    platform->motif_hints = XInternAtom(display, "_MOTIF_WM_HINTS", False);
-    const char *window_class = config->options != NULL ? config->options->window_class : NULL;
-    XClassHint identity = {.res_name = "deal", .res_class = (char *)(window_class != NULL ? window_class : "deal")};
-    XSetClassHint(display, platform->window, &identity);
-    platform_decorations(platform, config->decorations);
-    platform_size_hints(platform, config->padding, metrics);
-    platform->net_wm_name = XInternAtom(display, "_NET_WM_NAME", False);
-    platform->utf8_string = XInternAtom(display, "UTF8_STRING", False);
+    platform->width = initial_extent(config->columns, metrics->width, config->padding.horizontal);
+    platform->height = initial_extent(config->rows, metrics->height, config->padding.vertical);
     platform_title(platform, config, "");
-    platform_modifiers(platform);
-    platform->wm_protocols = XInternAtom(display, "WM_PROTOCOLS", False);
-    platform->wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
-    if (!XSetWMProtocols(display, platform->window, &platform->wm_delete_window, 1)) {
-        return "could not register the window close protocol";
+    xdg_toplevel_set_app_id(platform->toplevel, platform_app_id(config));
+    platform_size_hints(platform, config->padding, metrics);
+    wl_surface_commit(platform->surface);
+    while (!platform->configured && !platform->closed && platform->error == NULL) {
+        if (wl_display_dispatch(platform->display) < 0)
+            return "lost the Wayland connection waiting for the initial configure";
     }
+    return platform->error;
+}
 
-    if (config->options == NULL || !config->options->diagnostics) XMapWindow(display, platform->window);
+static const char *platform_egl_error(Platform *platform, const char *message)
+{
+    snprintf(platform->egl_error, sizeof platform->egl_error, "%s (EGL error 0x%04x)",
+             message, (unsigned int)eglGetError());
+    return platform->egl_error;
+}
+
+static const char *platform_open_egl(Platform *platform)
+{
+    platform->window = wl_egl_window_create(platform->surface, platform->width, platform->height);
+    if (platform->window == NULL) return "could not create the Wayland EGL window";
+    platform->egl = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, platform->display, NULL);
+    if (platform->egl == EGL_NO_DISPLAY ||
+        !eglInitialize(platform->egl, &platform->egl_major, &platform->egl_minor))
+        return platform_egl_error(platform, "could not initialize Wayland EGL");
+    platform->egl_initialized = true;
+
+    if (!eglBindAPI(EGL_OPENGL_API)) return platform_egl_error(platform, "could not bind desktop OpenGL");
+    const EGLint attributes[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE
+    };
+    EGLConfig config;
+    EGLint count;
+    if (!eglChooseConfig(platform->egl, attributes, &config, 1, &count))
+        return platform_egl_error(platform, "could not select a Wayland EGL configuration");
+    if (count == 0) return "no Wayland EGL configuration supports desktop OpenGL with RGBA";
+
+    /* OpenGL 2.1 preserves the fixed-function renderer and alpha-only glyph textures. */
+    const EGLint context_attributes[] = {EGL_CONTEXT_MAJOR_VERSION, 2, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE};
+    platform->context = eglCreateContext(platform->egl, config, EGL_NO_CONTEXT, context_attributes);
+    if (platform->context == EGL_NO_CONTEXT)
+        return platform_egl_error(platform, "could not create a compatible desktop OpenGL context");
+    platform->egl_surface = eglCreatePlatformWindowSurface(platform->egl, config, platform->window, NULL);
+    if (platform->egl_surface == EGL_NO_SURFACE ||
+        !eglMakeCurrent(platform->egl, platform->egl_surface, platform->egl_surface, platform->context))
+        return platform_egl_error(platform, "could not activate the Wayland EGL window surface");
+    /* Wayland frame callbacks throttle drawing even when the driver allows immediate swaps. */
+    eglSwapInterval(platform->egl, 0);
+    return NULL;
+}
+
+static void platform_frame_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+    (void)time;
+    Platform *platform = data;
+    wl_callback_destroy(callback);
+    platform->frame = NULL;
+}
+
+static const struct wl_callback_listener frame_listener = {.done = platform_frame_done};
+
+static const char *platform_swap(Platform *platform)
+{
+    platform->frame = wl_surface_frame(platform->surface);
+    if (platform->frame == NULL || wl_callback_add_listener(platform->frame, &frame_listener, platform) < 0)
+        return "could not request a Wayland frame callback";
+    if (!eglSwapBuffers(platform->egl, platform->egl_surface))
+        return platform_egl_error(platform, "could not present the terminal frame");
     return NULL;
 }
 
 static void platform_close(Platform *platform)
 {
-    if (platform->display == NULL) return;
-    platform_drop_drawable(platform);
-    XCloseDisplay(platform->display);
-    platform->display = NULL;
+    if (platform->egl_initialized) {
+        eglMakeCurrent(platform->egl, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (platform->egl_surface != EGL_NO_SURFACE) eglDestroySurface(platform->egl, platform->egl_surface);
+        if (platform->context != EGL_NO_CONTEXT) eglDestroyContext(platform->egl, platform->context);
+        eglTerminate(platform->egl);
+        eglReleaseThread();
+    }
+    if (platform->window != NULL) wl_egl_window_destroy(platform->window);
+    if (platform->frame != NULL) wl_callback_destroy(platform->frame);
+    platform_drop_seat(platform);
+    if (platform->clipboard_manager != NULL) wl_data_device_manager_destroy(platform->clipboard_manager);
+    if (platform->primary_manager != NULL)
+        zwp_primary_selection_device_manager_v1_destroy(platform->primary_manager);
+    xkb_context_unref(platform->xkb);
+    if (platform->toplevel != NULL) xdg_toplevel_destroy(platform->toplevel);
+    if (platform->xdg_surface != NULL) xdg_surface_destroy(platform->xdg_surface);
+    if (platform->surface != NULL) wl_surface_destroy(platform->surface);
+    if (platform->wm_base != NULL) xdg_wm_base_destroy(platform->wm_base);
+    if (platform->compositor != NULL) wl_compositor_destroy(platform->compositor);
+    if (platform->registry != NULL) wl_registry_destroy(platform->registry);
+    if (platform->display != NULL) {
+        wl_display_flush(platform->display);
+        wl_display_disconnect(platform->display);
+    }
 }
-
-/* Terminal screen state */
-
 
 typedef enum { COLOR_DEFAULT, COLOR_INDEXED, COLOR_RGB } ColorKind;
 
@@ -3131,7 +3438,7 @@ static void parser_escape_intermediate(Terminal *terminal, unsigned char byte)
     parser->state = PARSE_TEXT;
 }
 
-/* Reject invalid UTF-8 and controls before handing text to X11 or a URL handler. */
+/* Reject invalid UTF-8 and controls before using text in a window title or hyperlink. */
 static bool osc_text_valid(const char *text, size_t length, bool url)
 {
     for (size_t i = 0; i < length;) {
@@ -3414,26 +3721,44 @@ static TextRange selection_extent(const TerminalView *view, SelectionPoint point
         while (end < last && view_line(view, end).wrapped) ++end;
         return (TextRange){{first, 0}, {end, view_line(view, end).columns}};
     }
-    size_t first = point.column, end = first;
-    if (first < source.columns) {
-        const TerminalCell *cell = view_cell(view, &source, first);
-        end += cell->width;
-        if (mode == SELECT_WORD) {
-            int type = selection_class(cell->character);
-            while (first > 0) {
-                size_t previous = first - 1;
-                if (previous > 0 && view_cell(view, &source, previous)->width == 0) --previous;
-                if (selection_class(view_cell(view, &source, previous)->character) != type) break;
-                first = previous;
-            }
-            while (end < source.columns) {
-                cell = view_cell(view, &source, end);
-                if (cell->width == 0 || selection_class(cell->character) != type) break;
-                end += cell->width;
-            }
+    TextRange range = {point, point};
+    if (point.column >= source.columns) return range;
+    const TerminalCell *cell = view_cell(view, &source, point.column);
+    range.end.column = minimum(point.column + cell->width, source.columns);
+    if (mode != SELECT_WORD) return range;
+
+    int type = selection_class(cell->character);
+    uint64_t oldest = view_oldest(view), last = view_last(view);
+    for (;;) {
+        SelectionPoint previous = range.first;
+        LineView line = view_line(view, previous.line);
+        if (previous.column == 0) {
+            if (previous.line == oldest) break;
+            line = view_line(view, --previous.line);
+            if (!line.wrapped || line.columns == 0) break;
+            previous.column = line.columns;
         }
+        --previous.column;
+        if (previous.column > 0 && view_cell(view, &line, previous.column)->width == 0)
+            --previous.column;
+        if (selection_class(view_cell(view, &line, previous.column)->character) != type) break;
+        range.first = previous;
     }
-    return (TextRange){{point.line, first}, {point.line, minimum(end, source.columns)}};
+    for (;;) {
+        SelectionPoint next = range.end;
+        LineView line = view_line(view, next.line);
+        if (next.column == line.columns) {
+            if (!line.wrapped || next.line == last) break;
+            line = view_line(view, ++next.line);
+            next.column = 0;
+        }
+        if (next.column >= line.columns) break;
+        cell = view_cell(view, &line, next.column);
+        if (cell->width == 0 || selection_class(cell->character) != type) break;
+        next.column = minimum(next.column + cell->width, line.columns);
+        range.end = next;
+    }
+    return range;
 }
 
 static void selection_start(Terminal *terminal, SelectionPoint point, SelectionMode mode)
@@ -3453,10 +3778,17 @@ static bool selection_extend(Terminal *terminal, SelectionPoint point)
         point.column == selection->origin.column) return false;
     TerminalView view = terminal_view(terminal);
     TextRange next = selection_extent(&view, point, selection->mode);
-    selection->range.first = point_before(next.first, selection->anchor.first) ? next.first : selection->anchor.first;
-    selection->range.end = point_before(next.end, selection->anchor.end) ? selection->anchor.end : next.end;
+    TextRange range = {
+        point_before(next.first, selection->anchor.first) ? next.first : selection->anchor.first,
+        point_before(next.end, selection->anchor.end) ? selection->anchor.end : next.end
+    };
+    bool changed = !selection->active || point_before(range.first, selection->range.first) ||
+                   point_before(selection->range.first, range.first) ||
+                   point_before(range.end, selection->range.end) ||
+                   point_before(selection->range.end, range.end);
+    selection->range = range;
     selection->active = true;
-    return true;
+    return changed;
 }
 
 static bool selection_text(Terminal *terminal, TextBuffer *text)
@@ -3501,8 +3833,8 @@ enum { PTY_READ_CAPACITY = 8192, PTY_PARSE_SLICE = 128, PTY_PARSE_BUDGET = 5 };
 
 typedef struct {
     int master;
-    int child_signal;
-    int startup;
+    int signal_fd;
+    int startup, launch_gate;
     pid_t child;
     int child_status;
     bool child_status_valid;
@@ -3514,8 +3846,7 @@ typedef struct {
     unsigned char output[PTY_READ_CAPACITY];
     size_t output_start, output_end;
     sigset_t original_signal_mask;
-    struct sigaction original_sigchld;
-    bool restore_signals;
+    struct sigaction original_sighup;
 } Session;
 
 typedef enum { PTY_OPEN, PTY_CLOSED, PTY_FAILED } PtyResult;
@@ -3525,8 +3856,8 @@ static struct winsize session_size(const TerminalScreen *screen, int width, int 
     return (struct winsize){
         .ws_col = (unsigned short)screen->columns,
         .ws_row = (unsigned short)screen->rows,
-        .ws_xpixel = (unsigned short)grid_extent(width, padding.horizontal),
-        .ws_ypixel = (unsigned short)grid_extent(height, padding.vertical)
+        .ws_xpixel = (unsigned short)minimum(grid_extent(width, padding.horizontal), USHRT_MAX),
+        .ws_ypixel = (unsigned short)minimum(grid_extent(height, padding.vertical), USHRT_MAX)
     };
 }
 
@@ -3637,47 +3968,65 @@ static _Noreturn void launch_child(const sigset_t *original_mask, int failure_fd
     _exit(127);
 }
 
-static const char *session_open(Session *session, struct winsize size, int x11_fd,
-                               const Config *config)
+static const char *session_prepare_signals(Session *session)
 {
-    const char *shell = getenv("SHELL");
-
+    /* Block the signals before any graphics driver can create worker threads. */
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGCHLD);
+    sigaddset(&signals, SIGHUP);
+    /* A clipboard reader can close its pipe while an outgoing write is in flight. */
+    sigaddset(&signals, SIGPIPE);
+    if (sigprocmask(SIG_BLOCK, &signals, &session->original_signal_mask) < 0)
+        return "could not block shell exit and reload signals";
+    sigdelset(&signals, SIGPIPE);
     struct sigaction action = {.sa_handler = SIG_DFL, .sa_flags = SA_NOCLDSTOP};
     sigemptyset(&action.sa_mask);
-    if (sigprocmask(SIG_BLOCK, &signals, &session->original_signal_mask) < 0) {
+    if (sigaction(SIGCHLD, &action, NULL) < 0)
         return "could not configure shell exit notifications";
-    }
-    if (sigaction(SIGCHLD, &action, &session->original_sigchld) < 0) {
-        sigprocmask(SIG_SETMASK, &session->original_signal_mask, NULL);
-        return "could not configure shell exit notifications";
-    }
-    session->restore_signals = true;
+    action.sa_flags = 0;
+    if (sigaction(SIGHUP, &action, &session->original_sighup) < 0)
+        return "could not configure reload notifications";
+    session->signal_fd = signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
+    return session->signal_fd < 0 ? "could not create the signal notification descriptor" : NULL;
+}
+
+static const char *session_open(Session *session, struct winsize size, int display_fd,
+                               const Config *config)
+{
+    const char *shell = getenv("SHELL");
     sigset_t shell_mask = session->original_signal_mask;
     sigdelset(&shell_mask, SIGCHLD);
-    session->child_signal = signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
-    if (session->child_signal < 0) {
-        return "could not create a shell exit notification descriptor";
-    }
-
-    int startup[2];
+    int startup[2], gate[2];
     if (pipe2(startup, O_CLOEXEC | O_NONBLOCK) < 0) {
         return "could not create a shell startup pipe";
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate) < 0) {
+        close(startup[0]);
+        close(startup[1]);
+        return "could not create the shell launch gate";
     }
     session->startup = startup[0];
     int master = -1;
     pid_t child = forkpty(&master, NULL, NULL, &size);
     if (child == 0) {
         close(startup[0]);
-        close(session->child_signal);
-        if (x11_fd > STDERR_FILENO) {
-            close(x11_fd);
-        }
+        close(gate[1]);
+        close(session->signal_fd);
+        if (display_fd > STDERR_FILENO) close(display_fd);
+        unsigned char go;
+        ssize_t count;
+        do {
+            count = read(gate[0], &go, 1);
+        } while (count < 0 && errno == EINTR);
+        close(gate[0]);
+        if (count != 1) _exit(127);
+        sigaction(SIGHUP, &session->original_sighup, NULL);
         launch_child(&shell_mask, startup[1], config, shell);
     }
     close(startup[1]);
+    close(gate[0]);
+    session->launch_gate = gate[1];
     if (child < 0) {
         return "could not create a pseudoterminal and fork the shell";
     }
@@ -3689,6 +4038,18 @@ static const char *session_open(Session *session, struct winsize size, int x11_f
         return "could not configure the pseudoterminal descriptor";
     }
     return NULL;
+}
+
+static const char *session_launch(Session *session)
+{
+    const unsigned char go = 1;
+    ssize_t count;
+    do {
+        count = send(session->launch_gate, &go, 1, MSG_NOSIGNAL);
+    } while (count < 0 && errno == EINTR);
+    close(session->launch_gate);
+    session->launch_gate = -1;
+    return count == 1 ? NULL : "could not release the shell for launch";
 }
 
 static const char *session_check_startup(Session *session)
@@ -3735,6 +4096,10 @@ static void session_reap(Session *session, int options)
 
 static void session_close(Session *session)
 {
+    if (session->launch_gate >= 0) {
+        close(session->launch_gate);
+        session->launch_gate = -1;
+    }
     free(session->large_input);
     session->large_input = NULL;
     if (session->master >= 0) {
@@ -3749,7 +4114,7 @@ static void session_close(Session *session)
     if (session->child > 0) {
         /* Give the PTY hangup and SIGHUP time to end the shell before forcing exit. */
         kill(session->child, SIGHUP);
-        struct pollfd signal_event = {session->child_signal, POLLIN, 0};
+        struct pollfd signal_event = {session->signal_fd, POLLIN, 0};
         while (poll(&signal_event, 1, 250) < 0 && errno == EINTR) {
         }
         session_reap(session, WNOHANG);
@@ -3758,15 +4123,11 @@ static void session_close(Session *session)
             session_reap(session, 0);
         }
     }
-    if (session->child_signal >= 0) {
-        close(session->child_signal);
-        session->child_signal = -1;
+    if (session->signal_fd >= 0) {
+        close(session->signal_fd);
+        session->signal_fd = -1;
     }
-    if (session->restore_signals) {
-        sigaction(SIGCHLD, &session->original_sigchld, NULL);
-        sigprocmask(SIG_SETMASK, &session->original_signal_mask, NULL);
-        session->restore_signals = false;
-    }
+
 }
 
 static PtyResult session_resize(const Session *session, struct winsize size)
@@ -3811,27 +4172,40 @@ static bool session_queue(Session *session, const unsigned char *bytes, size_t c
     return session_append(session, bytes, count, false);
 }
 
-static bool session_paste(Session *session, const TextBuffer *text, bool latin1, bool bracketed)
+enum { PASTE_MARKER_BYTES = 6 };
+
+static bool paste_chunk(TextBuffer *text, unsigned char *bytes, size_t count, bool *after_cr)
 {
-    TextBuffer input = {0};
-    bool okay = !bracketed || text_append(&input, "\033[200~", 6);
-    size_t start = 0;
-    for (size_t i = 0; okay && i < text->length; ++i) {
-        unsigned char byte = text->bytes[i];
-        bool copy = byte == '\r' || byte == '\t' ||
-                    (byte >= 0x20 && byte != 0x7f && (!latin1 || byte < 0x80));
-        if (copy) continue;
-        okay = text_append(&input, text->bytes + start, i - start);
-        start = i + 1;
-        if (!okay) break;
-        if (byte == '\n' && (i == 0 || text->bytes[i - 1] != '\r')) okay = text_append(&input, "\r", 1);
-        else if (latin1 && byte >= 0xa0) okay = text_codepoint(&input, byte);
+    size_t used = 0;
+    for (size_t i = 0; i < count; ++i) {
+        unsigned char byte = bytes[i];
+        if (byte == '\n') {
+            if (!*after_cr) bytes[used++] = '\r';
+        } else if (byte == '\r' || byte == '\t' || (byte >= 0x20 && byte != 0x7f)) {
+            bytes[used++] = byte;
+        }
+        *after_cr = byte == '\r';
     }
-    if (okay && text->length > start) okay = text_append(&input, text->bytes + start, text->length - start);
-    if (okay && bracketed) okay = text_append(&input, "\033[201~", 6);
-    if (okay) okay = session_append(session, input.bytes, input.length, true);
-    text_destroy(&input);
-    return okay;
+    return text_append(text, bytes, used);
+}
+
+/* Receipt reserves space for the opening marker. Choose the mode at enqueue time. */
+static bool session_paste(Session *session, TextBuffer *text, bool bracketed)
+{
+    if (text->length == PASTE_MARKER_BYTES) return true;
+    if (bracketed && !text_append(text, "\033[201~", PASTE_MARKER_BYTES)) return false;
+    size_t start = bracketed ? 0 : PASTE_MARKER_BYTES;
+    size_t length = text->length - start;
+    if (session->input_length == 0 && length > sizeof session->input) {
+        free(session->large_input);
+        session->large_input = text->bytes;
+        session->large_capacity = text->capacity;
+        session->input_start = start;
+        session->input_length = length;
+        *text = (TextBuffer){0};
+        return true;
+    }
+    return session_append(session, text->bytes + start, length, true);
 }
 
 static void session_reply(void *context, const char *bytes, size_t length)
@@ -3903,41 +4277,6 @@ static PtyResult session_read(Session *session, Terminal *terminal, bool *redraw
     }
 }
 
-/* Native X11 selections */
-
-enum { TRANSFER_TIMEOUT = 10000, CLIPBOARD_CHUNK = 32768, OUTBOUND_TRANSFERS = 4 };
-
-typedef struct {
-    TextBuffer text;
-    Time timestamp;
-} OwnedSelection;
-
-typedef struct {
-    Window requestor;
-    Atom property, target;
-    long previous_mask;
-    TextBuffer text;
-    size_t sent;
-    int64_t deadline;
-} SelectionSend;
-
-typedef struct {
-    Window window;
-    Atom selection, target;
-    Time timestamp;
-    TextBuffer text;
-    int64_t deadline;
-    bool incremental;
-} SelectionReceive;
-
-typedef struct {
-    Atom clipboard, utf8, targets, timestamp, incr, property;
-    size_t chunk;
-    OwnedSelection primary, copied;
-    SelectionSend outbound[OUTBOUND_TRANSFERS];
-    SelectionReceive inbound;
-} Clipboard;
-
 static int deadline_timeout(int64_t now, int64_t deadline)
 {
     if (deadline == 0 || now < 0) return -1;
@@ -3949,326 +4288,501 @@ static int earlier_timeout(int a, int b)
     return b < 0 || (a >= 0 && a < b) ? a : b;
 }
 
-static bool clipboard_open(Clipboard *clipboard, Display *display)
+/* Wayland clipboard and primary selection */
+
+enum { CLIPBOARD_SENDS = 8, CLIPBOARD_SOURCES = 4, CLIPBOARD_CHUNK = 32768, CLIPBOARD_TIMEOUT = 10000 };
+static const char *const clipboard_types[] = {
+    "text/plain;charset=utf-8", "text/plain;charset=UTF-8",
+    "text/plain; charset=utf-8", "text/plain; charset=UTF-8", "UTF8_STRING", "text/plain"
+};
+
+typedef struct Clipboard Clipboard;
+typedef struct ClipboardChannel ClipboardChannel;
+typedef struct ClipboardSource ClipboardSource;
+
+struct ClipboardSource {
+    TextBuffer text;
+    unsigned int refs;
+    ClipboardChannel *channel;
+    ClipboardSource *next;
+    void *proxy;
+};
+
+typedef struct {
+    void *proxy;
+    const char *mime;
+} ClipboardOffer;
+
+struct ClipboardChannel {
+    Clipboard *clipboard;
+    /* The protocol on this channel determines the types of its proxies. */
+    void *device;
+    ClipboardOffer offer, pending;
+    ClipboardSource *sources, *current;
+    uint32_t seat_name, manager_name;
+    bool primary;
+};
+
+typedef struct {
+    int fd;
+    ClipboardSource *source;
+    size_t offset;
+    int64_t deadline;
+} ClipboardSend;
+
+typedef struct {
+    int fd;
+    TextBuffer text;
+    size_t received;
+    int64_t deadline;
+    bool after_cr, primary;
+} ClipboardReceive;
+
+struct Clipboard {
+    ClipboardChannel regular, primary;
+    ClipboardReceive receive;
+    ClipboardSend send[CLIPBOARD_SENDS];
+};
+
+static void clipboard_init(Clipboard *clipboard)
 {
-    char *names[] = {"CLIPBOARD", "UTF8_STRING", "TARGETS", "TIMESTAMP", "INCR", "DEAL_SELECTION"};
-    Atom atoms[sizeof names / sizeof names[0]];
-    if (!XInternAtoms(display, names, sizeof atoms / sizeof atoms[0], False, atoms)) return false;
-    for (size_t i = 0; i < sizeof atoms / sizeof atoms[0]; ++i) {
-        if (atoms[i] == None) return false;
+    clipboard->regular.clipboard = clipboard;
+    clipboard->primary = (ClipboardChannel){.clipboard = clipboard, .primary = true};
+    clipboard->receive.fd = -1;
+    for (size_t i = 0; i < CLIPBOARD_SENDS; ++i) clipboard->send[i].fd = -1;
+}
+
+static void clipboard_unref(ClipboardSource *source)
+{
+    if (source != NULL && --source->refs == 0) {
+        text_destroy(&source->text);
+        free(source);
     }
-    clipboard->clipboard = atoms[0];
-    clipboard->utf8 = atoms[1];
-    clipboard->targets = atoms[2];
-    clipboard->timestamp = atoms[3];
-    clipboard->incr = atoms[4];
-    clipboard->property = atoms[5];
-    long units = XMaxRequestSize(display);
-    clipboard->chunk = units > 32 ? minimum((size_t)(units - 32), CLIPBOARD_CHUNK / 4) * 4 : 0;
-    return clipboard->chunk != 0;
 }
 
-static OwnedSelection *clipboard_owner(Clipboard *clipboard, Atom selection)
+static int64_t clipboard_deadline(void)
 {
-    if (selection == XA_PRIMARY) return &clipboard->primary;
-    if (selection == clipboard->clipboard) return &clipboard->copied;
-    return NULL;
+    int64_t now = monotonic_milliseconds();
+    return now < 0 ? 0 : now + CLIPBOARD_TIMEOUT;
 }
 
-static bool timestamp_before(Time a, Time b)
+static bool clipboard_nonblocking(int fd)
 {
-    return ((uint32_t)a - (uint32_t)b) > UINT32_C(0x7fffffff);
+    int flags = fcntl(fd, F_GETFL);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+           fcntl(fd, F_SETFD, FD_CLOEXEC) == 0;
 }
 
-static bool clipboard_copy(Clipboard *clipboard, Platform *platform, Terminal *terminal,
-                           Atom selection, Time timestamp)
+static void clipboard_drop_send(ClipboardSend *send)
 {
-    TextBuffer text = {0};
-    if (selection_text(terminal, &text)) {
-        XSetSelectionOwner(platform->display, selection, platform->window, timestamp);
-        if (XGetSelectionOwner(platform->display, selection) == platform->window) {
-            OwnedSelection *owned = clipboard_owner(clipboard, selection);
-            text_destroy(&owned->text);
-            *owned = (OwnedSelection){text, timestamp};
-            return true;
-        }
-    }
-    text_destroy(&text);
-    return false;
+    if (send->fd < 0) return;
+    close(send->fd);
+    clipboard_unref(send->source);
+    *send = (ClipboardSend){.fd = -1};
 }
 
-/* A requesting client can close its window at any point during a transfer. */
-static bool clipboard_x_failed;
-
-static int clipboard_x_error(Display *display, XErrorEvent *event)
+static void clipboard_drop_receive(ClipboardReceive *receive)
 {
-    (void)display;
-    (void)event;
-    clipboard_x_failed = true;
-    return 0;
-}
-
-static XErrorHandler clipboard_x_begin(Display *display)
-{
-    XSync(display, False);
-    clipboard_x_failed = false;
-    return XSetErrorHandler(clipboard_x_error);
-}
-
-static bool clipboard_x_end(Display *display, XErrorHandler previous)
-{
-    XSync(display, False);
-    XSetErrorHandler(previous);
-    return !clipboard_x_failed;
-}
-
-static void clipboard_drop_send(Display *display, SelectionSend *send, bool destroyed)
-{
-    if (send->requestor != None && !destroyed) {
-        XErrorHandler previous = clipboard_x_begin(display);
-        XSelectInput(display, send->requestor, send->previous_mask);
-        clipboard_x_end(display, previous);
-    }
-    text_destroy(&send->text);
-    *send = (SelectionSend){0};
-}
-
-static void clipboard_drop_receive(Display *display, SelectionReceive *receive)
-{
-    if (receive->window != None) XDestroyWindow(display, receive->window);
+    if (receive->fd >= 0) close(receive->fd);
     text_destroy(&receive->text);
-    *receive = (SelectionReceive){0};
+    *receive = (ClipboardReceive){.fd = -1};
 }
 
-static void clipboard_close(Clipboard *clipboard, Display *display)
+static void clipboard_destroy_offer(ClipboardChannel *channel, void *offer)
 {
-    for (size_t i = 0; i < OUTBOUND_TRANSFERS; ++i) clipboard_drop_send(display, &clipboard->outbound[i], false);
-    clipboard_drop_receive(display, &clipboard->inbound);
-    text_destroy(&clipboard->primary.text);
-    text_destroy(&clipboard->copied.text);
+    if (offer == NULL) return;
+    if (channel->primary) zwp_primary_selection_offer_v1_destroy(offer);
+    else wl_data_offer_destroy(offer);
 }
 
-static bool text_latin1(const TextBuffer *utf8, TextBuffer *output)
+static void clipboard_destroy_source_proxy(ClipboardSource *source)
 {
-    for (size_t i = 0; i < utf8->length;) {
-        unsigned char lead = utf8->bytes[i++];
-        unsigned char byte = lead < 0x80 ? lead : '?';
-        if ((lead == 0xc2 || lead == 0xc3) && i < utf8->length) {
-            byte = (unsigned char)(((lead & 0x1f) << 6) | (utf8->bytes[i] & 0x3f));
+    if (source->proxy == NULL) return;
+    if (source->channel->primary) zwp_primary_selection_source_v1_destroy(source->proxy);
+    else wl_data_source_destroy(source->proxy);
+    source->proxy = NULL;
+}
+
+static void clipboard_drop_source(ClipboardSource *source)
+{
+    ClipboardSource **link = &source->channel->sources;
+    while (*link != source) link = &(*link)->next;
+    *link = source->next;
+    if (source->channel->current == source) source->channel->current = NULL;
+    clipboard_destroy_source_proxy(source);
+    clipboard_unref(source);
+}
+
+static void clipboard_drop_channel(ClipboardChannel *channel)
+{
+    while (channel->sources != NULL) clipboard_drop_source(channel->sources);
+    clipboard_destroy_offer(channel, channel->pending.proxy);
+    clipboard_destroy_offer(channel, channel->offer.proxy);
+    channel->pending = channel->offer = (ClipboardOffer){0};
+    if (channel->device == NULL) return;
+    if (channel->primary) zwp_primary_selection_device_v1_destroy(channel->device);
+    else if (wl_data_device_get_version(channel->device) >= WL_DATA_DEVICE_RELEASE_SINCE_VERSION)
+        wl_data_device_release(channel->device);
+    else wl_data_device_destroy(channel->device);
+    channel->device = NULL;
+}
+
+static void clipboard_close(Clipboard *clipboard)
+{
+    clipboard_drop_receive(&clipboard->receive);
+    for (size_t i = 0; i < CLIPBOARD_SENDS; ++i) clipboard_drop_send(&clipboard->send[i]);
+    clipboard_drop_channel(&clipboard->primary);
+    clipboard_drop_channel(&clipboard->regular);
+}
+
+static void clipboard_mime(ClipboardChannel *channel, void *offer, const char *mime)
+{
+    if (channel->pending.proxy != offer) return;
+    for (size_t i = 0; i < sizeof clipboard_types / sizeof *clipboard_types; ++i) {
+        if (channel->pending.mime == clipboard_types[i]) return;
+        if (strcmp(mime, clipboard_types[i]) == 0) {
+            channel->pending.mime = clipboard_types[i];
+            return;
         }
-        while (i < utf8->length && (utf8->bytes[i] & 0xc0) == 0x80) ++i;
-        if (!text_append(output, &byte, 1)) return false;
     }
-    return true;
 }
 
-static SelectionSend *clipboard_begin_send(Clipboard *clipboard, Display *display,
-                                            const XSelectionRequestEvent *request, Atom property,
-                                            const TextBuffer *text)
+static void regular_offer_mime(void *data, struct wl_data_offer *offer, const char *mime)
 {
-    SelectionSend *slot = NULL;
-    for (size_t i = 0; i < OUTBOUND_TRANSFERS; ++i) {
-        if (clipboard->outbound[i].requestor == request->requestor) return NULL;
-        if (slot == NULL && clipboard->outbound[i].requestor == None) slot = &clipboard->outbound[i];
-    }
-    XWindowAttributes attributes;
-    if (slot == NULL || !XGetWindowAttributes(display, request->requestor, &attributes) ||
-        !text_append(&slot->text, text->bytes, text->length)) return NULL;
-    slot->requestor = request->requestor;
-    slot->property = property;
-    slot->target = request->target;
-    slot->previous_mask = attributes.your_event_mask;
-    slot->deadline = monotonic_milliseconds() + TRANSFER_TIMEOUT;
-    XSelectInput(display, slot->requestor, attributes.your_event_mask | PropertyChangeMask | StructureNotifyMask);
-    unsigned long length = (unsigned long)text->length;
-    XChangeProperty(display, slot->requestor, property, clipboard->incr, 32, PropModeReplace,
-                    (const unsigned char *)&length, 1);
-    return slot;
+    clipboard_mime(data, offer, mime);
 }
 
-static void clipboard_request(Clipboard *clipboard, Platform *platform, const XSelectionRequestEvent *request)
+static void primary_offer_mime(void *data, struct zwp_primary_selection_offer_v1 *offer, const char *mime)
 {
-    Display *display = platform->display;
-    OwnedSelection *owned = clipboard_owner(clipboard, request->selection);
-    Atom property = request->property != None ? request->property : request->target;
-    Atom result = None;
-    SelectionSend *send = NULL;
-    TextBuffer legacy = {0};
-    XErrorHandler previous = clipboard_x_begin(display);
-    if (request->owner == platform->window && owned != NULL && owned->text.length != 0 &&
-        (request->time == CurrentTime || !timestamp_before(request->time, owned->timestamp))) {
-        if (request->target == clipboard->targets) {
-            Atom targets[] = {clipboard->targets, clipboard->timestamp, clipboard->utf8, XA_STRING};
-            XChangeProperty(display, request->requestor, property, XA_ATOM, 32, PropModeReplace,
-                            (const unsigned char *)targets, sizeof targets / sizeof targets[0]);
-            result = property;
-        } else if (request->target == clipboard->timestamp) {
-            unsigned long time = owned->timestamp;
-            XChangeProperty(display, request->requestor, property, XA_INTEGER, 32, PropModeReplace,
-                            (const unsigned char *)&time, 1);
-            result = property;
-        } else if (request->target == clipboard->utf8 || request->target == XA_STRING) {
-            const TextBuffer *payload = &owned->text;
-            if (request->target == XA_STRING) payload = text_latin1(payload, &legacy) ? &legacy : NULL;
-            if (payload != NULL && payload->length <= clipboard->chunk) {
-                XChangeProperty(display, request->requestor, property, request->target, 8, PropModeReplace,
-                                payload->bytes, (int)payload->length);
-                result = property;
-            } else if (payload != NULL) {
-                send = clipboard_begin_send(clipboard, display, request, property, payload);
-                if (send != NULL) result = property;
+    clipboard_mime(data, offer, mime);
+}
+
+static const struct wl_data_offer_listener regular_offer_listener = {.offer = regular_offer_mime};
+static const struct zwp_primary_selection_offer_v1_listener primary_offer_listener = {.offer = primary_offer_mime};
+
+static void regular_data_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
+{
+    (void)device;
+    ClipboardChannel *channel = data;
+    clipboard_destroy_offer(channel, channel->pending.proxy);
+    channel->pending = (ClipboardOffer){.proxy = offer};
+    if (wl_data_offer_add_listener(offer, &regular_offer_listener, channel) < 0) {
+        clipboard_destroy_offer(channel, offer);
+        channel->pending = (ClipboardOffer){0};
+    }
+}
+
+static void primary_data_offer(void *data, struct zwp_primary_selection_device_v1 *device,
+                               struct zwp_primary_selection_offer_v1 *offer)
+{
+    (void)device;
+    ClipboardChannel *channel = data;
+    clipboard_destroy_offer(channel, channel->pending.proxy);
+    channel->pending = (ClipboardOffer){.proxy = offer};
+    if (zwp_primary_selection_offer_v1_add_listener(offer, &primary_offer_listener, channel) < 0) {
+        clipboard_destroy_offer(channel, offer);
+        channel->pending = (ClipboardOffer){0};
+    }
+}
+
+static void clipboard_set_offer(ClipboardChannel *channel, void *offer)
+{
+    if (offer != NULL && offer == channel->offer.proxy) return;
+    clipboard_destroy_offer(channel, channel->offer.proxy);
+    channel->offer = (ClipboardOffer){0};
+    if (offer != NULL && offer == channel->pending.proxy) {
+        channel->offer = channel->pending;
+        channel->pending = (ClipboardOffer){0};
+    }
+}
+
+static void regular_selection(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
+{
+    (void)device;
+    clipboard_set_offer(data, offer);
+}
+
+static void primary_selection(void *data, struct zwp_primary_selection_device_v1 *device,
+                              struct zwp_primary_selection_offer_v1 *offer)
+{
+    (void)device;
+    clipboard_set_offer(data, offer);
+}
+
+static void regular_drag_enter(void *data, struct wl_data_device *device, uint32_t serial,
+                               struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y,
+                               struct wl_data_offer *offer)
+{
+    (void)device;
+    (void)surface;
+    (void)x;
+    (void)y;
+    ClipboardChannel *channel = data;
+    if (offer != NULL && offer == channel->pending.proxy) {
+        wl_data_offer_accept(offer, serial, NULL);
+        clipboard_destroy_offer(channel, offer);
+        channel->pending = (ClipboardOffer){0};
+    }
+}
+
+static void regular_drag_noop(void *data, struct wl_data_device *device)
+{
+    (void)data;
+    (void)device;
+}
+
+static void regular_drag_motion(void *data, struct wl_data_device *device, uint32_t time,
+                                wl_fixed_t x, wl_fixed_t y)
+{
+    (void)data;
+    (void)device;
+    (void)time;
+    (void)x;
+    (void)y;
+}
+
+static const struct wl_data_device_listener regular_device_listener = {
+    .data_offer = regular_data_offer, .enter = regular_drag_enter, .leave = regular_drag_noop,
+    .motion = regular_drag_motion, .drop = regular_drag_noop, .selection = regular_selection
+};
+
+static const struct zwp_primary_selection_device_v1_listener primary_device_listener = {
+    .data_offer = primary_data_offer, .selection = primary_selection
+};
+
+static bool clipboard_sync_channel(ClipboardChannel *channel, Platform *platform, bool available, uint32_t manager)
+{
+    available = available && platform->seat != NULL;
+    if (channel->device != NULL &&
+        (!available || channel->seat_name != platform->seat_name || channel->manager_name != manager)) {
+        ClipboardReceive *receive = &channel->clipboard->receive;
+        if (receive->fd >= 0 && receive->primary == channel->primary) clipboard_drop_receive(receive);
+        clipboard_drop_channel(channel);
+    }
+    if (!available || channel->device != NULL) return true;
+    channel->seat_name = platform->seat_name;
+    channel->manager_name = manager;
+    if (channel->primary) {
+        channel->device = zwp_primary_selection_device_manager_v1_get_device(platform->primary_manager,
+                                                                             platform->seat);
+        return channel->device != NULL &&
+               zwp_primary_selection_device_v1_add_listener(channel->device, &primary_device_listener, channel) == 0;
+    }
+    channel->device = wl_data_device_manager_get_data_device(platform->clipboard_manager, platform->seat);
+    return channel->device != NULL && wl_data_device_add_listener(channel->device, &regular_device_listener, channel) == 0;
+}
+
+static bool clipboard_sync(Clipboard *clipboard, Platform *platform, const Config *config)
+{
+    return clipboard_sync_channel(&clipboard->regular, platform, platform->clipboard_manager != NULL,
+                                  platform->clipboard_name) &&
+           clipboard_sync_channel(&clipboard->primary, platform,
+                                  config->primary_selection && platform->primary_manager != NULL,
+                                  platform->primary_name);
+}
+
+static void clipboard_send(ClipboardSource *source, const char *mime, int fd)
+{
+    bool supported = false;
+    for (size_t i = 0; i < sizeof clipboard_types / sizeof *clipboard_types; ++i)
+        if (strcmp(mime, clipboard_types[i]) == 0) supported = true;
+    if (supported && clipboard_nonblocking(fd)) {
+        for (size_t i = 0; i < CLIPBOARD_SENDS; ++i) {
+            ClipboardSend *send = &source->channel->clipboard->send[i];
+            if (send->fd >= 0) continue;
+            ++source->refs;
+            *send = (ClipboardSend){.fd = fd, .source = source, .deadline = clipboard_deadline()};
+            return;
+        }
+    }
+    close(fd);
+}
+
+static void regular_source_target(void *data, struct wl_data_source *source, const char *mime)
+{
+    (void)data;
+    (void)source;
+    (void)mime;
+}
+
+static void regular_source_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd)
+{
+    (void)source;
+    clipboard_send(data, mime, fd);
+}
+
+static void primary_source_send(void *data, struct zwp_primary_selection_source_v1 *source,
+                                const char *mime, int32_t fd)
+{
+    (void)source;
+    clipboard_send(data, mime, fd);
+}
+
+static void regular_source_cancel(void *data, struct wl_data_source *source)
+{
+    (void)source;
+    clipboard_drop_source(data);
+}
+
+static void primary_source_cancel(void *data, struct zwp_primary_selection_source_v1 *source)
+{
+    (void)source;
+    clipboard_drop_source(data);
+}
+
+static const struct wl_data_source_listener regular_source_listener = {
+    .target = regular_source_target, .send = regular_source_send, .cancelled = regular_source_cancel
+};
+
+static const struct zwp_primary_selection_source_v1_listener primary_source_listener = {
+    .send = primary_source_send, .cancelled = primary_source_cancel
+};
+
+static bool clipboard_channel_ready(const ClipboardChannel *channel, const Platform *platform)
+{
+    if (channel->device == NULL || platform->seat == NULL || channel->seat_name != platform->seat_name)
+        return false;
+    return channel->primary ? platform->primary_manager != NULL && channel->manager_name == platform->primary_name
+                            : platform->clipboard_manager != NULL && channel->manager_name == platform->clipboard_name;
+}
+
+static void clipboard_copy(ClipboardChannel *channel, Platform *platform, Terminal *terminal, uint32_t serial)
+{
+    if (!clipboard_channel_ready(channel, platform)) return;
+    ClipboardSource *source = calloc(1, sizeof *source);
+    if (source == NULL) return;
+    source->refs = 1;
+    source->channel = channel;
+    if (!selection_text(terminal, &source->text)) {
+        clipboard_unref(source);
+        return;
+    }
+
+    bool listening;
+    if (channel->primary) {
+        source->proxy = zwp_primary_selection_device_manager_v1_create_source(platform->primary_manager);
+        listening = source->proxy != NULL &&
+                    zwp_primary_selection_source_v1_add_listener(source->proxy, &primary_source_listener, source) == 0;
+    } else {
+        source->proxy = wl_data_device_manager_create_data_source(platform->clipboard_manager);
+        listening = source->proxy != NULL &&
+                    wl_data_source_add_listener(source->proxy, &regular_source_listener, source) == 0;
+    }
+    if (!listening) {
+        clipboard_destroy_source_proxy(source);
+        clipboard_unref(source);
+        return;
+    }
+    source->next = channel->sources;
+    channel->sources = source;
+    channel->current = source;
+    for (size_t i = 0; i < sizeof clipboard_types / sizeof *clipboard_types; ++i) {
+        if (channel->primary) zwp_primary_selection_source_v1_offer(source->proxy, clipboard_types[i]);
+        else wl_data_source_offer(source->proxy, clipboard_types[i]);
+    }
+    if (channel->primary) zwp_primary_selection_device_v1_set_selection(channel->device, source->proxy, serial);
+    else wl_data_device_set_selection(channel->device, source->proxy, serial);
+
+    /* Keep previous owners until cancellation, with a limit for unacknowledged requests. */
+    ClipboardSource *last = source;
+    for (size_t i = 1; i < CLIPBOARD_SOURCES && last->next != NULL; ++i) last = last->next;
+    if (last->next != NULL) clipboard_drop_source(last->next);
+}
+
+static void clipboard_clear_primary(ClipboardChannel *channel, const Platform *platform, uint32_t serial)
+{
+    if (channel->current == NULL || !clipboard_channel_ready(channel, platform)) return;
+    zwp_primary_selection_device_v1_set_selection(channel->device, NULL, serial);
+    channel->current = NULL;
+}
+
+static void clipboard_paste(ClipboardChannel *channel, const Platform *platform, Terminal *terminal)
+{
+    ClipboardReceive *receive = &channel->clipboard->receive;
+    if (receive->fd >= 0 || channel->offer.mime == NULL || !clipboard_channel_ready(channel, platform)) return;
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) < 0) {
+        terminal->bell_pending = true;
+        return;
+    }
+    if (!clipboard_nonblocking(fds[0]) || !text_append(&receive->text, "\033[200~", PASTE_MARKER_BYTES)) {
+        close(fds[0]);
+        close(fds[1]);
+        clipboard_drop_receive(receive);
+        terminal->bell_pending = true;
+        return;
+    }
+    if (channel->primary)
+        zwp_primary_selection_offer_v1_receive(channel->offer.proxy, channel->offer.mime, fds[1]);
+    else wl_data_offer_receive(channel->offer.proxy, channel->offer.mime, fds[1]);
+    close(fds[1]);
+    receive->fd = fds[0];
+    receive->primary = channel->primary;
+    receive->deadline = clipboard_deadline();
+}
+
+static void clipboard_read(ClipboardReceive *receive, Session *session, Terminal *terminal,
+                           const Config *config, bool *redraw, short events)
+{
+    if (!events) return;
+    unsigned char bytes[CLIPBOARD_CHUNK];
+    if (events & (POLLERR | POLLNVAL)) {
+        clipboard_drop_receive(receive);
+        terminal->bell_pending = true;
+        return;
+    }
+    ssize_t count = read(receive->fd, bytes, sizeof bytes);
+    if (count > 0 && (size_t)count <= TEXT_LIMIT - 2 * PASTE_MARKER_BYTES - receive->received &&
+        paste_chunk(&receive->text, bytes, (size_t)count, &receive->after_cr)) {
+        receive->received += (size_t)count;
+        receive->deadline = clipboard_deadline();
+        return;
+    }
+    if (count < 0 && (errno == EINTR || errno == EAGAIN)) return;
+    if (count == 0 && session_paste(session, &receive->text, terminal->bracketed_paste)) {
+        if (receive->received != 0 && config->scroll_on_input)
+            *redraw |= history_scroll(terminal, false, SIZE_MAX);
+    } else terminal->bell_pending = true;
+    clipboard_drop_receive(receive);
+}
+
+static void clipboard_write(ClipboardSend *send, short events)
+{
+    if (!events) return;
+    if (!(events & (POLLERR | POLLHUP | POLLNVAL))) {
+        TextBuffer *text = &send->source->text;
+        ssize_t count = write(send->fd, text->bytes + send->offset,
+                              minimum(text->length - send->offset, CLIPBOARD_CHUNK));
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) return;
+        if (count > 0) {
+            send->offset += (size_t)count;
+            if (send->offset < text->length) {
+                send->deadline = clipboard_deadline();
+                return;
             }
         }
     }
-    if (!clipboard_x_end(display, previous)) {
-        if (send != NULL) clipboard_drop_send(display, send, false);
-        send = NULL;
-        result = None;
-    }
-    XEvent notify = {.xselection = {.type = SelectionNotify, .display = display,
-        .requestor = request->requestor, .selection = request->selection,
-        .target = request->target, .property = result, .time = request->time}};
-    previous = clipboard_x_begin(display);
-    Status sent = XSendEvent(display, request->requestor, False, NoEventMask, &notify);
-    bool delivered = clipboard_x_end(display, previous);
-    if ((!sent || !delivered) && send != NULL) clipboard_drop_send(display, send, false);
-    text_destroy(&legacy);
+    clipboard_drop_send(send);
 }
 
-static void clipboard_send_chunk(Clipboard *clipboard, Display *display, const XPropertyEvent *event)
+static int clipboard_timeout(Clipboard *clipboard, Terminal *terminal, int64_t now)
 {
-    for (size_t i = 0; i < OUTBOUND_TRANSFERS; ++i) {
-        SelectionSend *send = &clipboard->outbound[i];
-        if (send->requestor != event->window || send->property != event->atom) continue;
-        size_t remaining = send->text.length - send->sent;
-        size_t length = minimum(remaining, clipboard->chunk);
-        XErrorHandler previous = clipboard_x_begin(display);
-        XChangeProperty(display, send->requestor, send->property, send->target, 8, PropModeReplace,
-                        send->text.bytes + send->sent, (int)length);
-        if (!clipboard_x_end(display, previous) || remaining == 0) clipboard_drop_send(display, send, false);
-        else {
-            send->sent += length;
-            send->deadline = monotonic_milliseconds() + TRANSFER_TIMEOUT;
+    int timeout = -1;
+    ClipboardReceive *receive = &clipboard->receive;
+    if (receive->fd >= 0) {
+        timeout = deadline_timeout(now, receive->deadline);
+        if (timeout == 0) {
+            clipboard_drop_receive(receive);
+            terminal->bell_pending = true;
+            timeout = -1;
         }
-        return;
     }
-}
-
-static void clipboard_paste_text(Terminal *terminal, Session *session,
-                                 const Config *config, const TextBuffer *text, bool latin1, bool *redraw)
-{
-    if (text->length == 0) return;
-    if (!session_paste(session, text, latin1, terminal->bracketed_paste)) terminal->bell_pending = true;
-    else if (config->scroll_on_input) *redraw |= history_scroll(terminal, false, SIZE_MAX);
-}
-
-static void clipboard_paste(Clipboard *clipboard, Platform *platform, Terminal *terminal,
-                            Session *session, const Config *config, Atom selection, Time timestamp,
-                            bool *redraw)
-{
-    Display *display = platform->display;
-    OwnedSelection *owned = clipboard_owner(clipboard, selection);
-    clipboard_drop_receive(display, &clipboard->inbound);
-    Window owner = XGetSelectionOwner(display, selection);
-    if (owner == None) return;
-    if (owner == platform->window && owned != NULL && owned->text.length != 0) {
-        clipboard_paste_text(terminal, session, config, &owned->text, false, redraw);
-        return;
-    }
-    Window window = XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
-    XSelectInput(display, window, PropertyChangeMask);
-    clipboard->inbound = (SelectionReceive){.window = window, .selection = selection, .target = clipboard->utf8,
-        .timestamp = timestamp, .deadline = monotonic_milliseconds() + TRANSFER_TIMEOUT};
-    XConvertSelection(display, selection, clipboard->utf8, clipboard->property, window, timestamp);
-}
-
-typedef enum { RECEIVE_FAILED, RECEIVE_WAIT, RECEIVE_COMPLETE } ReceiveResult;
-
-static ReceiveResult clipboard_read(Clipboard *clipboard, Display *display)
-{
-    SelectionReceive *receive = &clipboard->inbound;
-    unsigned long offset = 0;
-    for (;;) {
-        Atom type;
-        int format;
-        unsigned long count, remaining;
-        unsigned char *data = NULL;
-        int status = XGetWindowProperty(display, receive->window, clipboard->property, (long)offset,
-                                        CLIPBOARD_CHUNK / 4, False, AnyPropertyType, &type,
-                                        &format, &count, &remaining, &data);
-        if (status != Success) {
-            if (data != NULL) XFree(data);
-            return RECEIVE_FAILED;
-        }
-        if (type == clipboard->incr && !receive->incremental && offset == 0) {
-            bool valid = format == 32 && count == 1 && remaining == 0 && data != NULL &&
-                         ((const unsigned long *)data)[0] <= TEXT_LIMIT;
-            if (data != NULL) XFree(data);
-            if (!valid) return RECEIVE_FAILED;
-            receive->incremental = true;
-            XDeleteProperty(display, receive->window, clipboard->property);
-            return RECEIVE_WAIT;
-        }
-        bool valid = type == receive->target && format == 8 && (count == 0 || data != NULL) &&
-                     count <= TEXT_LIMIT - receive->text.length &&
-                     remaining <= TEXT_LIMIT - receive->text.length - count &&
-                     text_append(&receive->text, data, count);
-        if (data != NULL) XFree(data);
-        if (!valid) return RECEIVE_FAILED;
-        if (remaining == 0) {
-            XDeleteProperty(display, receive->window, clipboard->property);
-            return receive->incremental && (count > 0 || offset > 0) ? RECEIVE_WAIT : RECEIVE_COMPLETE;
-        }
-        if (count == 0 || count % 4 != 0) return RECEIVE_FAILED;
-        offset += count / 4;
-    }
-}
-
-static void clipboard_finish_read(Clipboard *clipboard, Platform *platform, Terminal *terminal,
-                                  Session *session, const Config *config, bool *redraw)
-{
-    SelectionReceive *receive = &clipboard->inbound;
-    ReceiveResult result = clipboard_read(clipboard, platform->display);
-    if (result == RECEIVE_WAIT) {
-        receive->deadline = monotonic_milliseconds() + TRANSFER_TIMEOUT;
-        return;
-    }
-    if (result == RECEIVE_COMPLETE) {
-        clipboard_paste_text(terminal, session, config, &receive->text,
-                             receive->target == XA_STRING, redraw);
-    } else terminal->bell_pending = true;
-    clipboard_drop_receive(platform->display, receive);
-}
-
-static void clipboard_notify(Clipboard *clipboard, Platform *platform, Terminal *terminal,
-                             Session *session, const Config *config, const XSelectionEvent *event,
-                             bool *redraw)
-{
-    SelectionReceive *receive = &clipboard->inbound;
-    if (event->requestor != receive->window || event->selection != receive->selection ||
-        event->target != receive->target) return;
-    if (event->property == clipboard->property) {
-        clipboard_finish_read(clipboard, platform, terminal, session, config, redraw);
-    } else if (event->property == None && receive->target != XA_STRING) {
-        receive->target = XA_STRING;
-        receive->deadline = monotonic_milliseconds() + TRANSFER_TIMEOUT;
-        XConvertSelection(platform->display, receive->selection, receive->target, clipboard->property,
-                          receive->window, receive->timestamp);
-    } else clipboard_drop_receive(platform->display, receive);
-}
-
-static int clipboard_tick(Clipboard *clipboard, Display *display, int64_t now)
-{
-    int timeout = deadline_timeout(now, clipboard->inbound.deadline);
-    if (timeout == 0) {
-        clipboard_drop_receive(display, &clipboard->inbound);
-        timeout = -1;
-    }
-    for (size_t i = 0; i < OUTBOUND_TRANSFERS; ++i) {
-        SelectionSend *send = &clipboard->outbound[i];
-        int next = deadline_timeout(now, send->deadline);
-        if (next == 0) clipboard_drop_send(display, send, false);
-        else timeout = earlier_timeout(timeout, next);
+    for (size_t i = 0; i < CLIPBOARD_SENDS; ++i) {
+        ClipboardSend *send = &clipboard->send[i];
+        if (send->fd < 0) continue;
+        int deadline = deadline_timeout(now, send->deadline);
+        if (deadline == 0) clipboard_drop_send(send);
+        else timeout = earlier_timeout(timeout, deadline);
     }
     return timeout;
 }
@@ -4280,7 +4794,7 @@ typedef struct {
     size_t length;
 } KeyInput;
 
-static KeyInput keyboard_translate(KeySym key, bool control, bool alt, bool application_arrows,
+static KeyInput keyboard_translate(xkb_keysym_t key, bool control, bool alt, bool application_arrows,
                                    bool application_keypad, const char *text, int count)
 {
     const char *sequence = NULL;
@@ -4288,104 +4802,97 @@ static KeyInput keyboard_translate(KeySym key, bool control, bool alt, bool appl
         "\033[11~", "\033[12~", "\033[13~", "\033[14~", "\033[15~", "\033[17~",
         "\033[18~", "\033[19~", "\033[20~", "\033[21~", "\033[23~", "\033[24~"
     };
-    if (key >= XK_F1 && key <= XK_F12) sequence = function_keys[key - XK_F1];
-    if (application_keypad && key >= XK_KP_0 && key <= XK_KP_9) {
-        return (KeyInput){{0x1b, 'O', (unsigned char)('p' + key - XK_KP_0)}, 3};
+    if (key >= XKB_KEY_F1 && key <= XKB_KEY_F12) sequence = function_keys[key - XKB_KEY_F1];
+    if (application_keypad && key >= XKB_KEY_KP_0 && key <= XKB_KEY_KP_9) {
+        return (KeyInput){{0x1b, 'O', (unsigned char)('p' + key - XKB_KEY_KP_0)}, 3};
     }
     if (application_keypad) {
         char code = 0;
         switch (key) {
-        case XK_KP_Insert: code = 'p'; break;
-        case XK_KP_End: code = 'q'; break;
-        case XK_KP_Down: code = 'r'; break;
-        case XK_KP_Page_Down: code = 's'; break;
-        case XK_KP_Left: code = 't'; break;
-        case XK_KP_Begin: code = 'u'; break;
-        case XK_KP_Right: code = 'v'; break;
-        case XK_KP_Home: code = 'w'; break;
-        case XK_KP_Up: code = 'x'; break;
-        case XK_KP_Page_Up: code = 'y'; break;
-        case XK_KP_Delete: code = 'n'; break;
+        case XKB_KEY_KP_Insert: code = 'p'; break;
+        case XKB_KEY_KP_End: code = 'q'; break;
+        case XKB_KEY_KP_Down: code = 'r'; break;
+        case XKB_KEY_KP_Page_Down: code = 's'; break;
+        case XKB_KEY_KP_Left: code = 't'; break;
+        case XKB_KEY_KP_Begin: code = 'u'; break;
+        case XKB_KEY_KP_Right: code = 'v'; break;
+        case XKB_KEY_KP_Home: code = 'w'; break;
+        case XKB_KEY_KP_Up: code = 'x'; break;
+        case XKB_KEY_KP_Page_Up: code = 'y'; break;
+        case XKB_KEY_KP_Delete: code = 'n'; break;
         }
         if (code) return (KeyInput){{0x1b, 'O', (unsigned char)code}, 3};
     }
     switch (key) {
-    case XK_Return: case XK_KP_Enter:
-        if (key == XK_KP_Enter && application_keypad) return (KeyInput){{0x1b, 'O', 'M'}, 3};
+    case XKB_KEY_Return: case XKB_KEY_KP_Enter:
+        if (key == XKB_KEY_KP_Enter && application_keypad) return (KeyInput){{0x1b, 'O', 'M'}, 3};
         return (KeyInput){{'\r'}, 1};
-    case XK_BackSpace: return (KeyInput){{0x7f}, 1};
-    case XK_Tab: case XK_KP_Tab: return (KeyInput){{'\t'}, 1};
-    case XK_ISO_Left_Tab: sequence = "\033[Z"; break;
-    case XK_Escape: return (KeyInput){{0x1b}, 1};
-    case XK_Up: case XK_KP_Up: sequence = application_arrows ? "\033OA" : "\033[A"; break;
-    case XK_Down: case XK_KP_Down: sequence = application_arrows ? "\033OB" : "\033[B"; break;
-    case XK_Right: case XK_KP_Right: sequence = application_arrows ? "\033OC" : "\033[C"; break;
-    case XK_Left: case XK_KP_Left: sequence = application_arrows ? "\033OD" : "\033[D"; break;
-    case XK_Home: case XK_KP_Home: sequence = "\033[1~"; break;
-    case XK_End: case XK_KP_End: sequence = "\033[4~"; break;
-    case XK_Insert: case XK_KP_Insert: sequence = "\033[2~"; break;
-    case XK_Delete: case XK_KP_Delete: sequence = "\033[3~"; break;
-    case XK_Page_Up: case XK_KP_Page_Up: sequence = "\033[5~"; break;
-    case XK_Page_Down: case XK_KP_Page_Down: sequence = "\033[6~"; break;
-    case XK_KP_Multiply: if (application_keypad) sequence = "\033Oj"; break;
-    case XK_KP_Add: if (application_keypad) sequence = "\033Ok"; break;
-    case XK_KP_Separator: if (application_keypad) sequence = "\033Ol"; break;
-    case XK_KP_Subtract: if (application_keypad) sequence = "\033Om"; break;
-    case XK_KP_Decimal: if (application_keypad) sequence = "\033On"; break;
-    case XK_KP_Divide: if (application_keypad) sequence = "\033Oo"; break;
+    case XKB_KEY_BackSpace: return (KeyInput){{0x7f}, 1};
+    case XKB_KEY_Tab: case XKB_KEY_KP_Tab: return (KeyInput){{'\t'}, 1};
+    case XKB_KEY_ISO_Left_Tab: sequence = "\033[Z"; break;
+    case XKB_KEY_Escape: return (KeyInput){{0x1b}, 1};
+    case XKB_KEY_Up: case XKB_KEY_KP_Up: sequence = application_arrows ? "\033OA" : "\033[A"; break;
+    case XKB_KEY_Down: case XKB_KEY_KP_Down: sequence = application_arrows ? "\033OB" : "\033[B"; break;
+    case XKB_KEY_Right: case XKB_KEY_KP_Right: sequence = application_arrows ? "\033OC" : "\033[C"; break;
+    case XKB_KEY_Left: case XKB_KEY_KP_Left: sequence = application_arrows ? "\033OD" : "\033[D"; break;
+    case XKB_KEY_Home: case XKB_KEY_KP_Home: sequence = "\033[1~"; break;
+    case XKB_KEY_End: case XKB_KEY_KP_End: sequence = "\033[4~"; break;
+    case XKB_KEY_Insert: case XKB_KEY_KP_Insert: sequence = "\033[2~"; break;
+    case XKB_KEY_Delete: case XKB_KEY_KP_Delete: sequence = "\033[3~"; break;
+    case XKB_KEY_Page_Up: case XKB_KEY_KP_Page_Up: sequence = "\033[5~"; break;
+    case XKB_KEY_Page_Down: case XKB_KEY_KP_Page_Down: sequence = "\033[6~"; break;
+    case XKB_KEY_KP_Multiply: if (application_keypad) sequence = "\033Oj"; break;
+    case XKB_KEY_KP_Add: if (application_keypad) sequence = "\033Ok"; break;
+    case XKB_KEY_KP_Separator: if (application_keypad) sequence = "\033Ol"; break;
+    case XKB_KEY_KP_Subtract: if (application_keypad) sequence = "\033Om"; break;
+    case XKB_KEY_KP_Decimal: if (application_keypad) sequence = "\033On"; break;
+    case XKB_KEY_KP_Divide: if (application_keypad) sequence = "\033Oo"; break;
     }
 
     KeyInput input = {0};
     if (sequence != NULL) {
         input.length = strlen(sequence);
         memcpy(input.bytes, sequence, input.length);
-    } else if (control && key >= XK_a && key <= XK_z) {
-        input.bytes[input.length++] = (unsigned char)(key - XK_a + 1);
-    } else if (control && key >= XK_A && key <= XK_Z) {
-        input.bytes[input.length++] = (unsigned char)(key - XK_A + 1);
+    } else if (control && key >= XKB_KEY_a && key <= XKB_KEY_z) {
+        input.bytes[input.length++] = (unsigned char)(key - XKB_KEY_a + 1);
+    } else if (control && key >= XKB_KEY_A && key <= XKB_KEY_Z) {
+        input.bytes[input.length++] = (unsigned char)(key - XKB_KEY_A + 1);
     } else {
-        for (int i = 0; i < count && input.length < sizeof input.bytes; ++i) {
-            unsigned char byte = (unsigned char)text[i];
-            bool printable = (byte >= FIRST_GLYPH && byte <= LAST_GLYPH) || byte >= 0xa0;
-            if (printable) {
-                size_t length = byte >= 0xa0 ? 2 : 1;
-                bool prefix = alt && input.length == 0;
-                if (sizeof input.bytes - input.length < length + prefix) break;
-                if (prefix) input.bytes[input.length++] = 0x1b;
-                if (length == 2) input.bytes[input.length++] = (unsigned char)(0xc0 | (byte >> 6));
-                input.bytes[input.length++] = length == 2 ? (unsigned char)(0x80 | (byte & 0x3f)) : byte;
-            } else if (control && byte < 0x20) {
-                input.bytes[input.length++] = byte;
-            }
+        /* XKB supplies UTF-8 and applies the standard Control transformations. */
+        if (count > 0 && (control || (unsigned char)text[0] >= 0x20)) {
+            if (alt && (unsigned char)text[0] >= 0x20 && (unsigned char)text[0] != 0x7f)
+                input.bytes[input.length++] = 0x1b;
+            memcpy(input.bytes + input.length, text, (size_t)count);
+            input.length += (size_t)count;
         }
     }
     return input;
 }
 
-static KeyInput keyboard_encode(KeySym key, unsigned int modifiers, bool application_arrows,
+static KeyInput keyboard_encode(xkb_keysym_t key, unsigned int modifiers, bool application_arrows,
                                bool application_keypad, const char *text, int count)
 {
-    bool control = (modifiers & ControlMask) != 0, alt = (modifiers & Mod1Mask) != 0;
-    unsigned int parameter = 1 + !!(modifiers & ShiftMask) + 2u * alt + 4u * control;
+    bool control = (modifiers & MOD_CTRL) != 0, alt = (modifiers & MOD_ALT) != 0;
+    unsigned int parameter = 1 + !!(modifiers & MOD_SHIFT) + 2u * alt + 4u * control;
     char final = 0;
     unsigned int number = 0;
     if (parameter != 1) {
         static const unsigned int function[] = {15, 17, 18, 19, 20, 21, 23, 24};
-        if (key >= XK_F1 && key <= XK_F4) final = (char)('P' + key - XK_F1);
-        if (key >= XK_F5 && key <= XK_F12) number = function[key - XK_F5];
+        if (key >= XKB_KEY_F1 && key <= XKB_KEY_F4) final = (char)('P' + key - XKB_KEY_F1);
+        if (key >= XKB_KEY_F5 && key <= XKB_KEY_F12) number = function[key - XKB_KEY_F5];
         switch (key) {
-        case XK_Up: case XK_KP_Up: final = 'A'; break;
-        case XK_Down: case XK_KP_Down: final = 'B'; break;
-        case XK_Right: case XK_KP_Right: final = 'C'; break;
-        case XK_Left: case XK_KP_Left: final = 'D'; break;
-        case XK_Home: case XK_KP_Home: final = 'H'; break;
-        case XK_End: case XK_KP_End: final = 'F'; break;
-        case XK_Insert: case XK_KP_Insert: number = 2; break;
-        case XK_Delete: case XK_KP_Delete: number = 3; break;
-        case XK_Page_Up: case XK_KP_Page_Up: number = 5; break;
-        case XK_Page_Down: case XK_KP_Page_Down: number = 6; break;
-        case XK_Tab: case XK_KP_Tab:
-            if (modifiers & ShiftMask) key = XK_ISO_Left_Tab;
+        case XKB_KEY_Up: case XKB_KEY_KP_Up: final = 'A'; break;
+        case XKB_KEY_Down: case XKB_KEY_KP_Down: final = 'B'; break;
+        case XKB_KEY_Right: case XKB_KEY_KP_Right: final = 'C'; break;
+        case XKB_KEY_Left: case XKB_KEY_KP_Left: final = 'D'; break;
+        case XKB_KEY_Home: case XKB_KEY_KP_Home: final = 'H'; break;
+        case XKB_KEY_End: case XKB_KEY_KP_End: final = 'F'; break;
+        case XKB_KEY_Insert: case XKB_KEY_KP_Insert: number = 2; break;
+        case XKB_KEY_Delete: case XKB_KEY_KP_Delete: number = 3; break;
+        case XKB_KEY_Page_Up: case XKB_KEY_KP_Page_Up: number = 5; break;
+        case XKB_KEY_Page_Down: case XKB_KEY_KP_Page_Down: number = 6; break;
+        case XKB_KEY_Tab: case XKB_KEY_KP_Tab:
+            if (modifiers & MOD_SHIFT) key = XKB_KEY_ISO_Left_Tab;
             break;
         }
     }
@@ -4397,7 +4904,7 @@ static KeyInput keyboard_encode(KeySym key, unsigned int modifiers, bool applica
     }
     KeyInput input = keyboard_translate(key, control, alt, application_arrows, application_keypad, text, count);
     bool single_control = input.length == 1 && (input.bytes[0] <= 0x1f || input.bytes[0] == 0x7f);
-    if (alt && (single_control || key == XK_ISO_Left_Tab)) {
+    if (alt && (single_control || key == XKB_KEY_ISO_Left_Tab)) {
         memmove(input.bytes + 1, input.bytes, input.length);
         ++input.length;
         input.bytes[0] = 0x1b;
@@ -4405,122 +4912,141 @@ static KeyInput keyboard_encode(KeySym key, unsigned int modifiers, bool applica
     return input;
 }
 
-static void keyboard_event(Platform *platform, Terminal *terminal, Session *session,
-                           Clipboard *clipboard, const Config *config, XKeyEvent *event,
-                           int *font_size, bool *reload, bool *redraw)
-{
-    char text[sizeof ((KeyInput){0}).bytes];
-    KeySym key;
-    int count = XLookupString(event, text, sizeof text, &key, NULL);
-    unsigned int modifiers = event_modifiers(platform, event->state);
-    bool control = (modifiers & ControlMask) != 0;
-    bool shift = (modifiers & ShiftMask) != 0;
-    bool alt = (modifiers & Mod1Mask) != 0;
-    KeySym normalized = shortcut_key(key), unshifted = normalized;
-    if (shift && (modifiers == config->reload.modifiers || modifiers == config->zoom_in.modifiers ||
-                  modifiers == config->zoom_out.modifiers || modifiers == config->fullscreen.modifiers)) {
-        XKeyEvent base = *event;
-        char ignored[16];
-        base.state &= ~(ShiftMask | LockMask);
-        XLookupString(&base, ignored, sizeof ignored, &unshifted, NULL);
-        unshifted = shortcut_key(unshifted);
-    }
-    if (modifiers == config->reload.modifiers &&
-        (normalized == config->reload.key || unshifted == config->reload.key)) {
-        *reload = true;
-        return;
-    }
-    if (modifiers == config->zoom_in.modifiers &&
-        (normalized == config->zoom_in.key || unshifted == config->zoom_in.key)) {
-        if (*font_size < MAX_FONT_SIZE) ++*font_size;
-        return;
-    }
-    if (modifiers == config->zoom_out.modifiers &&
-        (normalized == config->zoom_out.key || unshifted == config->zoom_out.key)) {
-        if (*font_size > MIN_FONT_SIZE) --*font_size;
-        return;
-    }
-    if (config->fullscreen.key != NoSymbol && modifiers == config->fullscreen.modifiers &&
-        (normalized == config->fullscreen.key || unshifted == config->fullscreen.key)) {
-        platform_fullscreen(platform);
-        return;
-    }
-    if (control && shift && !alt) {
-        if (key == XK_c || key == XK_C) {
-            clipboard_copy(clipboard, platform, terminal, clipboard->clipboard, event->time);
-            return;
-        }
-        if (key == XK_v || key == XK_V) {
-            clipboard_paste(clipboard, platform, terminal, session, config, clipboard->clipboard,
-                            event->time, redraw);
-            return;
-        }
-    }
-    if (shift && !control && !alt && !terminal->using_alternate) {
-        size_t page = terminal->primary.screen.rows;
-        switch (key) {
-        case XK_Page_Up: case XK_KP_Page_Up: *redraw |= history_scroll(terminal, true, page); return;
-        case XK_Page_Down: case XK_KP_Page_Down: *redraw |= history_scroll(terminal, false, page); return;
-        case XK_Home: case XK_KP_Home: *redraw |= history_scroll(terminal, true, SIZE_MAX); return;
-        case XK_End: case XK_KP_End: *redraw |= history_scroll(terminal, false, SIZE_MAX); return;
-        }
-    }
-    KeyInput input = keyboard_encode(key, modifiers, terminal->application_arrows,
-                                     terminal->application_keypad, text, count);
-    if (!session_queue(session, input.bytes, input.length)) {
-        terminal->bell_pending = true;
-    } else if (input.length != 0 && config->scroll_on_input) {
-        *redraw |= history_scroll(terminal, false, SIZE_MAX);
-    }
-}
-
-/* Native X11 pointer input */
-
 typedef struct {
-    int x, y;
-    Time last_click;
     SelectionPoint last_point;
-    unsigned int clicks;
+    uint32_t last_click;
+    unsigned int clicks, buttons, generation;
+    unsigned int column, row, code;
     int64_t deadline;
-    bool last_alternate, inside;
-    unsigned int buttons, generation;
-    size_t report_column, report_row;
-    unsigned int report_code;
-    bool report_position;
+    bool last_alternate, motion_reported;
 } Mouse;
 
 typedef struct {
+    Platform *platform;
+    Terminal *terminal;
+    Session *session;
+    const Config *config;
+    const FontRenderer *renderer;
+    Clipboard *clipboard;
     Mouse mouse;
-    Clipboard clipboard;
+    pid_t link_children[8];
     int font_size;
     bool reload;
-    pid_t link_children[8];
-    int64_t link_deadline;
+    bool *redraw;
 } Interaction;
 
-static bool mouse_cell(const TerminalView *view, const FontMetrics *metrics, Padding padding, int x, int y,
-                       size_t *column, size_t *row)
+static bool shortcut_matches(Shortcut shortcut, unsigned int modifiers, xkb_keysym_t key,
+                             xkb_keysym_t unshifted)
 {
-    if (x < padding.horizontal || y < padding.vertical) return false;
-    *column = (size_t)((x - padding.horizontal) / metrics->width);
-    *row = (size_t)((y - padding.vertical) / metrics->height);
-    return *column < view->screen->columns && *row < view->screen->rows;
+    return shortcut.key != XKB_KEY_NoSymbol && modifiers == shortcut.modifiers &&
+           (key == shortcut.key || unshifted == shortcut.key);
 }
 
-static uint16_t mouse_link(Terminal *terminal, const Config *config, const FontMetrics *metrics, int x, int y)
+static void input_zoom(Interaction *input, int64_t steps)
 {
-    if (!config->hyperlinks || terminal->links == NULL) return 0;
-    TerminalView view = terminal_view(terminal);
-    size_t column, row;
-    if (!mouse_cell(&view, metrics, config->padding, x, y, &column, &row)) return 0;
-    LineView line = view_line(&view, view.first_visible + row);
-    return view_cell(&view, &line, column)->hyperlink;
+    input->font_size = config_zoom_size(input->config, input->font_size + steps * input->config->zoom_step);
 }
 
-static void link_reap(Interaction *ui)
+static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint32_t serial)
 {
-    for (size_t i = 0; i < sizeof ui->link_children / sizeof ui->link_children[0]; ++i) {
-        pid_t *child = &ui->link_children[i];
+    Interaction *input = data;
+    struct xkb_state *keys = input->platform->keys;
+    Terminal *terminal = input->terminal;
+    const Config *config = input->config;
+    xkb_keysym_t key = xkb_state_key_get_one_sym(keys, code);
+    unsigned int modifiers = keyboard_modifiers(keys);
+    const xkb_keysym_t *symbols;
+    xkb_keysym_t normalized = shortcut_key(key), unshifted = normalized;
+    if ((modifiers & MOD_SHIFT) &&
+        xkb_keymap_key_get_syms_by_level(xkb_state_get_keymap(keys), code,
+                                       xkb_state_key_get_layout(keys, code), 0, &symbols) == 1)
+        unshifted = shortcut_key(symbols[0]);
+    if (shortcut_matches(config->reload, modifiers, normalized, unshifted)) {
+        if (event == KEY_PRESS) input->reload = true;
+        return true;
+    }
+    if (shortcut_matches(config->zoom_in, modifiers, normalized, unshifted)) {
+        input_zoom(input, 1);
+        return true;
+    }
+    if (shortcut_matches(config->zoom_out, modifiers, normalized, unshifted)) {
+        input_zoom(input, -1);
+        return true;
+    }
+    if (shortcut_matches(config->zoom_reset, modifiers, normalized, unshifted)) {
+        input->font_size = config->font_size;
+        return true;
+    }
+    if (shortcut_matches(config->fullscreen, modifiers, normalized, unshifted)) {
+        if (event == KEY_PRESS) platform_fullscreen(input->platform);
+        return true;
+    }
+    if (modifiers == (MOD_CTRL | MOD_SHIFT) && (normalized == XKB_KEY_c || normalized == XKB_KEY_v)) {
+        if (event == KEY_PRESS) {
+            ClipboardChannel *clipboard = &input->clipboard->regular;
+            if (normalized == XKB_KEY_c) clipboard_copy(clipboard, input->platform, terminal, serial);
+            else clipboard_paste(clipboard, input->platform, terminal);
+        }
+        return true;
+    }
+
+    if (modifiers == MOD_SHIFT && !terminal->using_alternate) {
+        size_t page = terminal->primary.screen.rows;
+        switch (key) {
+        case XKB_KEY_Page_Up: case XKB_KEY_KP_Page_Up: *input->redraw |= history_scroll(terminal, true, page); return true;
+        case XKB_KEY_Page_Down: case XKB_KEY_KP_Page_Down: *input->redraw |= history_scroll(terminal, false, page); return true;
+        case XKB_KEY_Home: case XKB_KEY_KP_Home: *input->redraw |= history_scroll(terminal, true, SIZE_MAX); return true;
+        case XKB_KEY_End: case XKB_KEY_KP_End: *input->redraw |= history_scroll(terminal, false, SIZE_MAX); return true;
+        }
+    }
+    /* A held local shortcut must not leak into the PTY when its modifiers are released. */
+    if (event == KEY_REPEAT_SHORTCUT) return true;
+
+    char text[sizeof ((KeyInput){0}).bytes];
+    int count = xkb_state_key_get_utf8(keys, code, text, sizeof text);
+    if (count < 0 || (size_t)count >= sizeof text) count = 0;
+    KeyInput encoded = keyboard_encode(key, modifiers, terminal->application_arrows,
+                                       terminal->application_keypad, text, count);
+    if (!session_queue(input->session, encoded.bytes, encoded.length)) {
+        terminal->bell_pending = true;
+    } else if (encoded.length != 0 && config->scroll_on_input) {
+        *input->redraw |= history_scroll(terminal, false, SIZE_MAX);
+    }
+    return false;
+}
+
+/* Local pointer interaction and terminal mouse reporting */
+
+static bool mouse_cell(const Interaction *input, unsigned int *column, unsigned int *row)
+{
+    const FontMetrics *metrics = &input->renderer->metrics;
+    const TerminalScreen *screen = &terminal_buffer(input->terminal)->screen;
+    Padding padding = input->config->padding;
+    double x = input->platform->pointer_x - padding.horizontal;
+    double y = input->platform->pointer_y - padding.vertical;
+    if (x < 0 || y < 0 || x / metrics->width >= (double)screen->columns ||
+        y / metrics->height >= (double)screen->rows ||
+        x >= grid_extent(input->platform->width, padding.horizontal) ||
+        y >= grid_extent(input->platform->height, padding.vertical)) return false;
+    *column = (unsigned int)(x / metrics->width) + 1;
+    *row = (unsigned int)(y / metrics->height) + 1;
+    return true;
+}
+
+static uint16_t mouse_link(const Interaction *input)
+{
+    if (!input->config->hyperlinks || input->terminal->links == NULL) return 0;
+    unsigned int column, row;
+    if (!mouse_cell(input, &column, &row)) return 0;
+    TerminalView view = terminal_view(input->terminal);
+    LineView line = view_line(&view, view.first_visible + row - 1);
+    return view_cell(&view, &line, column - 1)->hyperlink;
+}
+
+static void link_reap(Interaction *input)
+{
+    for (size_t i = 0; i < sizeof input->link_children / sizeof *input->link_children; ++i) {
+        pid_t *child = &input->link_children[i];
         if (*child == 0) continue;
         pid_t result;
         do { result = waitpid(*child, NULL, WNOHANG); } while (result < 0 && errno == EINTR);
@@ -4528,22 +5054,22 @@ static void link_reap(Interaction *ui)
     }
 }
 
-static void link_open(Interaction *ui, const Session *session, const char *url)
+static void link_open(Interaction *input, const char *url)
 {
     extern char **environ;
-    link_reap(ui);
-    for (size_t i = 0; i < sizeof ui->link_children / sizeof ui->link_children[0]; ++i) {
-        if (ui->link_children[i] != 0) continue;
+    if (!link_valid(url, strlen(url))) return;
+    link_reap(input);
+    for (size_t i = 0; i < sizeof input->link_children / sizeof *input->link_children; ++i) {
+        if (input->link_children[i] != 0) continue;
         posix_spawnattr_t attributes;
         int error = posix_spawnattr_init(&attributes);
         if (error == 0) {
-            error = posix_spawnattr_setsigmask(&attributes, &session->original_signal_mask);
+            error = posix_spawnattr_setsigmask(&attributes, &input->session->original_signal_mask);
             if (error == 0) error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK);
             if (error == 0) {
                 char *const arguments[] = {"xdg-open", (char *)url, NULL};
-                pid_t child;
-                error = posix_spawnp(&child, arguments[0], NULL, &attributes, arguments, environ);
-                if (error == 0) ui->link_children[i] = child;
+                error = posix_spawnp(&input->link_children[i], arguments[0], NULL, &attributes, arguments, environ);
+                if (error != 0) input->link_children[i] = 0;
             }
             posix_spawnattr_destroy(&attributes);
         }
@@ -4552,345 +5078,255 @@ static void link_open(Interaction *ui, const Session *session, const char *url)
     }
 }
 
-typedef enum { MOUSE_PRESS, MOUSE_RELEASE, MOUSE_MOTION } MouseAction;
-
-static bool mouse_report(Mouse *mouse, const Platform *platform, Terminal *terminal, Session *session,
-                         const Config *config, const FontMetrics *metrics, MouseAction action,
-                         unsigned int button, unsigned int state)
+static bool mouse_reporting(const Interaction *input, unsigned int modifiers)
 {
-    if (mouse->generation != terminal->mouse_generation) {
-        mouse->generation = terminal->mouse_generation;
-        mouse->buttons = 0;
-        mouse->report_position = false;
-    }
-    unsigned int modifiers = event_modifiers(platform, state);
-    bool override = (modifiers & config->mouse_override) || terminal->selection.dragging;
-    if (!config->mouse_reporting || terminal->mouse_mode == 0 ||
-        (!terminal->using_alternate && terminal->history.offset != 0) || override) {
-        if (action == MOUSE_RELEASE && button >= Button1 && button <= Button3) {
-            mouse->buttons &= ~(1u << (button - Button1));
-            mouse->report_position = false;
-        }
-        return false;
-    }
+    const Terminal *terminal = input->terminal;
+    return input->config->mouse_reporting && terminal->mouse_mode != 0 &&
+           (terminal->using_alternate || terminal->history.offset == 0) &&
+           !(modifiers & input->config->mouse_override) && !terminal->selection.dragging;
+}
 
-    TerminalView view = terminal_view(terminal);
-    size_t column = 0, row = 0;
-    bool in_grid = mouse->x < platform->width - config->padding.horizontal &&
-                   mouse->y < platform->height - config->padding.vertical &&
-                   mouse_cell(&view, metrics, config->padding, mouse->x, mouse->y, &column, &row);
-    bool in_encoding = in_grid && (terminal->mouse_sgr || (column < 223 && row < 223));
-    unsigned int code;
-    if (action == MOUSE_MOTION) {
-        if (!in_encoding || terminal->mouse_mode == 1000 ||
-            (terminal->mouse_mode == 1002 && mouse->buttons == 0)) return true;
-        code = 32 + (mouse->buttons & 1 ? 0 : mouse->buttons & 2 ? 1 : mouse->buttons & 4 ? 2 : 3);
-    } else if (button >= Button1 && button <= Button3) {
-        code = button - Button1;
-        unsigned int bit = 1u << code;
-        if (action == MOUSE_RELEASE) {
-            bool forwarded = (mouse->buttons & bit) != 0;
-            mouse->buttons &= ~bit;
-            if (!forwarded) return true;
-            if (!terminal->mouse_sgr) code = 3;
-        }
-    } else if (action == MOUSE_PRESS && button >= Button4 && button <= 7) {
-        code = 64 + button - Button4;
-    } else return true;
-    if (!in_encoding) {
-        mouse->report_position = false;
-        return true;
-    }
-    code |= (modifiers & ShiftMask ? 4 : 0) | (modifiers & Mod1Mask ? 8 : 0) |
-            (modifiers & ControlMask ? 16 : 0);
-    if (action == MOUSE_MOTION && mouse->report_position && mouse->report_code == code &&
-        mouse->report_column == column && mouse->report_row == row) return true;
-    mouse->report_position = false;
+static void mouse_sync(Interaction *input)
+{
+    Mouse *mouse = &input->mouse;
+    if (mouse->generation == input->terminal->mouse_generation) return;
+    mouse->generation = input->terminal->mouse_generation;
+    mouse->buttons = 0;
+    mouse->motion_reported = false;
+}
 
+static unsigned int mouse_report_code(unsigned int code, unsigned int modifiers)
+{
+    return code | (modifiers & MOD_SHIFT ? 4u : 0) | (modifiers & MOD_ALT ? 8u : 0) |
+                  (modifiers & MOD_CTRL ? 16u : 0);
+}
+
+static bool mouse_send(Interaction *input, unsigned int code, unsigned int column,
+                        unsigned int row, bool release)
+{
     unsigned char bytes[32];
-    size_t count;
-    if (terminal->mouse_sgr) {
-        count = (size_t)snprintf((char *)bytes, sizeof bytes, "\033[<%u;%zu;%zu%c",
-                                 code, column + 1, row + 1, action == MOUSE_RELEASE ? 'm' : 'M');
+    size_t length;
+    if (input->terminal->mouse_sgr) {
+        length = (size_t)snprintf((char *)bytes, sizeof bytes, "\033[<%u;%u;%u%c",
+                                 code, column, row, release ? 'm' : 'M');
     } else {
-        bytes[0] = 0x1b; bytes[1] = '['; bytes[2] = 'M';
+        if (column > 223 || row > 223) return false;
+        bytes[0] = 0x1b;
+        bytes[1] = '[';
+        bytes[2] = 'M';
         bytes[3] = (unsigned char)(32 + code);
-        bytes[4] = (unsigned char)(33 + column);
-        bytes[5] = (unsigned char)(33 + row);
-        count = 6;
+        bytes[4] = (unsigned char)(32 + column);
+        bytes[5] = (unsigned char)(32 + row);
+        length = 6;
     }
-    if (session_queue(session, bytes, count)) {
-        if (action == MOUSE_PRESS && button >= Button1 && button <= Button3)
-            mouse->buttons |= 1u << (button - Button1);
-        mouse->report_position = action == MOUSE_MOTION;
-        mouse->report_column = column;
-        mouse->report_row = row;
-        mouse->report_code = code;
-    }
-    return true;
+    return session_queue(input->session, bytes, length);
 }
 
-static bool platform_focus(Platform *platform, Terminal *terminal, const XFocusChangeEvent *event)
+static SelectionPoint mouse_selection_point(const Interaction *input)
 {
-    if (event->window != platform->window || event->mode == NotifyGrab ||
-        event->mode == NotifyUngrab || event->detail == NotifyInferior) return false;
-    bool focused = event->type == FocusIn;
-    if (focused == platform->focused) return false;
-    platform->focused = focused;
-    if (terminal->focus_reporting) terminal_reply(terminal, focused ? "\033[I" : "\033[O");
-    return true;
+    TerminalView view = terminal_view(input->terminal);
+    return selection_point(&view, &input->renderer->metrics, input->config->padding,
+                           (int)input->platform->pointer_x, (int)input->platform->pointer_y);
 }
 
-static bool mouse_extend(Mouse *mouse, Terminal *terminal, const FontMetrics *metrics, Padding padding)
+static void mouse_extend(Interaction *input)
 {
-    TerminalView view = terminal_view(terminal);
-    SelectionPoint point = selection_point(&view, metrics, padding, mouse->x, mouse->y);
-    if (point.line != terminal->selection.origin.line || point.column != terminal->selection.origin.column) {
-        mouse->clicks = 0;
+    SelectionPoint point = mouse_selection_point(input);
+    const SelectionPoint origin = input->terminal->selection.origin;
+    if (point.line != origin.line || point.column != origin.column) input->mouse.clicks = 0;
+    *input->redraw |= selection_extend(input->terminal, point);
+}
+
+static void pointer_left(void *data)
+{
+    Interaction *input = data;
+    mouse_sync(input);
+    unsigned int modifiers = keyboard_modifiers(input->platform->keys);
+    for (unsigned int button = 0; button < 3; ++button) {
+        if (input->mouse.buttons & (1u << button)) {
+            unsigned int code = input->terminal->mouse_sgr ? button : 3;
+            mouse_send(input, mouse_report_code(code, modifiers),
+                       input->mouse.column, input->mouse.row, true);
+        }
     }
-    return selection_extend(terminal, point);
+    input->mouse = (Mouse){0};
+    input->terminal->selection.dragging = false;
 }
 
-static void mouse_press(Interaction *ui, Platform *platform, Terminal *terminal, Session *session,
-                        const Config *config, const FontMetrics *metrics, const XButtonEvent *event,
-                        bool *redraw)
+static void pointer_moved(void *data)
 {
-    Mouse *mouse = &ui->mouse;
-    mouse->x = event->x;
-    mouse->y = event->y;
-    mouse->inside = true;
-    unsigned int modifiers = event_modifiers(platform, event->state);
-    if (event->button == Button1 && modifiers == config->link_modifier) {
-        const char *url = link_url(terminal, mouse_link(terminal, config, metrics, mouse->x, mouse->y));
+    Interaction *input = data;
+    Mouse *mouse = &input->mouse;
+    mouse_sync(input);
+    if (input->terminal->selection.dragging) {
+        mouse_extend(input);
+        return;
+    }
+    unsigned int modifiers = keyboard_modifiers(input->platform->keys);
+    unsigned int mode = input->terminal->mouse_mode;
+    unsigned int column, row;
+    if (!mouse_reporting(input, modifiers) || mode == 1000 || (mode == 1002 && mouse->buttons == 0) ||
+        !mouse_cell(input, &column, &row)) {
+        mouse->motion_reported = false;
+        return;
+    }
+    unsigned int button = mouse->buttons & 1 ? 0 : mouse->buttons & 2 ? 1 : mouse->buttons & 4 ? 2 : 3;
+    unsigned int code = mouse_report_code(32 + button, modifiers);
+    if (mouse->motion_reported && column == mouse->column && row == mouse->row && code == mouse->code) return;
+    if (mouse_send(input, code, column, row, false)) {
+        mouse->column = column;
+        mouse->row = row;
+        mouse->code = code;
+        mouse->motion_reported = true;
+    }
+}
+
+static void pointer_button_event(void *data, uint32_t button, bool pressed, uint32_t serial, uint32_t time)
+{
+    Interaction *input = data;
+    Mouse *mouse = &input->mouse;
+    Terminal *terminal = input->terminal;
+    const Config *config = input->config;
+    unsigned int modifiers = keyboard_modifiers(input->platform->keys);
+    unsigned int code;
+    switch (button) {
+    case BTN_LEFT: code = 0; break;
+    case BTN_MIDDLE: code = 1; break;
+    case BTN_RIGHT: code = 2; break;
+    default: return;
+    }
+    unsigned int bit = 1u << code;
+    mouse_sync(input);
+    mouse->motion_reported = false;
+    if (!pressed) {
+        if (mouse->buttons & bit) {
+            mouse->buttons &= ~bit;
+            unsigned int column, row;
+            if (!mouse_cell(input, &column, &row) ||
+                (!terminal->mouse_sgr && (column > 223 || row > 223))) {
+                column = mouse->column;
+                row = mouse->row;
+            }
+            mouse_send(input, mouse_report_code(terminal->mouse_sgr ? code : 3, modifiers), column, row, true);
+        } else if (button == BTN_LEFT && terminal->selection.dragging) {
+            mouse_extend(input);
+            terminal->selection.dragging = false;
+            mouse->deadline = 0;
+            if (config->primary_selection) {
+                ClipboardChannel *primary = &input->clipboard->primary;
+                if (terminal->selection.active) clipboard_copy(primary, input->platform, terminal, serial);
+                else clipboard_clear_primary(primary, input->platform, serial);
+            }
+        }
+        return;
+    }
+    if (button == BTN_LEFT && modifiers == config->link_modifier) {
+        const char *url = link_url(terminal, mouse_link(input));
         if (url != NULL) {
-            link_open(ui, session, url);
+            mouse->clicks = 0;
+            link_open(input, url);
             return;
         }
     }
-    if (mouse_report(mouse, platform, terminal, session, config, metrics,
-                     MOUSE_PRESS, event->button, event->state)) return;
-    switch (event->button) {
-    case Button1: {
-        TerminalView view = terminal_view(terminal);
-        SelectionPoint point = selection_point(&view, metrics, config->padding, mouse->x, mouse->y);
-        if (terminal->using_alternate == mouse->last_alternate && point.line == mouse->last_point.line &&
+    if (mouse_reporting(input, modifiers)) {
+        unsigned int column, row;
+        if (mouse_cell(input, &column, &row) &&
+            mouse_send(input, mouse_report_code(code, modifiers), column, row, false)) {
+            mouse->buttons |= bit;
+            mouse->column = column;
+            mouse->row = row;
+        }
+        mouse->clicks = 0;
+        return;
+    }
+    if (button == BTN_MIDDLE && config->primary_selection) {
+        clipboard_paste(&input->clipboard->primary, input->platform, terminal);
+    } else if (button == BTN_LEFT) {
+        SelectionPoint point = mouse_selection_point(input);
+        if (mouse->last_alternate == terminal->using_alternate && point.line == mouse->last_point.line &&
             point.column == mouse->last_point.column &&
-            (uint32_t)(event->time - mouse->last_click) <= 350) mouse->clicks = mouse->clicks % 3 + 1;
+            (uint32_t)(time - mouse->last_click) <= (uint32_t)config->click_interval)
+            mouse->clicks = mouse->clicks % 3 + 1;
         else mouse->clicks = 1;
         mouse->last_point = point;
         mouse->last_alternate = terminal->using_alternate;
-        mouse->last_click = event->time;
+        mouse->last_click = time;
         mouse->deadline = 0;
         SelectionMode mode = mouse->clicks == 3 ? SELECT_LINE : mouse->clicks == 2 ? SELECT_WORD : SELECT_CHARACTER;
         selection_start(terminal, point, mode);
-        *redraw = true;
-        break;
-    }
-    case Button2:
-        clipboard_paste(&ui->clipboard, platform, terminal, session, config, XA_PRIMARY, event->time, redraw);
-        break;
-    case Button4: case Button5:
-        if (history_scroll(terminal, event->button == Button4, 3)) {
-            if (terminal->selection.dragging) mouse_extend(mouse, terminal, metrics, config->padding);
-            *redraw = true;
-        }
-        break;
+        *input->redraw = true;
     }
 }
 
-static int mouse_tick(Mouse *mouse, Terminal *terminal, const FontMetrics *metrics,
-                      Padding padding, int64_t now, bool *redraw)
+static void pointer_scroll(void *data, uint32_t axis, int steps, unsigned int modifiers)
 {
-    const History *history = &terminal->history;
-    int bottom = padding.vertical + (int)terminal->primary.screen.rows * metrics->height;
-    bool up = mouse->y < padding.vertical && history->offset < history->count;
-    bool down = mouse->y >= bottom && history->offset > 0;
+    Interaction *input = data;
+    bool vertical = axis == WL_POINTER_AXIS_VERTICAL_SCROLL;
+    if (modifiers & MOD_CTRL) {
+        if (vertical) input_zoom(input, -(int64_t)steps);
+        return;
+    }
+    bool up = steps < 0;
+    size_t count = (size_t)(up ? -steps : steps);
+    if (mouse_reporting(input, modifiers)) {
+        unsigned int column, row;
+        if (!mouse_cell(input, &column, &row)) return;
+        unsigned int code = mouse_report_code((vertical ? 64u : 66u) + !up, modifiers);
+        for (size_t i = 0; i < count; ++i) {
+            if (!mouse_send(input, code, column, row, false)) break;
+        }
+    } else if (vertical) {
+        size_t lines = (size_t)input->config->scroll_lines;
+        if (history_scroll(input->terminal, up, minimum(count, SIZE_MAX / lines) * lines)) {
+            if (input->terminal->selection.dragging) mouse_extend(input);
+            *input->redraw = true;
+        }
+    }
+}
+
+static int mouse_tick(Interaction *input, int64_t now)
+{
+    Mouse *mouse = &input->mouse;
+    Terminal *terminal = input->terminal;
+    const FontMetrics *metrics = &input->renderer->metrics;
+    int top = input->config->padding.vertical;
+    int bottom = top + (int)terminal->primary.screen.rows * metrics->height;
+    double y = input->platform->pointer_y;
+    bool up = y < top && terminal->history.offset < terminal->history.count;
+    bool down = y >= bottom && terminal->history.offset > 0;
     if (!terminal->selection.dragging || terminal->using_alternate || (!up && !down) || now < 0) {
         mouse->deadline = 0;
         return -1;
     }
     if (mouse->deadline == 0) mouse->deadline = now + 55;
     if (now >= mouse->deadline) {
-        int distance = up ? padding.vertical - mouse->y : mouse->y - bottom;
+        double distance = up ? top - y : y - bottom;
         size_t lines = 1 + minimum((size_t)(distance / metrics->height), 7);
         if (history_scroll(terminal, up, lines)) {
-            mouse_extend(mouse, terminal, metrics, padding);
-            *redraw = true;
+            mouse_extend(input);
+            *input->redraw = true;
         }
         mouse->deadline = now + 55;
     }
     return deadline_timeout(now, mouse->deadline);
 }
 
-/* Application lifecycle */
-
-static bool platform_events(Platform *platform, Terminal *terminal, Session *session,
-                            Interaction *ui, const Config *config, const FontMetrics *metrics,
-                            bool *redraw)
-{
-    Display *display = platform->display;
-    Clipboard *clipboard = &ui->clipboard;
-    for (unsigned int i = 0; i < 128 && XPending(display) > 0; ++i) {
-        XEvent event;
-        XNextEvent(display, &event);
-        switch (event.type) {
-        case ClientMessage:
-            if (event.xclient.window == platform->window &&
-                event.xclient.message_type == platform->wm_protocols &&
-                event.xclient.format == 32 &&
-                (Atom)event.xclient.data.l[0] == platform->wm_delete_window) {
-                return false;
-            }
-            break;
-        case DestroyNotify:
-            if (event.xdestroywindow.window == platform->window) {
-                platform->window = None;
-                return false;
-            }
-            for (size_t slot = 0; slot < OUTBOUND_TRANSFERS; ++slot) {
-                SelectionSend *send = &clipboard->outbound[slot];
-                if (send->requestor == event.xdestroywindow.window) clipboard_drop_send(display, send, true);
-            }
-            break;
-        case ConfigureNotify:
-            if (event.xconfigure.window == platform->window &&
-                event.xconfigure.width > 0 && event.xconfigure.width <= USHRT_MAX &&
-                event.xconfigure.height > 0 && event.xconfigure.height <= USHRT_MAX &&
-                (platform->width != event.xconfigure.width ||
-                 platform->height != event.xconfigure.height)) {
-                platform->width = event.xconfigure.width;
-                platform->height = event.xconfigure.height;
-                *redraw = true;
-            }
-            break;
-        case Expose:
-            if (event.xexpose.window == platform->window) *redraw = true;
-            break;
-        case MapNotify:
-            if (event.xmap.window == platform->window) {
-                platform->mapped = true;
-                *redraw = true;
-            }
-            break;
-        case UnmapNotify:
-            if (event.xunmap.window == platform->window) {
-                platform->mapped = false;
-                ui->mouse.inside = false;
-                ui->mouse.buttons = 0;
-                ui->mouse.report_position = false;
-                terminal->selection.dragging = false;
-            }
-            break;
-        case KeyPress:
-            keyboard_event(platform, terminal, session, clipboard, config, &event.xkey,
-                           &ui->font_size, &ui->reload, redraw);
-            break;
-        case ButtonPress:
-            mouse_press(ui, platform, terminal, session, config, metrics, &event.xbutton, redraw);
-            break;
-        case MotionNotify:
-            ui->mouse.x = event.xmotion.x;
-            ui->mouse.y = event.xmotion.y;
-            if (terminal->selection.dragging) {
-                *redraw |= mouse_extend(&ui->mouse, terminal, metrics, config->padding);
-            } else {
-                mouse_report(&ui->mouse, platform, terminal, session, config, metrics,
-                             MOUSE_MOTION, 0, event.xmotion.state);
-            }
-            break;
-        case EnterNotify: case LeaveNotify:
-            ui->mouse.inside = event.type == EnterNotify;
-            ui->mouse.x = event.xcrossing.x;
-            ui->mouse.y = event.xcrossing.y;
-            ui->mouse.report_position = false;
-            break;
-        case ButtonRelease:
-            ui->mouse.x = event.xbutton.x;
-            ui->mouse.y = event.xbutton.y;
-            if (event.xbutton.button == Button1 && terminal->selection.dragging) {
-                *redraw |= mouse_extend(&ui->mouse, terminal, metrics, config->padding);
-                terminal->selection.dragging = false;
-                clipboard_copy(clipboard, platform, terminal, XA_PRIMARY, event.xbutton.time);
-            } else {
-                mouse_report(&ui->mouse, platform, terminal, session, config, metrics,
-                             MOUSE_RELEASE, event.xbutton.button, event.xbutton.state);
-            }
-            break;
-        case FocusIn: case FocusOut:
-            *redraw |= platform_focus(platform, terminal, &event.xfocus);
-            break;
-        case SelectionRequest:
-            clipboard_request(clipboard, platform, &event.xselectionrequest);
-            break;
-        case SelectionNotify:
-            clipboard_notify(clipboard, platform, terminal, session, config, &event.xselection, redraw);
-            break;
-        case SelectionClear: {
-            OwnedSelection *owned = clipboard_owner(clipboard, event.xselectionclear.selection);
-            if (owned != NULL && !timestamp_before(event.xselectionclear.time, owned->timestamp)) {
-                text_destroy(&owned->text);
-                if (event.xselectionclear.selection == XA_PRIMARY && terminal->selection.active &&
-                    !terminal->selection.dragging) {
-                    terminal->selection.active = false;
-                    *redraw = true;
-                }
-            }
-            break;
-        }
-        case PropertyNotify:
-            if (event.xproperty.state == PropertyDelete) {
-                clipboard_send_chunk(clipboard, display, &event.xproperty);
-            } else if (clipboard->inbound.incremental && event.xproperty.window == clipboard->inbound.window &&
-                       event.xproperty.atom == clipboard->property) {
-                clipboard_finish_read(clipboard, platform, terminal, session, config, redraw);
-            }
-            break;
-        case MappingNotify:
-            XRefreshKeyboardMapping(&event.xmapping);
-            if (event.xmapping.request != MappingPointer) platform_modifiers(platform);
-            break;
-        }
-    }
-    return true;
-}
-
 typedef struct {
     int64_t next, flash_end;
 } Bell;
 
-static void platform_urgency(Platform *platform, bool enabled)
+static int bell_tick(Bell *bell, Terminal *terminal, const Config *config, int64_t now, bool *redraw)
 {
-    XWMHints *existing = XGetWMHints(platform->display, platform->window);
-    XWMHints hints = existing != NULL ? *existing : (XWMHints){0};
-    if (existing != NULL) XFree(existing);
-    if (enabled) hints.flags |= XUrgencyHint;
-    else hints.flags &= ~XUrgencyHint;
-    XSetWMHints(platform->display, platform->window, &hints);
-    platform->urgent = enabled;
-}
-
-static int bell_tick(Bell *bell, Platform *platform, Terminal *terminal, const Config *config,
-                    int64_t now, bool *redraw)
-{
-    if (platform->urgent && (platform->focused || !config->bell_urgency))
-        platform_urgency(platform, false);
     if (bell->flash_end && (now < 0 || now >= bell->flash_end || !config->visual_bell)) {
         bell->flash_end = 0;
         *redraw = true;
     }
-    bool pending = terminal->bell_pending;
-    terminal->bell_pending = false;
-    if (pending && now >= 0 && now >= bell->next &&
-        (config->audible_bell || config->visual_bell || config->bell_urgency)) {
+    if (terminal->bell_pending && config->visual_bell && now >= 0 && now >= bell->next) {
         bell->next = now + 250;
-        if (config->audible_bell) XBell(platform->display, 0);
-        if (config->visual_bell && platform->mapped) {
-            bell->flash_end = now + 100;
-            *redraw = true;
-        }
-        if (config->bell_urgency && !platform->focused && !platform->urgent)
-            platform_urgency(platform, true);
+        bell->flash_end = now + 100;
+        *redraw = true;
     }
+    terminal->bell_pending = false;
     return deadline_timeout(now, bell->flash_end);
 }
 
@@ -4903,23 +5339,6 @@ static void render_bell(int width, int height, TerminalColor color)
     render_rectangle(0, 0, 1, height);
     render_rectangle(width - 1, 0, 1, height);
     glEnd();
-}
-
-static int platform_compositor_tick(Platform *platform, const Config *config, int64_t now,
-                                    bool *redraw)
-{
-    if (!platform->argb || config->opacity >= 1.0f || !platform->mapped) {
-        platform->compositor_check = 0;
-        platform->composited = false;
-        return -1;
-    }
-    if (platform->compositor_check == 0 || (now >= 0 && now >= platform->compositor_check)) {
-        bool active = XGetSelectionOwner(platform->display, platform->compositor_selection) != None;
-        *redraw |= active != platform->composited;
-        platform->composited = active;
-        platform->compositor_check = now >= 0 ? now + 2000 : 1;
-    }
-    return deadline_timeout(now, platform->compositor_check);
 }
 
 typedef struct {
@@ -4959,7 +5378,7 @@ static bool font_zoom(FontRenderer *renderer, Terminal *terminal, const Config *
     Config zoomed = *config;
     zoomed.font_size = size;
     FontRenderer next = {0};
-    const char *error = font_open(&next, &zoomed);
+    const char *error = font_open(&next, &zoomed, renderer->config);
     if (error == NULL) error = font_make_atlas(&next);
     if (error == NULL && !terminal_resize_window(terminal, platform->width, platform->height,
                                                  config->padding, &next.metrics)) {
@@ -5028,13 +5447,14 @@ static bool config_reload(Config *config, Terminal *terminal, FontRenderer *rend
             goto failed;
         }
     }
-    int size = next.font_size == config->font_size ? renderer->size : next.font_size;
+    int size = next.font_size == config->font_size ? config_zoom_size(&next, renderer->size)
+                                                  : next.font_size;
     bool change_font = size != renderer->size || strcmp(font_family(&next), font_family(config)) != 0 ||
                        next.letter_spacing != config->letter_spacing || next.line_spacing != config->line_spacing;
     if (change_font) {
         Config sized = next;
         sized.font_size = size;
-        error = font_open(&font, &sized);
+        error = font_open(&font, &sized, NULL);
         if (error == NULL) error = font_make_atlas(&font);
         if (error != NULL) goto failed;
     }
@@ -5062,173 +5482,216 @@ failed:
     return false;
 }
 
-static const char *run(Platform *platform, Terminal *terminal, Session *session,
-                       Config *config, FontRenderer *renderer, Interaction *ui, char *zoom_path)
+static const char *platform_poll(Platform *platform, struct pollfd *events, nfds_t count, int timeout)
 {
-    Display *display = platform->display;
-    int x11_fd = ConnectionNumber(display);
+    struct wl_display *display = platform->display;
+    /* EGL can queue Wayland events while swapping. Dispatch them before polling again. */
+    if (wl_display_prepare_read(display) < 0)
+        return errno == EAGAIN ? NULL : "could not prepare to read Wayland events";
+
+    if (wl_display_flush(display) < 0) {
+        if (errno != EAGAIN) {
+            wl_display_cancel_read(display);
+            return "could not write to the Wayland display";
+        }
+        events[0].events |= POLLOUT;
+    }
+
+    int ready = poll(events, count, timeout);
+    int poll_error = errno;
+    if (ready > 0 && (events[0].revents & POLLIN)) {
+        if (wl_display_read_events(display) < 0) return "could not read from the Wayland display";
+    } else {
+        wl_display_cancel_read(display);
+    }
+    if (ready < 0 && poll_error != EINTR) return "could not wait for Wayland and PTY activity";
+    if (events[0].revents & (POLLHUP | POLLERR | POLLNVAL)) return "lost the Wayland connection";
+    return NULL;
+}
+
+static const char *run(Platform *platform, Terminal *terminal, Session *session,
+                       Config *config, FontRenderer *renderer, Clipboard *clipboard,
+                       char *zoom_path, bool *save_zoom)
+{
+    int display_fd = wl_display_get_fd(platform->display);
     int width = platform->width, height = platform->height;
-    if (!terminal_resize_window(terminal, width, height, config->padding, &renderer->metrics)) {
-        return "could not allocate the screen buffer";
-    }
-    const char *error = session_open(session, session_size(&terminal->primary.screen, width, height,
-                                                           config->padding), x11_fd, config);
-    if (error != NULL) {
-        return error;
-    }
     terminal->reply = session_reply;
     terminal->reply_context = session;
-    ui->font_size = renderer->size;
 
     bool redraw = true;
-    bool output_dirty = false;
-    bool pty_hangup = false;
-    int64_t next_frame = 0, drain_deadline = 0;
+    bool focused = false, pty_hangup = false, pty_closed = false;
+    int64_t drain_deadline = 0, link_deadline = 0, zoom_deadline = 0;
     CursorBlink blink = {0};
     Bell bell = {0};
+    Interaction input = {.platform = platform, .terminal = terminal, .session = session,
+                         .config = config, .renderer = renderer, .clipboard = clipboard,
+                         .font_size = renderer->size, .redraw = &redraw};
+    platform->key_pressed = keyboard_event;
+    platform->scrolled = pointer_scroll;
+    platform->pointer_button_event = pointer_button_event;
+    platform->pointer_moved = pointer_moved;
+    platform->pointer_left = pointer_left;
+    platform->input_data = &input;
+
+    if (!clipboard_sync(clipboard, platform, config)) return "could not initialize Wayland selections";
     for (;;) {
-        if (!platform_events(platform, terminal, session, ui, config, &renderer->metrics, &redraw)) {
-            return NULL;
+        if (wl_display_dispatch_pending(platform->display) < 0) return "lost the Wayland connection";
+        if (platform->error != NULL || platform->closed) return platform->error;
+        redraw |= platform->needs_redraw;
+        platform->needs_redraw = false;
+        if (focused != platform->focused) {
+            focused = platform->focused;
+            redraw = true;
+            if (terminal->focus_reporting && !pty_closed)
+                terminal_reply(terminal, focused ? "\033[I" : "\033[O");
         }
-        bool reloaded = false;
-        if (ui->reload) {
-            ui->reload = false;
-            bool decorated = config->decorations;
+
+        bool reloaded = false, zoomed = false;
+        if (input.reload) {
+            input.reload = false;
+            int previous_default = config->font_size;
             reloaded = config_reload(config, terminal, renderer, platform);
             if (reloaded) {
-                ui->font_size = renderer->size;
-                if (decorated != config->decorations) platform_decorations(platform, config->decorations);
+                input.font_size = renderer->size;
+                if (previous_default != config->font_size) *save_zoom = false;
+                xdg_toplevel_set_app_id(platform->toplevel, platform_app_id(config));
             }
-            redraw |= reloaded;
         }
-        bool zoomed = false;
-        if (ui->font_size != renderer->size) {
-            zoomed = font_zoom(renderer, terminal, config, platform, ui->font_size);
-            ui->font_size = renderer->size;
-            redraw |= zoomed;
-            if (zoomed) config_save_zoom(zoom_path, config->font_size, renderer->size);
+        if (!clipboard_sync(clipboard, platform, config)) return "could not initialize Wayland selections";
+        if (!pty_closed) platform_repeat_key(platform, monotonic_milliseconds());
+        if (input.font_size != renderer->size) {
+            zoomed = font_zoom(renderer, terminal, config, platform, input.font_size);
+            input.font_size = renderer->size;
+            if (zoomed && zoom_path != NULL) {
+                *save_zoom = true;
+                zoom_deadline = monotonic_milliseconds() + 250;
+            } else if (!zoomed) {
+                platform->repeat.key = 0;
+            }
         }
-        if (reloaded || zoomed) platform_size_hints(platform, config->padding, &renderer->metrics);
-        if (reloaded || zoomed || width != platform->width || height != platform->height) {
+        if (reloaded) platform_size_hints(platform, config->padding, &renderer->metrics);
+        bool resized = width != platform->width || height != platform->height;
+        if (resized) {
             width = platform->width;
             height = platform->height;
-            if (!reloaded && !zoomed && !terminal_resize_window(terminal, width, height, config->padding, &renderer->metrics)) {
-                return "could not resize the screen buffer";
-            }
-            PtyResult status = session_resize(session, session_size(&terminal->primary.screen, width,
-                                                                     height, config->padding));
-            if (status != PTY_OPEN) {
-                return status == PTY_FAILED ? "could not resize the pseudoterminal"
-                                            : session_check_startup(session);
+            if (!reloaded && !zoomed && !terminal_resize_window(terminal, width, height, config->padding,
+                                                                &renderer->metrics))
+                return "could not resize the screen buffers";
+            wl_egl_window_resize(platform->window, width, height, 0, 0);
+        }
+        if (resized || reloaded || zoomed) {
+            redraw = true;
+            if (!pty_closed) {
+                PtyResult result = session_resize(session, session_size(&terminal->primary.screen, width,
+                                                                       height, config->padding));
+                if (result == PTY_FAILED) return "could not resize the pseudoterminal";
+                if (result == PTY_CLOSED) pty_hangup = true;
             }
         }
-        int64_t now = monotonic_milliseconds();
+
         if (terminal->title_dirty) {
             platform_title(platform, config, terminal->dynamic_title);
             terminal->title_dirty = false;
         }
-        int timeout = clipboard_tick(&ui->clipboard, display, now);
-        timeout = earlier_timeout(timeout, bell_tick(&bell, platform, terminal, config, now, &redraw));
-        timeout = earlier_timeout(timeout, platform_compositor_tick(platform, config, now, &redraw));
-        if (terminal->links_dirty) {
-            if (ui->link_deadline == 0) ui->link_deadline = now + 500;
-            if (now < 0 || now >= ui->link_deadline) {
-                links_collect(terminal);
-                ui->link_deadline = 0;
-            } else timeout = earlier_timeout(timeout, deadline_timeout(now, ui->link_deadline));
+        int64_t now = monotonic_milliseconds();
+        int timeout = clipboard_timeout(clipboard, terminal, now);
+        timeout = earlier_timeout(timeout, bell_tick(&bell, terminal, config, now, &redraw));
+        timeout = earlier_timeout(timeout, mouse_tick(&input, now));
+        if (*save_zoom) {
+            if (now < 0 || now >= zoom_deadline) {
+                config_save_zoom(zoom_path, config->font_size, renderer->size);
+                *save_zoom = false;
+            } else timeout = earlier_timeout(timeout, deadline_timeout(now, zoom_deadline));
         }
-        timeout = earlier_timeout(timeout, mouse_tick(&ui->mouse, terminal, &renderer->metrics,
-                                                     config->padding, now, &redraw));
-        uint16_t hover = ui->mouse.inside && !terminal->selection.dragging ?
-            mouse_link(terminal, config, &renderer->metrics, ui->mouse.x, ui->mouse.y) : 0;
+        if (terminal->links_dirty) {
+            if (link_deadline == 0) link_deadline = now + 500;
+            if (now < 0 || now >= link_deadline) {
+                links_collect(terminal);
+                link_deadline = 0;
+            } else timeout = earlier_timeout(timeout, deadline_timeout(now, link_deadline));
+        }
+        uint16_t hover = platform->pointer_inside && !terminal->selection.dragging ? mouse_link(&input) : 0;
         if (hover != terminal->hovered_link) {
             terminal->hovered_link = hover;
             redraw = true;
         }
         const TerminalBuffer *buffer = terminal_buffer(terminal);
         TerminalView view = terminal_view(terminal);
-        if (platform->mapped && output_dirty) {
-            int frame_timeout = deadline_timeout(now, next_frame);
-            if (frame_timeout <= 0) redraw = true;
-            else timeout = earlier_timeout(timeout, frame_timeout);
-        }
-        timeout = earlier_timeout(timeout, cursor_timeout(&blink, platform->mapped && platform->focused &&
-                                    buffer->cursor_visible && buffer->cursor_blink &&
-                                    view.first_visible == view.first_live, config->blink_interval, now, &redraw));
-        if (redraw && platform->mapped) {
+        timeout = earlier_timeout(timeout, cursor_timeout(&blink, focused && buffer->cursor_visible &&
+                                    buffer->cursor_blink && view.first_visible == view.first_live,
+                                    config->blink_interval, now, &redraw));
+        if (redraw && platform->frame == NULL) {
             render_screen(renderer, &view, width, height, buffer->cursor.column, buffer->cursor.row,
                           buffer->cursor_visible && blink.visible, buffer->cursor_style, config,
-                          platform->composited ? config->opacity : 1.0f);
+                          config->opacity);
             if (bell.flash_end) render_bell(width, height, config->cursor);
-            glXSwapBuffers(display, platform->glx_window != None ? platform->glx_window : platform->window);
+            const char *error = platform_swap(platform);
+            if (error != NULL) return error;
             redraw = false;
-            output_dirty = false;
-            next_frame = now >= 0 ? now + 16 : 0;
         }
 
-        enum { X11, PTY, CHILD, STARTUP };
-        struct pollfd events[] = {
-            [X11] = {x11_fd, POLLIN, 0},
-            [PTY] = {session->master, POLLIN | (session->input_length > 0 ? POLLOUT : 0), 0},
-            [CHILD] = {session->child_signal, POLLIN, 0},
-            [STARTUP] = {session->startup, POLLIN, 0}
+        if (pty_closed && session->child == 0) return session_check_startup(session);
+        if (pty_closed || (session->child == 0 && !pty_hangup)) {
+            if (drain_deadline == 0) drain_deadline = now + 250;
+            if (now < 0 || now >= drain_deadline) return session_check_startup(session);
+            timeout = earlier_timeout(timeout, deadline_timeout(now, drain_deadline));
+        }
+
+        enum { WAYLAND, PTY, SIGNAL, STARTUP, PASTE, SENDS };
+        struct pollfd events[SENDS + CLIPBOARD_SENDS] = {
+            [WAYLAND] = {display_fd, POLLIN, 0},
+            [PTY] = {pty_closed ? -1 : session->master, POLLIN | (session->input_length ? POLLOUT : 0), 0},
+            [SIGNAL] = {session->signal_fd, POLLIN, 0},
+            [STARTUP] = {session->startup, POLLIN, 0},
+            [PASTE] = {clipboard->receive.fd, POLLIN, 0}
         };
+        for (size_t i = 0; i < CLIPBOARD_SENDS; ++i)
+            events[SENDS + i] = (struct pollfd){clipboard->send[i].fd, POLLOUT, 0};
         bool parser_pending = session->output_start < session->output_end;
-        if (parser_pending || pty_hangup || session->child == 0 || XPending(display) > 0) timeout = 0;
-        int ready = poll(events, sizeof events / sizeof events[0], timeout);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return "could not wait for X11 and PTY activity";
-        }
-        if (events[X11].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            return "lost the X11 connection";
-        }
-        if (events[STARTUP].revents != 0) {
+        if (!pty_closed && (parser_pending || pty_hangup)) timeout = 0;
+        if (!pty_closed && platform->repeat.key != 0)
+            timeout = earlier_timeout(timeout, deadline_timeout(monotonic_milliseconds(), platform->repeat.deadline));
+        const char *error = platform_poll(platform, events, sizeof events / sizeof events[0], timeout);
+        if (error != NULL) return error;
+
+        if (events[STARTUP].revents) {
             error = session_check_startup(session);
-            if (error != NULL) {
-                return error;
+            if (error != NULL) return error;
+        }
+        if (events[SIGNAL].revents & (POLLHUP | POLLERR | POLLNVAL))
+            return "lost the signal notification descriptor";
+        if (events[SIGNAL].revents & POLLIN) {
+            struct signalfd_siginfo signals[8];
+            ssize_t count = read(session->signal_fd, signals, sizeof signals);
+            if (count < 0 && errno != EINTR && errno != EAGAIN)
+                return "could not read signal notifications";
+            for (ssize_t i = 0; i < count / (ssize_t)sizeof *signals; ++i) {
+                if (signals[i].ssi_signo == SIGHUP) input.reload = true;
+                if (signals[i].ssi_signo == SIGCHLD) {
+                    session_reap(session, WNOHANG);
+                    link_reap(&input);
+                }
             }
         }
-        if (events[CHILD].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            return "lost the shell exit notification descriptor";
-        }
-        if (events[CHILD].revents & POLLIN) {
-            struct signalfd_siginfo signal_info;
-            ssize_t count;
-            do {
-                count = read(session->child_signal, &signal_info, sizeof signal_info);
-            } while (count < 0 && errno == EINTR);
-            session_reap(session, WNOHANG);
-            link_reap(ui);
-            if (session->child == 0 && drain_deadline == 0) drain_deadline = monotonic_milliseconds() + 250;
-        }
-        if (events[PTY].revents & POLLNVAL) {
-            return "lost the pseudoterminal descriptor";
-        }
+        if (events[PTY].revents & POLLNVAL) return "lost the pseudoterminal descriptor";
         pty_hangup |= (events[PTY].revents & (POLLHUP | POLLERR)) != 0;
-        /* A hangup still allows queued bytes to be read. Only time out a slave that remains open. */
-        if (!pty_hangup && drain_deadline != 0 && monotonic_milliseconds() >= drain_deadline) {
-            return session_check_startup(session);
+        if (!pty_closed && ((events[PTY].revents & POLLIN) || parser_pending || pty_hangup)) {
+            PtyResult result = session_read(session, terminal, &redraw, pty_hangup);
+            if (result == PTY_FAILED) return "could not read from the pseudoterminal";
+            pty_closed = result == PTY_CLOSED;
         }
-        if ((events[PTY].revents & POLLIN) || parser_pending || pty_hangup || session->child == 0) {
-            PtyResult status = session_read(session, terminal, &output_dirty, pty_hangup || session->child == 0);
-            if (status == PTY_FAILED) {
-                return "could not read from the pseudoterminal";
-            }
-            if (status == PTY_CLOSED) {
-                return session_check_startup(session);
-            }
-        }
-        if (events[PTY].revents & POLLOUT) {
-            PtyResult status = session_write(session);
-            if (status == PTY_FAILED) return "could not write to the pseudoterminal";
-            if (status == PTY_CLOSED) {
+        if (!pty_closed && (events[PTY].revents & POLLOUT)) {
+            PtyResult result = session_write(session);
+            if (result == PTY_FAILED) return "could not write to the pseudoterminal";
+            if (result == PTY_CLOSED) {
                 session->input_length = 0;
                 pty_hangup = true;
             }
         }
+        if (pty_closed) clipboard_drop_receive(&clipboard->receive);
+        else clipboard_read(&clipboard->receive, session, terminal, config, &redraw, events[PASTE].revents);
+        for (size_t i = 0; i < CLIPBOARD_SENDS; ++i)
+            clipboard_write(&clipboard->send[i], events[SENDS + i].revents);
     }
 }
 
@@ -5237,13 +5700,14 @@ static void print_help(void)
     puts("Usage: deal [OPTIONS] [-e COMMAND [ARGS...]]\n"
          "  --help                    Show this help\n"
          "  --version                 Show the version\n"
-         "  --config PATH             Read a different Lua configuration\n"
+         "  --config PATH             Read a different INI configuration\n"
          "  --working-directory PATH  Start the child in PATH\n"
          "  --title TITLE             Set the initial window title\n"
-         "  --class CLASS             Set the X11 window class\n"
+         "  --app-id ID               Set the Wayland application ID\n"
+         "  --class ID                Alias for --app-id\n"
          "  --columns N               Set the initial grid width\n"
          "  --rows N                  Set the initial grid height\n"
-         "  --diagnostics             Print build, X11, rendering and terminal details\n"
+         "  --diagnostics             Report Wayland, EGL, OpenGL and configuration\n"
          "  -e COMMAND [ARGS...]      Execute a program with the remaining arguments");
 }
 
@@ -5277,14 +5741,14 @@ static int options_parse(Options *options, int argc, char **argv)
         }
         if (strcmp(key, "--config") == 0) options->config_path = value;
         else if (strcmp(key, "--working-directory") == 0) options->directory = value;
-        else if (strcmp(key, "--title") == 0 || strcmp(key, "--class") == 0) {
+        else if (strcmp(key, "--title") == 0 || strcmp(key, "--app-id") == 0 || strcmp(key, "--class") == 0) {
             size_t length = strlen(value);
             if (length > TITLE_LIMIT || !osc_text_valid(value, length, false)) {
                 fprintf(stderr, "deal: invalid value for %s\n", key);
                 return 2;
             }
             if (strcmp(key, "--title") == 0) options->title = value;
-            else options->window_class = value;
+            else options->app_id = value;
         } else if (strcmp(key, "--columns") == 0 || strcmp(key, "--rows") == 0) {
             bool columns = strcmp(key, "--columns") == 0;
             int limit = columns ? 512 : 256;
@@ -5307,21 +5771,25 @@ static int options_parse(Options *options, int argc, char **argv)
 static void print_diagnostics(const Config *config, const FontRenderer *renderer,
                               const Platform *platform, const char *graphical_error)
 {
-    char *default_path = config->options->config_path == NULL ? config_path("init.lua", true) : NULL;
+    char *default_path = config->options->config_path == NULL ? config_path("deal.conf", true) : NULL;
     const char *path = config->options->config_path != NULL ? config->options->config_path : default_path;
     char packaged[PATH_MAX];
     const char *term = config_term(config, packaged);
-    printf("deal %s\nBuild platform: Linux X11 (C11, %zu-bit)\nConfiguration: %s\nTERM: %s%s\n",
+    printf("deal %s\nBuild platform: Linux Wayland (C11, %zu-bit)\nConfiguration (INI): %s\nTERM: %s%s\n",
            deal_version, sizeof(void *) * CHAR_BIT, path != NULL ? path : "unavailable", term,
            config->custom_term && strcmp(term, "deal") != 0 ? " (deal terminfo unavailable)" : "");
     free(default_path);
-    printf("X11: %s\n", platform->display != NULL ? "available" : "unavailable");
-    if (platform->compositor_selection != None)
-        printf("Compositor: %s\nARGB visual: %s\n",
-               XGetSelectionOwner(platform->display, platform->compositor_selection) != None ? "available" : "unavailable",
-               platform->argb ? "available" : "unavailable");
-    else puts("Compositor: unavailable");
-    if (glXGetCurrentContext() != NULL) {
+    printf("Wayland: %s\nxdg-shell: %s\nApplication ID: %s\n",
+           platform->display != NULL ? "connected" : "unavailable",
+           platform->configured ? "configured" : "unavailable", platform_app_id(config));
+    printf("Clipboard protocol: %s\nPrimary selection: %s\n",
+           platform->clipboard_manager != NULL ? "available" : "unavailable",
+           platform->primary_manager == NULL ? "unavailable" : config->primary_selection ? "enabled" : "disabled");
+    if (platform->egl_initialized) {
+        const char *vendor = eglQueryString(platform->egl, EGL_VENDOR);
+        printf("EGL: %d.%d (%s)\n", platform->egl_major, platform->egl_minor, vendor ? vendor : "unknown");
+    } else puts("EGL: unavailable");
+    if (eglGetCurrentContext() != EGL_NO_CONTEXT) {
         const char *vendor = (const char *)glGetString(GL_VENDOR);
         const char *name = (const char *)glGetString(GL_RENDERER);
         const char *version = (const char *)glGetString(GL_VERSION);
@@ -5329,8 +5797,7 @@ static void print_diagnostics(const Config *config, const FontRenderer *renderer
                                           strcasestr(name, "swrast") || strcasestr(name, "software"));
         printf("OpenGL vendor: %s\nOpenGL renderer: %s\nOpenGL version: %s\nRendering: %s\n",
                vendor ? vendor : "unknown", name ? name : "unknown", version ? version : "unknown",
-               software ? "software" : glXIsDirect(platform->display, platform->context)
-                   ? "direct GLX (no software renderer detected)" : "indirect GLX");
+               software ? "software" : name ? "no known software renderer detected" : "unknown");
     } else puts("OpenGL: unavailable");
     if (renderer->faces != NULL && renderer->metrics.width > 0) {
         FT_Face face = renderer->faces[renderer->primary].face;
@@ -5339,8 +5806,9 @@ static void print_diagnostics(const Config *config, const FontRenderer *renderer
                renderer->size, renderer->metrics.width, renderer->metrics.height);
     } else puts("Font: unavailable");
     if (graphical_error != NULL) printf("Startup probe: %s\n", graphical_error);
-    puts("Features: UTF-8, ANSI 256/RGB, alternate screen, scrollback reflow, mouse and focus reporting, "
-         "bracketed paste, OSC titles and links, X11 clipboard, fullscreen, Lua reload, configurable bell");
+    puts("Features: desktop OpenGL, UTF-8, ANSI 256/RGB, alternate screen, scrollback reflow, "
+         "Wayland keyboard repeat, keyboard and wheel zoom, selection, clipboard, mouse reports, "
+         "focus reporting, OSC titles and links, visual bell, INI reload");
 }
 
 int main(int argc, char **argv)
@@ -5359,59 +5827,73 @@ int main(int argc, char **argv)
     Config config;
     if (!config_load(&config, &options)) return EXIT_FAILURE;
     char *zoom_path = options.config_path == NULL ? config_path("font-zoom", true) : NULL;
+    bool save_zoom = false;
     Platform platform = {0};
-    Interaction ui = {0};
     FontRenderer renderer = {0};
     Terminal terminal;
     terminal_init(&terminal, config.foreground, config.background, config.cursor,
                   config.cursor_style, config.blink);
     terminal_configure(&terminal, &config);
     terminal.title_dirty = false;
-    Session session = {.master = -1, .child_signal = -1, .startup = -1};
+    Session session = {.master = -1, .signal_fd = -1, .startup = -1, .launch_gate = -1};
+    Clipboard clipboard = {0};
+    clipboard_init(&clipboard);
     Config initial_font = config;
-    initial_font.font_size = config_read_zoom(zoom_path, config.font_size);
-    const char *error = font_open(&renderer, &initial_font);
-    if (error != NULL && initial_font.font_size != config.font_size) {
-        font_close(&renderer);
-        renderer = (FontRenderer){0};
-        error = font_open(&renderer, &config);
+    initial_font.font_size = config_read_zoom(zoom_path, &config);
+    const char *error = options.diagnostics ? NULL : session_prepare_signals(&session);
+    if (error == NULL) {
+        error = font_open(&renderer, &initial_font, NULL);
+        if (error != NULL && initial_font.font_size != config.font_size) {
+            font_close(&renderer);
+            renderer = (FontRenderer){0};
+            error = font_open(&renderer, &config, NULL);
+        }
     }
-    if (error == font_spacing_error) {
+    if (error == font_spacing_error && options.config_path == NULL) {
         fprintf(stderr, "deal: %s; using default spacing\n", error);
         font_close(&renderer);
         renderer = (FontRenderer){0};
         config.letter_spacing = config.line_spacing = 0;
-        error = font_open(&renderer, &config);
+        error = font_open(&renderer, &config, NULL);
     }
     if (error == NULL) {
         error = platform_open(&platform, &config, &renderer.metrics);
     }
     if (options.diagnostics) {
+        if (error == NULL && !platform.closed) error = platform_open_egl(&platform);
         print_diagnostics(&config, &renderer, &platform, error);
-        font_close(&renderer);
-        platform_close(&platform);
-        config_destroy(&config);
-        free(zoom_path);
-        return EXIT_SUCCESS;
-    }
-    if (error == NULL) {
-        error = font_make_atlas(&renderer);
-    }
-    if (error == NULL) {
-        if (!clipboard_open(&ui.clipboard, platform.display)) error = "could not initialize X11 selections";
-        else if (config.history_capacity > 0) {
+    } else if (error == NULL && !platform.closed) {
+        if (config.history_capacity > 0) {
             terminal.history.lines = calloc((size_t)config.history_capacity, sizeof(*terminal.history.lines));
             if (terminal.history.lines == NULL) error = "could not allocate the scrollback ring";
             else terminal.history.capacity = (size_t)config.history_capacity;
         }
-    }
-    if (error == NULL) {
-        error = run(&platform, &terminal, &session, &config, &renderer, &ui, zoom_path);
+        if (error == NULL && !terminal_resize_window(&terminal, platform.width, platform.height,
+                                                    config.padding, &renderer.metrics))
+            error = "could not allocate the screen buffers";
+        if (error == NULL) {
+            struct winsize size = session_size(&terminal.primary.screen, platform.width, platform.height,
+                                                config.padding);
+            /* Fork before EGL starts driver threads and wait until the renderer is ready to exec. */
+            error = session_open(&session, size, wl_display_get_fd(platform.display), &config);
+        }
+        if (error == NULL) error = platform_open_egl(&platform);
+        if (error == NULL) error = font_make_atlas(&renderer);
+        if (error == NULL) error = session_launch(&session);
+        if (error == NULL) {
+            error = run(&platform, &terminal, &session, &config, &renderer, &clipboard, zoom_path, &save_zoom);
+            platform.key_pressed = NULL;
+            platform.scrolled = NULL;
+            platform.pointer_button_event = NULL;
+            platform.pointer_moved = NULL;
+            platform.pointer_left = NULL;
+            platform.input_data = NULL;
+        }
     }
 
-    link_reap(&ui);
+    if (save_zoom) config_save_zoom(zoom_path, config.font_size, renderer.size);
+    clipboard_close(&clipboard);
     session_close(&session);
-    clipboard_close(&ui.clipboard, platform.display);
     links_clear(&terminal);
     history_clear(&terminal.history);
     free(terminal.history.lines);
@@ -5421,6 +5903,7 @@ int main(int argc, char **argv)
     platform_close(&platform);
     config_destroy(&config);
     free(zoom_path);
+    if (options.diagnostics) return EXIT_SUCCESS;
     if (error != NULL) {
         fprintf(stderr, "deal: %s\n", error);
         return EXIT_FAILURE;
