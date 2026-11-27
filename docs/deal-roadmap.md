@@ -192,7 +192,7 @@ Manual check: change the wallpaper with `wall` and confirm open deal windows rec
 
 ---
 
-## 0.13.0: Optimization
+## 0.14.0: Optimization
 
 After Phase 3, once the font rasterizer comes from desk.
 
@@ -218,6 +218,16 @@ After Phase 3, once the font rasterizer comes from desk.
 | Memory | RSS after 100k lines of scrollback |
 
 Goal: under 1% idle CPU with blink off (already zero frames when idle), and throughput at least matching foot.
+
+---
+
+## 0.13.0: Tabs (in progress)
+
+Requested ahead of optimization. Built in two steps, each tested on its own.
+
+**Step 1: sessions and keyboard switching.** A `Tab` owns a `Terminal` and a `Session` (shell, PTY, screens, scrollback, selection, title). The run loop polls every tab's PTY. Only the active tab is drawn and receives input, and background tabs keep reading output. Resizes and config reloads apply to every tab. A tab whose shell exits closes, and the last one closes the window. Shortcuts in `[keybinds]`: `new_tab` Ctrl+Shift+T (opens in the current tab's directory, like `new_window`), `close_tab` Ctrl+Shift+W, `next_tab` Ctrl+Tab and Ctrl+PageDown, `previous_tab` Ctrl+Shift+Tab and Ctrl+PageUp, `tab_1` to `tab_9` Alt+1 to Alt+9. At most 16 tabs.
+
+**Step 2: tab bar.** One row above the grid, shown only with two or more tabs, in the theme colors: active tab with the selection colors, others muted, a bell marker for background tabs that rang. Click to switch, middle-click to close. The window title shows the active tab's title.
 
 ---
 
@@ -261,5 +271,6 @@ Release work:
 | Deferred | Scrollback search and prompt marks | Skipped for now |
 | (Phase 1.4) | deal becomes the default, foot removed | Planned |
 | 0.12.0 | Palette from desk, OSC color queries | Code done, checklist pending |
-| 0.13.0 | Renderer, damage and parser optimization | After Phase 3 |
+| 0.13.0 | Tabs | In progress |
+| 0.14.0 | Renderer, damage and parser optimization | After Phase 3 |
 | 1.0.0 | vttest, fuzzing, terminfo, docs | Final |
