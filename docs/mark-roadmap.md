@@ -12,7 +12,7 @@ It's written for deal and uses what deal draws. Other terminals get the same esc
 
 | Piece | Where | mark uses it for |
 |---|---|---|
-| Raw mode, alternate screen, `TIOCGWINSZ`, `SIGWINCH` and signal cleanup | `net/net.c` (`ppoll` with a signal mask), `lead/editor.c` | The pager (0.2) |
+| Raw mode, alternate screen, `TIOCGWINSZ`, `SIGWINCH` and signal cleanup | `net/net.c` (`ppoll` with a signal mask), `lead/editor.c` | The pager (0.3) |
 | INI config, config paths, `desk_write_default` | desk (Layer 0) | Config (0.5) |
 | Palette | `desk_palette_load` (Layer 0) | Colors that follow the wallpaper (0.5) |
 | File watch | `desk_watch_*` (Layer 0) | Reload when the file is saved (0.5) |
@@ -107,7 +107,7 @@ No argument with stdin on a terminal prints usage and exits 2. A file that can't
 1. Read the whole file into memory (refuse above 64 MiB with a message). Treat input as UTF-8; replace invalid bytes with U+FFFD; normalize CRLF and lone CR to LF; replace NUL with U+FFFD as the spec says. Tabs expand to 4-column stops for block structure.
 2. Block pass: paragraphs, ATX and setext headings, thematic breaks, block quotes, bullet and ordered lists (with tight and loose), fenced and indented code blocks, HTML blocks (kept as text), link reference definitions.
 3. Inline pass: code spans, emphasis and strong (delimiter stack, including the rule of 3), links and images (inline and reference, with titles), `<autolinks>`, backslash escapes, entities (named ones from a small table of the common ones, plus numeric), hard and soft breaks.
-4. Layout and rendering from the table above, without tables and task lists (0.3), printed straight to stdout with the attributes and OSC 8 links. Output always ends with SGR 0.
+4. Layout and rendering from the table above, without tables and task lists (0.2), printed straight to stdout with the attributes and OSC 8 links. Output always ends with SGR 0.
 5. Width: `--width`, else the terminal's when stdout is one, else 80. Call `setlocale(LC_CTYPE, "")` so `wcwidth` knows UTF-8.
 6. `make`, `make install` following bar's `PREFIX`/`BINDIR`/`DESTDIR`, `/mark/mark` in `.gitignore`, mark in the root README's table.
 7. A test directory `mark/tests/` with small `.md` files and the expected `--plain` output, run by `make check`.
@@ -140,7 +140,34 @@ No argument with stdin on a terminal prints usage and exits 2. A file that can't
 
 ---
 
-## 0.2: The pager
+## 0.2: GitHub extensions
+
+- **Tables:** parse the delimiter row and alignment, cell inlines, escaped pipes (`\|`). Column widths are the widest cell; when the table is wider than the text width, shrink the widest columns first and wrap their cells inside the box. Tables wider than the screen even after shrinking (many narrow columns) keep a minimum of 6 cells per column and scroll sideways like code blocks.
+- **Strikethrough:** `~~text~~` (and single `~`, as GitHub accepts it).
+- **Task lists:** `- [ ]` and `- [x]` at the start of a list item.
+- **Extended autolinks:** bare `https://`, `http://` and `www.` URLs and email addresses, with GitHub's trailing punctuation rules.
+- **Fenced code info strings:** the first word is shown as the language label.
+
+### As built
+
+- Pulled ahead of the pager: nearly every document in this repository has tables, and 0.1 showed them as run-together paragraphs. The pager doesn't depend on them.
+- Tables follow cmark-gfm: the paragraph's last line becomes the header when its cell count matches the delimiter row, which needs at least one pipe; rows run until a blank line or another block starts; short rows get empty cells and extra cells are dropped; `\|` is a pipe in a cell, even inside code. Tables have at most 256 columns.
+- Column widths: each column's widest line when the table fits. Otherwise each column gets its longest word and the room left is shared in proportion to what each still wants, so a column of short labels doesn't take half the width. If even the longest words don't fit, the widest columns are capped together, none below 6 cells or its own width. When a body row still wraps, a rule separates every body row, so rows stay apart; tables whose rows fit on one line keep only the rule under the header. A table still too wide is cut with `…` until the pager can scroll it sideways.
+- Single and double tildes strike through, a run pairing only with a run of the same length; three or more stay text.
+- Extended autolinks also take `ftp://`, as GitHub's examples do. They're found after inline parsing, in text outside links, so `www.a.com/x_y_z` is one link however the underscores were read.
+- Task lists replace the bullet with `☐` or `☑`; in ordered lists the box follows the number. Done items are muted and struck through.
+- `make check` adds GitHub's 21 examples for these extensions (`tests/gfm.json`, from cmark-gfm's `test/spec.txt`), and the test build's `--commonmark` turns the extensions off for the CommonMark examples. Pathological inputs gained many rows, many columns, a wide table, tildes, bare links and at signs.
+
+### Manual checks
+
+- A table with a long last column wraps inside its cells; box lines meet at every joint, including with wide characters in a cell.
+- `PLAN.md`'s tables (the 26 projects) fit an 80-column window and stay aligned.
+- Task lists in the plan show checked and unchecked boxes.
+- A bare URL in text becomes a clickable link without picking up a trailing `.` or `)`.
+
+---
+
+## 0.3: The pager
 
 When stdout is a terminal, mark shows the document in its own pager instead of printing it. Writing a pager instead of piping to `less -R` is what lets mark reflow on resize, focus and follow links, and jump between headings.
 
@@ -173,23 +200,6 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 - Ctrl+C, `q` and `kill` all leave the shell prompt exactly as it was.
 - With mouse reporting on, the wheel scrolls and Shift+drag selects text in deal.
 - `mark file | less` still works (no pager, plain escapes).
-
----
-
-## 0.3: GitHub extensions
-
-- **Tables:** parse the delimiter row and alignment, cell inlines, escaped pipes (`\|`). Column widths are the widest cell; when the table is wider than the text width, shrink the widest columns first and wrap their cells inside the box. Tables wider than the screen even after shrinking (many narrow columns) keep a minimum of 6 cells per column and scroll sideways like code blocks.
-- **Strikethrough:** `~~text~~` (and single `~`, as GitHub accepts it).
-- **Task lists:** `- [ ]` and `- [x]` at the start of a list item.
-- **Extended autolinks:** bare `https://`, `http://` and `www.` URLs and email addresses, with GitHub's trailing punctuation rules.
-- **Fenced code info strings:** the first word is shown as the language label.
-
-### Manual checks
-
-- A table with a long last column wraps inside its cells; box lines meet at every joint, including with wide characters in a cell.
-- `PLAN.md`'s tables (the 26 projects) fit an 80-column window and stay aligned.
-- Task lists in the plan show checked and unchecked boxes.
-- A bare URL in text becomes a clickable link without picking up a trailing `.` or `)`.
 
 ---
 
@@ -290,8 +300,8 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 | Version | Theme | Status |
 |---|---|---|
 | 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Done (652/652 spec examples; live checks in deal pending) |
-| 0.2 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Not started |
-| 0.3 | GitHub tables, strikethrough, task lists, extended autolinks | Not started |
+| 0.2 | GitHub tables, strikethrough, task lists, extended autolinks | Done (21/21 GitHub examples; live checks in deal pending) |
+| 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Not started |
 | 0.4 | Following links, back stack, search, heading jumps, outline | Not started |
 | 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Not started |
 | 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Final |

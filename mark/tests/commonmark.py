@@ -23,7 +23,7 @@ failures = 0
 tests = json.load(open(os.path.join(here, 'spec.json'), encoding='utf-8'))
 passed = 0
 for t in tests:
-    out = run(['--html'], t['markdown']).stdout.decode()
+    out = run(['--html', '--commonmark'], t['markdown']).stdout.decode()
     if out == t['html']:
         passed += 1
     elif show in (t['section'], 'all'):
@@ -33,6 +33,23 @@ for t in tests:
         print('  got:  ', repr(out))
 print(f"CommonMark {tests[0].get('version', '0.31.2')}: {passed}/{len(tests)} examples")
 if passed != len(tests):
+    failures += 1
+
+# GitHub's examples for the extensions mark supports, from the GFM spec
+# (cmark-gfm's test/spec.txt).
+gfm = json.load(open(os.path.join(here, 'gfm.json'), encoding='utf-8'))
+passed = 0
+for t in gfm:
+    out = run(['--html'], t['markdown']).stdout.decode()
+    if out == t['html']:
+        passed += 1
+    elif show in (t['extension'], 'all'):
+        print(f"{t['extension']} example")
+        print('  input:', repr(t['markdown']))
+        print('  want: ', repr(t['html']))
+        print('  got:  ', repr(out))
+print(f"GitHub extensions: {passed}/{len(gfm)} examples")
+if passed != len(gfm):
     failures += 1
 
 pathological = {
@@ -59,6 +76,13 @@ pathological = {
     'one long line': 'word ' * 400000,
     'wide characters': '漢字かな🙂 ' * 100000,
     'many short lines': 'a\n' * 300000,
+    'many table rows': '| a | b |\n|---|---|\n' + '| c | d |\n' * 100000,
+    'many table columns': '|a' * 5000 + '|\n' + '|-' * 5000 + '|\n' + '|b' * 5000 + '|\n',
+    'wide table': '|' + ' x |' * 200 + '\n|' + '---|' * 200 + '\n' + ('|' + ' word word |' * 200 + '\n') * 200,
+    'many tildes': '~a ~~b ' * 50000,
+    'many bare links': 'www.example.com ' * 50000,
+    'many at signs': 'a@b ' * 50000 + '@' * 100000,
+    'adjacent text nodes': 'a]&' * 60000,
 }
 for name, text in pathological.items():
     for args in (['--html'], ['--width', '80']):

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MARK_VERSION "0.1.0"
+#define MARK_VERSION "0.2.0"
 
 /* Exit statuses. */
 enum {
@@ -25,6 +25,7 @@ enum {
 #define MAX_LINK_LABEL 999
 #define MAX_LINK_PARENS 32
 #define MAX_BACKTICKS 1000
+#define MAX_TABLE_COLUMNS 256
 
 /* A growable byte string. */
 struct buf {
@@ -49,6 +50,8 @@ enum block_type {
     B_BREAK,
     B_CODE,
     B_HTML,
+    B_TABLE, /* GitHub extension. */
+    B_ROW,
 };
 
 struct list_data {
@@ -81,6 +84,11 @@ struct block {
     char *info;
     int html_type;       /* HTML block, 1 to 7. */
     struct list_data list; /* List and item. */
+    int task;            /* Item: 0 not a task, 1 open, 2 done. */
+    int columns;         /* Table. */
+    char *align;         /* Table: 'l', 'c', 'r' or 0 per column. */
+    bool header;         /* Row. */
+    struct inline_node **cells; /* Row: one per table column, after parsing. */
 };
 
 /* Inline structure (section 6). */
@@ -94,6 +102,7 @@ enum inline_type {
     I_STRONG,
     I_LINK,
     I_IMAGE,
+    I_STRIKE, /* GitHub extension. */
 };
 
 struct inline_node {
@@ -117,6 +126,7 @@ struct refmap {
 };
 
 struct document {
+    bool extensions; /* GitHub's tables, strikethrough, task lists, autolinks. */
     struct arena arena;
     struct block *root;
     struct refmap refs;
@@ -185,6 +195,7 @@ struct options {
     char *dir_url;       /* file://host/dir/ */
 #ifdef MARK_TEST
     bool html;
+    bool commonmark; /* No extensions, for the CommonMark examples. */
 #endif
 };
 

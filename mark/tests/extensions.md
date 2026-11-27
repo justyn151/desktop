@@ -1,0 +1,7 @@
+~~Struck~~ and ~single~ tildes; ~~~three~~~ stay as text.
+
+Bare links: www.example.com, https://example.com/path?q=(a)), ftp://files.example.org.
+Mail someone@example.com. Not a link: hello@localhost, www.under_score.com.
+
+1. [ ] An ordered task
+2. [x] Done

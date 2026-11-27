@@ -877,15 +877,16 @@ static bool can_contain(enum block_type parent, enum block_type child)
     switch (parent) {
     case B_DOCUMENT:
     case B_QUOTE:
-    case B_ITEM: return child != B_ITEM;
+    case B_ITEM: return child != B_ITEM && child != B_ROW;
     case B_LIST: return child == B_ITEM;
+    case B_TABLE: return child == B_ROW;
     default: return false;
     }
 }
 
 static bool accepts_lines(enum block_type type)
 {
-    return type == B_PARAGRAPH || type == B_HEADING || type == B_CODE;
+    return type == B_PARAGRAPH || type == B_HEADING || type == B_CODE || type == B_TABLE;
 }
 
 static void append_block(struct block *parent, struct block *child)
@@ -1120,6 +1121,103 @@ static bool lists_match(const struct list_data *a, const struct list_data *b)
     return a->ordered == b->ordered && a->delimiter == b->delimiter && a->bullet == b->bullet;
 }
 
+/* Table rows (GitHub extension) */
+
+/* Split a row into cells at unescaped pipes; a leading and a trailing pipe
+   don't start or end a cell. Returns the number of cells, filling at most
+   max of them. */
+static int split_row(const char *s, size_t n, size_t *starts, size_t *lens, int max)
+{
+    size_t i = 0;
+    while (i < n && is_whitespace(s[i])) ++i;
+    while (n > i && is_whitespace(s[n - 1])) --n;
+    if (i < n && s[i] == '|') ++i;
+    int count = 0;
+    while (i < n) {
+        size_t start = i;
+        while (i < n && s[i] != '|') i += s[i] == '\\' && i + 1 < n ? 2 : 1;
+        size_t a = start, b = i < n ? i : n;
+        while (a < b && is_space_or_tab(s[a])) ++a;
+        while (b > a && is_space_or_tab(s[b - 1])) --b;
+        if (count < max) {
+            starts[count] = a;
+            lens[count] = b - a;
+        }
+        ++count;
+        if (i < n) ++i; /* The pipe. */
+    }
+    return count;
+}
+
+/* A delimiter row such as "| :-- | :-: | --: |". Returns its number of
+   columns and their alignment, or 0. At least one pipe is needed, so a
+   lone "---" stays a setext underline or a thematic break. */
+static int scan_table_delimiter(const char *s, size_t n, char *align)
+{
+    if (!memchr(s, '|', n)) return 0;
+    size_t i = 0;
+    while (i < n && is_space_or_tab(s[i])) ++i;
+    if (i < n && s[i] == '|') ++i;
+    int columns = 0;
+    for (;;) {
+        while (i < n && is_space_or_tab(s[i])) ++i;
+        if (i >= n || s[i] == '\n') break;
+        bool left = false, right = false;
+        if (s[i] == ':') {
+            left = true;
+            ++i;
+        }
+        size_t dashes = i;
+        while (i < n && s[i] == '-') ++i;
+        if (i == dashes) return 0;
+        if (i < n && s[i] == ':') {
+            right = true;
+            ++i;
+        }
+        while (i < n && is_space_or_tab(s[i])) ++i;
+        if (columns >= MAX_TABLE_COLUMNS) return 0;
+        align[columns++] = left && right ? 'c' : right ? 'r' : left ? 'l' : 0;
+        if (i < n && s[i] == '|') {
+            ++i;
+            continue;
+        }
+        if (i >= n || s[i] == '\n') break;
+        return 0;
+    }
+    return columns;
+}
+
+/* The paragraph's last line becomes a table's header when it has as many
+   cells as the delimiter row has columns. */
+static bool try_table(struct parser *p, struct block **container, size_t pos)
+{
+    char align[MAX_TABLE_COLUMNS];
+    int columns = scan_table_delimiter(p->line + pos, p->len - pos, align);
+    if (!columns) return false;
+    struct block *para = *container;
+    struct buf *content = &para->content;
+    if (content->len == 0) return false;
+    size_t end = content->len - 1; /* Its final '\n'. */
+    size_t start = end;
+    while (start > 0 && content->data[start - 1] != '\n') --start;
+    size_t starts[1], lens[1];
+    if (split_row(content->data + start, end - start, starts, lens, 0) != columns) return false;
+
+    char *header = arena_strndup(&p->doc->arena, content->data + start, end - start);
+    content->len = start;
+    content->data[start] = '\0';
+    struct block *table = add_child(p, para, B_TABLE);
+    table->columns = columns;
+    table->align = arena_strndup(&p->doc->arena, align, (size_t)columns);
+    struct block *row = add_child(p, table, B_ROW);
+    row->open = false;
+    row->header = true;
+    buf_puts(&row->content, header);
+    advance_to(p, p->len - 1);
+    *container = table;
+    return true;
+}
+
 /* Walk the open blocks, consuming each one's continuation markers. Returns
    the last block that matched, or NULL when a closing fence used the line. */
 static struct block *check_open_blocks(struct parser *p, bool *all_matched)
@@ -1168,6 +1266,7 @@ static struct block *check_open_blocks(struct parser *p, bool *all_matched)
             if (container->html_type >= 6 && p->blank) goto done;
             break;
         case B_PARAGRAPH:
+        case B_TABLE:
             if (p->blank) goto done;
             break;
         default: break;
@@ -1210,6 +1309,8 @@ static void open_new_blocks(struct parser *p, struct block **container, bool all
         } else if (!indented && (level = scan_html_block_start(p->line + pos, p->len - pos, type != B_PARAGRAPH))) {
             *container = add_child(p, *container, B_HTML);
             (*container)->html_type = level;
+        } else if (!indented && type == B_PARAGRAPH && p->doc->extensions && try_table(p, container, pos)) {
+            /* The delimiter row is used. */
         } else if (!indented && type == B_PARAGRAPH && (level = scan_setext_underline(p, pos))) {
             if (resolve_references(p->doc, *container)) {
                 (*container)->type = B_HEADING;
@@ -1275,7 +1376,8 @@ static void add_text(struct parser *p, struct block *container, struct block *la
     if (p->blank && container->last) container->last->last_line_blank = true;
     enum block_type type = container->type;
     container->last_line_blank =
-        p->blank && type != B_QUOTE && type != B_HEADING && type != B_BREAK && !(type == B_CODE && container->fenced) &&
+        p->blank && type != B_QUOTE && type != B_HEADING && type != B_BREAK && type != B_TABLE &&
+        !(type == B_CODE && container->fenced) &&
         !(type == B_ITEM && !container->first && container->start_line == p->line_number);
     for (struct block *b = container; b->parent; b = b->parent) b->parent->last_line_blank = false;
 
@@ -1295,6 +1397,11 @@ static void add_text(struct parser *p, struct block *container, struct block *la
         }
     } else if (p->blank) {
         /* Nothing to add. */
+    } else if (type == B_TABLE) {
+        struct block *row = add_child(p, container, B_ROW);
+        row->open = false;
+        advance_to(p, p->first_nonspace);
+        buf_put(&row->content, p->line + p->offset, p->len - p->offset);
     } else if (accepts_lines(type)) {
         if (type == B_HEADING && !container->setext) {
             advance_to(p, p->first_nonspace);
@@ -1417,8 +1524,9 @@ static void insert_before(struct inline_node *anchor, struct inline_node *node)
     anchor->prev = node;
 }
 
-static bool is_special(char c)
+static bool is_special(const struct subject *sub, char c)
 {
+    if (c == '~') return sub->doc->extensions;
     switch (c) {
     case '\n': case '`': case '\\': case '&': case '<': case '*': case '_': case '[': case ']': case '!':
         return true;
@@ -1592,6 +1700,8 @@ static struct inline_node *handle_delimiters(struct subject *sub, char c)
         can_close = right;
     }
     struct inline_node *node = make_text(sub, sub->s + start, (size_t)count);
+    /* Strikethrough is one or two tildes; a longer run is text. */
+    if (c == '~' && count > 2) can_open = can_close = false;
     if (can_open || can_close) {
         struct delimiter *d = arena_alloc(&sub->doc->arena, sizeof *d);
         d->node = node;
@@ -1618,7 +1728,7 @@ static void remove_delimiter(struct subject *sub, struct delimiter *d)
    closer to look at. */
 static struct delimiter *insert_emphasis(struct subject *sub, struct delimiter *opener, struct delimiter *closer)
 {
-    int use = closer->count >= 2 && opener->count >= 2 ? 2 : 1;
+    int use = closer->c == '~' ? closer->count : closer->count >= 2 && opener->count >= 2 ? 2 : 1;
     opener->count -= use;
     closer->count -= use;
     opener->node->len -= (size_t)use;
@@ -1628,7 +1738,7 @@ static struct delimiter *insert_emphasis(struct subject *sub, struct delimiter *
         remove_delimiter(sub, d);
         d = prev;
     }
-    struct inline_node *emph = make_inline(sub, use == 1 ? I_EMPH : I_STRONG);
+    struct inline_node *emph = make_inline(sub, closer->c == '~' ? I_STRIKE : use == 1 ? I_EMPH : I_STRONG);
     for (struct inline_node *node = opener->node->next; node && node != closer->node;) {
         struct inline_node *next = node->next;
         unlink_inline(node);
@@ -1651,8 +1761,8 @@ static struct delimiter *insert_emphasis(struct subject *sub, struct delimiter *
 
 static void process_emphasis(struct subject *sub, size_t stack_bottom)
 {
-    size_t openers_bottom[12];
-    for (int i = 0; i < 12; ++i) openers_bottom[i] = stack_bottom;
+    size_t openers_bottom[14];
+    for (int i = 0; i < 14; ++i) openers_bottom[i] = stack_bottom;
     struct delimiter *closer = NULL;
     for (struct delimiter *d = sub->last_delim; d && d->position >= stack_bottom; d = d->prev) closer = d;
     while (closer) {
@@ -1660,11 +1770,18 @@ static void process_emphasis(struct subject *sub, size_t stack_bottom)
             closer = closer->next;
             continue;
         }
-        int index = (closer->c == '*' ? 0 : 6) + (closer->can_open ? 3 : 0) + closer->original % 3;
+        int index = closer->c == '~' ? 12 + (closer->original == 2)
+                                     : (closer->c == '*' ? 0 : 6) + (closer->can_open ? 3 : 0) + closer->original % 3;
         struct delimiter *opener = closer->prev;
         bool found = false;
         while (opener && opener->position >= stack_bottom && opener->position >= openers_bottom[index]) {
-            if (opener->can_open && opener->c == closer->c) {
+            if (opener->can_open && opener->c == '~' && closer->c == '~') {
+                /* Tildes pair only with a run of the same length. */
+                if (opener->original == closer->original) {
+                    found = true;
+                    break;
+                }
+            } else if (opener->can_open && opener->c == closer->c) {
                 bool odd_match = (closer->can_open || opener->can_close) && closer->original % 3 != 0 &&
                                  (opener->original + closer->original) % 3 == 0;
                 if (!odd_match) {
@@ -1781,7 +1898,8 @@ static void parse_inline(struct subject *sub)
     case '&': node = handle_entity(sub); break;
     case '<': node = handle_pointy(sub); break;
     case '*':
-    case '_': node = handle_delimiters(sub, c); break;
+    case '_':
+    case '~': node = handle_delimiters(sub, c); break;
     case '[':
         ++sub->pos;
         node = make_text(sub, "[", 1);
@@ -1800,7 +1918,7 @@ static void parse_inline(struct subject *sub)
     case ']': node = handle_close_bracket(sub); break;
     default: {
         size_t start = sub->pos;
-        while (sub->pos < sub->n && !is_special(sub->s[sub->pos])) ++sub->pos;
+        while (sub->pos < sub->n && !is_special(sub, sub->s[sub->pos])) ++sub->pos;
         size_t end = sub->pos;
         if (sub->pos < sub->n && sub->s[sub->pos] == '\n') {
             while (end > start && sub->s[end - 1] == ' ') --end;
@@ -1812,10 +1930,200 @@ static void parse_inline(struct subject *sub)
     if (node) append_inline(sub->parent, node);
 }
 
-static void parse_block_inlines(struct document *doc, struct block *b)
+/* Extended autolinks (GitHub extension): www., http://, https:// and
+   ftp:// links and email addresses in plain text. */
+
+/* A domain at s[i]: segments of letters, digits, '-' and '_' separated by
+   periods, with at least one period and no '_' in the last two segments.
+   Returns its end, or 0. */
+static size_t scan_domain(const char *s, size_t n, size_t i)
 {
-    const char *s = b->content.data ? b->content.data : "";
-    size_t start = 0, end = b->content.len;
+    size_t periods = 0;
+    bool underscore_last = false, underscore_before = false;
+    size_t start = i;
+    while (i < n) {
+        char c = s[i];
+        if (c == '.') {
+            if (i == start || s[i - 1] == '.') break;
+            ++periods;
+            underscore_before = underscore_last;
+            underscore_last = false;
+        } else if (c == '_') {
+            underscore_last = true;
+        } else if (!is_ascii_alnum(c) && c != '-' && (unsigned char)c < 0x80) {
+            break;
+        }
+        ++i;
+    }
+    if (i == start || periods == 0 || underscore_last || underscore_before) return 0;
+    return i;
+}
+
+/* Drop trailing punctuation, unbalanced closing parentheses and a
+   trailing entity reference from a link that ends at end. */
+static size_t trim_autolink(const char *s, size_t start, size_t end)
+{
+    while (end > start) {
+        char c = s[end - 1];
+        if (strchr("?!.,:*_~'\"", c)) {
+            --end;
+        } else if (c == ')') {
+            size_t open = 0, close = 0;
+            for (size_t i = start; i < end; ++i) {
+                open += s[i] == '(';
+                close += s[i] == ')';
+            }
+            if (close <= open) break;
+            --end;
+        } else if (c == ';') {
+            size_t i = end - 1;
+            while (i > start && is_ascii_alnum(s[i - 1])) --i;
+            if (i > start && i < end - 1 && s[i - 1] == '&') end = i - 1;
+            else break;
+        } else {
+            break;
+        }
+    }
+    return end;
+}
+
+static size_t scan_link_path(const char *s, size_t n, size_t i)
+{
+    while (i < n && !is_whitespace(s[i]) && s[i] != '<') ++i;
+    return i;
+}
+
+/* A www or scheme autolink at s[i]. Sets the URL prefix to add. */
+static size_t scan_web_autolink(const char *s, size_t n, size_t i, const char **prefix)
+{
+    static const char *const schemes[] = {"http://", "https://", "ftp://"};
+    size_t domain = 0;
+    *prefix = "";
+    if (n - i >= 4 && strncasecmp(s + i, "www.", 4) == 0) {
+        domain = i;
+        *prefix = "http://";
+    } else {
+        for (size_t k = 0; k < 3; ++k) {
+            size_t len = strlen(schemes[k]);
+            if (n - i > len && strncasecmp(s + i, schemes[k], len) == 0) domain = i + len;
+        }
+        if (!domain) return 0;
+    }
+    size_t end = scan_domain(s, n, domain);
+    if (!end) return 0;
+    end = trim_autolink(s, i, scan_link_path(s, n, end));
+    return end > domain ? end : 0;
+}
+
+/* An email address around the '@' at s[at], not starting before from. */
+static bool scan_email_autolink(const char *s, size_t n, size_t from, size_t at, size_t *start, size_t *end)
+{
+    size_t a = at;
+    while (a > from && (is_ascii_alnum(s[a - 1]) || strchr(".+-_", s[a - 1]))) --a;
+    if (a == at) return false;
+    size_t i = at + 1, periods = 0;
+    while (i < n && (is_ascii_alnum(s[i]) || s[i] == '-' || s[i] == '_' ||
+                     (s[i] == '.' && i + 1 < n && (is_ascii_alnum(s[i + 1]) || s[i + 1] == '-' || s[i + 1] == '_')))) {
+        periods += s[i] == '.';
+        ++i;
+    }
+    if (i == at + 1 || periods == 0 || s[i - 1] == '-' || s[i - 1] == '_') return false;
+    *start = a;
+    *end = i;
+    return true;
+}
+
+static bool autolink_boundary(const char *s, size_t i)
+{
+    return i == 0 || is_whitespace(s[i - 1]) || strchr("*_~(", s[i - 1]);
+}
+
+/* Split one text node around the autolinks in it. */
+static void autolink_text(struct subject *sub, struct inline_node *text)
+{
+    const char *s = text->text;
+    size_t n = text->len, done = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t start = i, end = 0;
+        const char *prefix = "";
+        if ((s[i] == 'w' || s[i] == 'W' || s[i] == 'h' || s[i] == 'H' || s[i] == 'f' || s[i] == 'F') &&
+            autolink_boundary(s, i)) {
+            end = scan_web_autolink(s, n, i, &prefix);
+        } else if (s[i] == '@' && scan_email_autolink(s, n, done, i, &start, &end)) {
+            prefix = "mailto:";
+        }
+        if (!end) continue;
+        if (start > done) insert_before(text, make_text(sub, s + done, start - done));
+        struct inline_node *link = make_inline(sub, I_LINK);
+        struct buf url = {0};
+        buf_puts(&url, prefix);
+        buf_put(&url, s + start, end - start);
+        link->url = arena_strndup(&sub->doc->arena, url.data, url.len);
+        buf_free(&url);
+        insert_before(text, link);
+        append_inline(link, make_text(sub, s + start, end - start));
+        done = end;
+        i = end - 1;
+    }
+    if (done == 0) return;
+    if (done < n) {
+        text->text += done;
+        text->len -= done;
+    } else {
+        unlink_inline(text);
+    }
+}
+
+/* Merge neighbouring text nodes, then find autolinks in each, outside
+   links and images. Walks without recursion. */
+static void autolink_children(struct subject *sub, struct inline_node *parent)
+{
+    for (struct inline_node *node = parent->first; node;) {
+        if (node->type == I_TEXT && node->next && node->next->type == I_TEXT) {
+            /* Join the whole run at once, so it costs its length. */
+            size_t total = 0;
+            struct inline_node *end = node;
+            for (; end && end->type == I_TEXT; end = end->next) total += end->len;
+            char *joined = arena_alloc(&sub->doc->arena, total + 1);
+            size_t used = 0;
+            for (struct inline_node *t = node; t != end;) {
+                struct inline_node *following = t->next;
+                memcpy(joined + used, t->text, t->len);
+                used += t->len;
+                if (t != node) unlink_inline(t);
+                t = following;
+            }
+            node->text = joined;
+            node->len = total;
+        }
+        struct inline_node *next = node->next;
+        if (node->type == I_TEXT) autolink_text(sub, node);
+        node = next;
+    }
+}
+
+static void find_autolinks(struct subject *sub, struct inline_node *root)
+{
+    autolink_children(sub, root);
+    struct inline_node *node = root->first;
+    while (node) {
+        bool container = node->type == I_EMPH || node->type == I_STRONG || node->type == I_STRIKE;
+        if (container && node->first) {
+            autolink_children(sub, node);
+            node = node->first;
+            continue;
+        }
+        while (node && !node->next) {
+            node = node->parent;
+            if (node == root) return;
+        }
+        if (node) node = node->next;
+    }
+}
+
+static struct inline_node *parse_inlines(struct document *doc, const char *s, size_t n)
+{
+    size_t start = 0, end = n;
     while (start < end && is_whitespace(s[start])) ++start;
     while (end > start && is_whitespace(s[end - 1])) --end;
     struct subject *sub = xmalloc(sizeof *sub);
@@ -1826,22 +2134,66 @@ static void parse_block_inlines(struct document *doc, struct block *b)
     sub->parent = arena_alloc(&doc->arena, sizeof *sub->parent);
     while (sub->pos < sub->n) parse_inline(sub);
     process_emphasis(sub, 0);
-    b->inlines = sub->parent;
+    if (doc->extensions) find_autolinks(sub, sub->parent);
+    struct inline_node *root = sub->parent;
     free(sub);
+    return root;
+}
+
+/* Each of a row's cells, with "\|" turned into "|" before parsing. */
+static void parse_row(struct document *doc, struct block *row)
+{
+    int columns = row->parent->columns;
+    size_t starts[MAX_TABLE_COLUMNS], lens[MAX_TABLE_COLUMNS];
+    const char *s = row->content.data ? row->content.data : "";
+    int count = split_row(s, row->content.len, starts, lens, columns);
+    row->cells = arena_alloc(&doc->arena, (size_t)columns * sizeof *row->cells);
+    struct buf cell = {0};
+    for (int c = 0; c < columns; ++c) {
+        cell.len = 0;
+        buf_reserve(&cell, 0);
+        if (c < count) {
+            for (size_t i = starts[c]; i < starts[c] + lens[c]; ++i) {
+                if (s[i] == '\\' && i + 1 < starts[c] + lens[c] && s[i + 1] == '|') continue;
+                buf_putc(&cell, s[i]);
+            }
+        }
+        row->cells[c] = parse_inlines(doc, cell.data, cell.len);
+    }
+    buf_free(&cell);
+}
+
+/* "[ ] " or "[x] " at the start of an item's first paragraph. */
+static void find_task(struct block *item)
+{
+    struct block *para = item->first;
+    if (!para || para->type != B_PARAGRAPH || para->content.len < 3) return;
+    const char *s = para->content.data;
+    if (s[0] != '[' || s[2] != ']' || !(s[1] == ' ' || s[1] == 'x' || s[1] == 'X')) return;
+    if (para->content.len > 3 && !is_whitespace(s[3])) return;
+    item->task = s[1] == ' ' ? 1 : 2;
+    memmove(para->content.data, s + 3, para->content.len - 3 + 1);
+    para->content.len -= 3;
 }
 
 static void parse_all_inlines(struct document *doc, struct block *b)
 {
     for (; b; b = b->next) {
-        if (b->type == B_PARAGRAPH || b->type == B_HEADING) parse_block_inlines(doc, b);
+        if (b->type == B_ITEM && doc->extensions) find_task(b);
+        if (b->type == B_PARAGRAPH || b->type == B_HEADING) {
+            b->inlines = parse_inlines(doc, b->content.data ? b->content.data : "", b->content.len);
+        } else if (b->type == B_ROW) {
+            parse_row(doc, b);
+        }
         parse_all_inlines(doc, b->first);
     }
 }
 
-static struct document *parse_document(const char *text, size_t len)
+static struct document *parse_document(const char *text, size_t len, bool extensions)
 {
     struct document *doc = xmalloc(sizeof *doc);
     memset(doc, 0, sizeof *doc);
+    doc->extensions = extensions;
     doc->root = arena_alloc(&doc->arena, sizeof *doc->root);
     doc->root->type = B_DOCUMENT;
     doc->root->open = true;
@@ -1949,6 +2301,11 @@ static void html_inlines(struct buf *out, const struct inline_node *node)
             html_inlines(out, node->first);
             buf_puts(out, "</strong>");
             break;
+        case I_STRIKE:
+            buf_puts(out, "<del>");
+            html_inlines(out, node->first);
+            buf_puts(out, "</del>");
+            break;
         case I_LINK:
             buf_puts(out, "<a href=\"");
             html_href(out, node->url);
@@ -2008,6 +2365,8 @@ static void html_blocks(struct buf *out, const struct block *b)
         case B_ITEM:
             html_cr(out);
             buf_puts(out, "<li>");
+            if (b->task) buf_puts(out, b->task == 2 ? "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> "
+                                                    : "<input type=\"checkbox\" disabled=\"\" /> ");
             html_blocks(out, b->first);
             buf_puts(out, "</li>\n");
             break;
@@ -2054,6 +2413,30 @@ static void html_blocks(struct buf *out, const struct block *b)
             buf_put(out, b->content.data ? b->content.data : "", b->content.len);
             html_cr(out);
             break;
+        case B_TABLE:
+            html_cr(out);
+            buf_puts(out, "<table>\n<thead>\n");
+            html_blocks(out, b->first);
+            if (b->first && b->first->next) buf_puts(out, "</tbody>\n");
+            buf_puts(out, "</table>\n");
+            break;
+        case B_ROW: {
+            const char *tag = b->header ? "th" : "td";
+            if (b->prev && b->prev->header) buf_puts(out, "<tbody>\n");
+            buf_puts(out, "<tr>\n");
+            for (int c = 0; c < b->parent->columns; ++c) {
+                char open[32];
+                char align = b->parent->align[c];
+                snprintf(open, sizeof open, "<%s%s>", tag,
+                         align == 'l' ? " align=\"left\"" : align == 'c' ? " align=\"center\"" : align == 'r' ? " align=\"right\"" : "");
+                buf_puts(out, open);
+                html_inlines(out, b->cells[c]->first);
+                buf_puts(out, b->header ? "</th>\n" : "</td>\n");
+            }
+            buf_puts(out, "</tr>\n");
+            if (b->header) buf_puts(out, "</thead>\n");
+            break;
+        }
         }
     }
 }
@@ -2241,11 +2624,20 @@ static bool is_space_glyph(const struct page *pg, const struct glyph *g)
     return g->length == 1 && pg->text.data[g->offset] == ' ';
 }
 
-/* Greedy wrapping at spaces; words longer than a line break by cells. */
-static void wrap(struct layout *L, const struct glyph *g, size_t n)
+struct range {
+    size_t start, end;
+};
+
+struct ranges {
+    struct range *items;
+    size_t count, cap;
+};
+
+/* Greedy wrapping at spaces; words longer than a line break by cells.
+   Always gives at least one line. */
+static void wrap_ranges(const struct page *pg, const struct glyph *g, size_t n, int avail, struct ranges *out)
 {
-    const struct page *pg = L->page;
-    int avail = available(L);
+    out->count = 0;
     size_t start = 0;
     for (;;) {
         while (start < n && is_space_glyph(pg, &g[start])) ++start;
@@ -2277,10 +2669,28 @@ static void wrap(struct layout *L, const struct glyph *g, size_t n)
             ++i;
         }
         while (end > start && is_space_glyph(pg, &g[end - 1])) --end;
-        emit_line(L, g + start, end - start, 0, 0);
+        grow(&out->items, &out->cap, out->count + 1, sizeof *out->items);
+        out->items[out->count++] = (struct range){start, end};
         if (next > n) break;
         start = next;
     }
+}
+
+static int range_width(const struct glyph *g, struct range r)
+{
+    int width = 0;
+    for (size_t i = r.start; i < r.end; ++i) width += g[i].width;
+    return width;
+}
+
+static void wrap(struct layout *L, const struct glyph *g, size_t n)
+{
+    struct ranges lines = {0};
+    wrap_ranges(L->page, g, n, available(L), &lines);
+    for (size_t i = 0; i < lines.count; ++i) {
+        emit_line(L, g + lines.items[i].start, lines.items[i].end - lines.items[i].start, 0, 0);
+    }
+    free(lines.items);
 }
 
 static bool has_scheme(const char *url)
@@ -2380,12 +2790,15 @@ static void flatten(struct layout *L, const struct inline_node *first, struct st
             break;
         case I_EMPH:
         case I_STRONG:
+        case I_STRIKE:
         case I_LINK:
         case I_IMAGE:
             grow(&stack, &cap, depth + 1, sizeof *stack);
             stack[depth++] = (struct frame){node, style, link};
             if (node->type == I_EMPH) {
                 style.attr |= ATTR_ITALIC;
+            } else if (node->type == I_STRIKE) {
+                style.attr |= ATTR_STRIKE;
             } else if (node->type == I_STRONG) {
                 style.attr |= ATTR_BOLD;
             } else if (node->type == I_LINK) {
@@ -2557,26 +2970,196 @@ static void layout_list(struct layout *L, const struct block *b)
     struct style marker_style = with_color(plain_style, COLOR_ACCENT);
     long number = b->list.start;
     for (const struct block *item = b->first; item; item = item->next, ++number) {
-        char first[48], rest[48];
+        char first[64], rest[64];
+        const char *box = item->task == 2 ? "☑ " : item->task == 1 ? "☐ " : "";
         if (b->list.ordered) {
             char value[24];
             int len = snprintf(value, sizeof value, "%ld", number);
             memset(first, ' ', (size_t)(digits - len));
-            snprintf(first + digits - len, sizeof first - (size_t)(digits - len), "%s%c ", value, b->list.delimiter);
-            memset(rest, ' ', (size_t)digits + 2);
-            rest[digits + 2] = '\0';
+            snprintf(first + digits - len, sizeof first - (size_t)(digits - len), "%s%c %s", value,
+                     b->list.delimiter, box);
         } else {
-            snprintf(first, sizeof first, "%s ", bullets[L->list_depth % 3]);
-            strcpy(rest, "  ");
+            /* A task's box takes the bullet's place. */
+            snprintf(first, sizeof first, "%s", item->task ? box : bullets[L->list_depth % 3]);
+            if (!item->task) strcat(first, " ");
         }
+        int indent = text_width(first);
+        memset(rest, ' ', (size_t)indent);
+        rest[indent] = '\0';
         if (item != b->first && !b->list.tight) blank_line(L);
-        push_prefix(L, first, rest, marker_style);
+        push_prefix(L, first, rest, item->task == 2 ? with_color(plain_style, COLOR_MUTED) : marker_style);
         ++L->list_depth;
+        struct style saved = L->base;
+        if (item->task == 2) {
+            /* Done: muted and struck through. */
+            L->base.attr |= ATTR_STRIKE;
+            L->base.fg = COLOR_MUTED;
+        }
         if (item->first) layout_blocks(L, item->first, b->list.tight);
         else emit_line(L, NULL, 0, 0, 0);
+        L->base = saved;
         --L->list_depth;
         pop_prefix(L);
     }
+}
+
+/* A border line such as ┌───┬───┐. */
+static void table_border(struct layout *L, const int *widths, int columns, const char *left, const char *middle,
+                         const char *right, struct style style)
+{
+    L->tmp.count = 0;
+    push_string(L, &L->tmp, left, style);
+    for (int c = 0; c < columns; ++c) {
+        for (int i = 0; i < widths[c] + 2; ++i) push_string(L, &L->tmp, "─", style);
+        push_string(L, &L->tmp, c + 1 < columns ? middle : right, style);
+    }
+    cut_line(L, &L->tmp, 0, available(L), style);
+    emit_line(L, L->tmp.items, L->tmp.count, 0, 0);
+}
+
+static void layout_table(struct layout *L, const struct block *b)
+{
+    struct page *pg = L->page;
+    int columns = b->columns;
+    int rows = 0;
+    for (const struct block *row = b->first; row; row = row->next) ++rows;
+
+    /* Every cell as glyphs, header cells bold. */
+    struct glyphs *cells = xmalloc((size_t)rows * (size_t)columns * sizeof *cells);
+    memset(cells, 0, (size_t)rows * (size_t)columns * sizeof *cells);
+    int *natural = xmalloc((size_t)columns * sizeof *natural);
+    int *word = xmalloc((size_t)columns * sizeof *word);
+    int *widths = xmalloc((size_t)columns * sizeof *widths);
+    memset(natural, 0, (size_t)columns * sizeof *natural);
+    memset(word, 0, (size_t)columns * sizeof *word);
+    struct style base = L->base;
+    struct ranges lines = {0};
+    int r = 0;
+    for (const struct block *row = b->first; row; row = row->next, ++r) {
+        struct style style = base;
+        if (row->header) style.attr |= ATTR_BOLD;
+        for (int c = 0; c < columns; ++c) {
+            struct glyphs *cell = &cells[r * columns + c];
+            flatten(L, row->cells[c]->first, style, cell);
+            wrap_ranges(pg, cell->items, cell->count, INT_MAX, &lines);
+            for (size_t k = 0; k < lines.count; ++k) {
+                int w = range_width(cell->items, lines.items[k]);
+                if (w > natural[c]) natural[c] = w;
+            }
+            int run = 0;
+            for (size_t i = 0; i < cell->count; ++i) {
+                run = is_space_glyph(pg, &cell->items[i]) || cell->items[i].link == GLYPH_BREAK ? 0
+                                                                                                 : run + cell->items[i].width;
+                if (run > word[c]) word[c] = run;
+            }
+        }
+    }
+
+    /* Fit. Each column gets its longest word, and the room left is shared
+       in proportion to what each still wants. When even the words don't
+       fit, cap the widest columns together instead, keeping each at least
+       6 cells (or its natural width) wide. */
+    int budget = available(L) - (3 * columns + 1);
+    long natural_total = 0, word_total = 0;
+    for (int c = 0; c < columns; ++c) {
+        natural_total += natural[c];
+        word_total += word[c];
+    }
+    int widest = 0;
+    for (int c = 0; c < columns; ++c) widest = natural[c] > widest ? natural[c] : widest;
+    int low = 0, high = widest;
+    while (low < high) {
+        int cap = low + (high - low + 1) / 2;
+        long total = 0;
+        for (int c = 0; c < columns; ++c) {
+            int minimum = natural[c] < 6 ? natural[c] : 6;
+            int w = natural[c] < cap ? natural[c] : cap;
+            total += w > minimum ? w : minimum;
+        }
+        if (total <= budget) low = cap;
+        else high = cap - 1;
+    }
+    for (int c = 0; c < columns; ++c) {
+        int minimum = natural[c] < 6 ? natural[c] : 6;
+        int w = natural[c] < low ? natural[c] : low;
+        widths[c] = w > minimum ? w : minimum;
+        if (widths[c] < 1) widths[c] = 1;
+    }
+    if (natural_total <= budget) {
+        for (int c = 0; c < columns; ++c) widths[c] = natural[c] > 0 ? natural[c] : 1;
+    } else if (word_total <= budget) {
+        long spare = budget - word_total, wanted = natural_total - word_total, given = 0;
+        for (int c = 0; c < columns; ++c) {
+            long extra = wanted ? (long)(natural[c] - word[c]) * spare / wanted : 0;
+            widths[c] = word[c] + (int)extra;
+            given += extra;
+        }
+        /* Rounding leftovers go to the columns that still want room. */
+        for (int c = 0; c < columns && given < spare; ++c) {
+            if (widths[c] < natural[c]) {
+                ++widths[c];
+                ++given;
+            }
+        }
+        for (int c = 0; c < columns; ++c) {
+            if (widths[c] < 1) widths[c] = 1;
+        }
+    }
+
+    struct style border = with_color(plain_style, COLOR_MUTED);
+    uint16_t space = intern_style(pg, base);
+    struct ranges *cell_lines = xmalloc((size_t)columns * sizeof *cell_lines);
+    memset(cell_lines, 0, (size_t)columns * sizeof *cell_lines);
+    /* When a body row wraps, rule between all the body rows so they stay
+       apart. */
+    bool ruled = false;
+    r = 0;
+    for (const struct block *row = b->first; row && !ruled; row = row->next, ++r) {
+        for (int c = 0; c < columns && !row->header; ++c) {
+            struct glyphs *cell = &cells[r * columns + c];
+            wrap_ranges(pg, cell->items, cell->count, widths[c], &lines);
+            if (lines.count > 1) ruled = true;
+        }
+    }
+    table_border(L, widths, columns, "┌", "┬", "┐", border);
+    r = 0;
+    for (const struct block *row = b->first; row; row = row->next, ++r) {
+        size_t height = 1;
+        for (int c = 0; c < columns; ++c) {
+            struct glyphs *cell = &cells[r * columns + c];
+            wrap_ranges(pg, cell->items, cell->count, widths[c], &cell_lines[c]);
+            if (cell_lines[c].count > height) height = cell_lines[c].count;
+        }
+        for (size_t k = 0; k < height; ++k) {
+            L->tmp.count = 0;
+            push_string(L, &L->tmp, "│", border);
+            for (int c = 0; c < columns; ++c) {
+                struct glyphs *cell = &cells[r * columns + c];
+                struct range range = k < cell_lines[c].count ? cell_lines[c].items[k] : (struct range){0, 0};
+                int gap = widths[c] - range_width(cell->items, range);
+                if (gap < 0) gap = 0;
+                char align = b->align[c];
+                int before = align == 'r' ? gap : align == 'c' ? gap / 2 : 0;
+                for (int i = 0; i < before + 1; ++i) push_text(pg, &L->tmp, " ", 1, space, -1, NULL);
+                for (size_t i = range.start; i < range.end; ++i) push_glyph(&L->tmp, cell->items[i]);
+                for (int i = 0; i < gap - before + 1; ++i) push_text(pg, &L->tmp, " ", 1, space, -1, NULL);
+                push_string(L, &L->tmp, "│", border);
+            }
+            cut_line(L, &L->tmp, 0, available(L), border);
+            emit_line(L, L->tmp.items, L->tmp.count, 0, 0);
+        }
+        if (row->next && (row->header || ruled)) table_border(L, widths, columns, "├", "┼", "┤", border);
+    }
+    table_border(L, widths, columns, "└", "┴", "┘", border);
+
+    for (int i = 0; i < rows * columns; ++i) free(cells[i].items);
+    for (int c = 0; c < columns; ++c) free(cell_lines[c].items);
+    free(cell_lines);
+    free(cells);
+    free(natural);
+    free(word);
+    free(widths);
+    free(lines.items);
 }
 
 static void layout_block(struct layout *L, const struct block *b)
@@ -2589,6 +3172,8 @@ static void layout_block(struct layout *L, const struct block *b)
     case B_HTML: layout_html(L, b); break;
     case B_QUOTE: layout_quote(L, b); break;
     case B_LIST: layout_list(L, b); break;
+    case B_TABLE: layout_table(L, b); break;
+    case B_ROW: break;
     case B_DOCUMENT:
     case B_ITEM: layout_blocks(L, b->first, false); break;
     }
@@ -2820,7 +3405,7 @@ int main(int argc, char **argv)
     const char *no_color = getenv("NO_COLOR");
     if (no_color && no_color[0]) opt.color = false;
 
-    enum { OPT_WIDTH = 256, OPT_PLAIN, OPT_HTML };
+    enum { OPT_WIDTH = 256, OPT_PLAIN, OPT_HTML, OPT_COMMONMARK };
     static const struct option long_options[] = {
         {"width", required_argument, NULL, OPT_WIDTH},
         {"plain", no_argument, NULL, OPT_PLAIN},
@@ -2828,6 +3413,7 @@ int main(int argc, char **argv)
         {"version", no_argument, NULL, 'v'},
 #ifdef MARK_TEST
         {"html", no_argument, NULL, OPT_HTML},
+        {"commonmark", no_argument, NULL, OPT_COMMONMARK},
 #endif
         {NULL, 0, NULL, 0},
     };
@@ -2848,6 +3434,7 @@ int main(int argc, char **argv)
         case OPT_PLAIN: opt.styled = false; break;
 #ifdef MARK_TEST
         case OPT_HTML: opt.html = true; break;
+        case OPT_COMMONMARK: opt.commonmark = true; break;
 #endif
         case 'h': usage(stdout); return EXIT_OK;
         case 'v': puts("mark " MARK_VERSION); return EXIT_OK;
@@ -2886,7 +3473,11 @@ int main(int argc, char **argv)
     free(raw);
     if (opt.path) set_file_urls(&opt);
 
-    struct document *doc = parse_document(text, len);
+    bool extensions = true;
+#ifdef MARK_TEST
+    extensions = !opt.commonmark;
+#endif
+    struct document *doc = parse_document(text, len, extensions);
     bool ok;
 #ifdef MARK_TEST
     if (opt.html) {

@@ -27,7 +27,8 @@ has something to do with it.
 9) starting at eight
 10) aligns its numbers
 
-- [ ] Task lists come in 0.3
+- [ ] An open task
+- [x] A done task
 
 ***
 

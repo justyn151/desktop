@@ -15,3 +15,8 @@
 ```c
 int x;
 ```
+| a | ~~b~~ |
+|:-:|--:|
+| [x](https://example.com) | `c` |
+
+- [x] done
