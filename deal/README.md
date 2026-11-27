@@ -1,8 +1,8 @@
-# deal 0.13.2
+# deal 0.13.3
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.13.2 splits the tab bar equally between tabs and adds close buttons. Version 0.13.1 added the tab bar. Version 0.13.0 added tabs. Version 0.12.1 gave explicit backgrounds that match the default background the window's opacity. Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.13.3 draws box-drawing characters itself, so table and frame lines meet exactly. Version 0.13.2 splits the tab bar equally between tabs and adds close buttons. Version 0.13.1 added the tab bar. Version 0.13.0 added tabs. Version 0.12.1 gave explicit backgrounds that match the default background the window's opacity. Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 
@@ -122,6 +122,8 @@ When a program rings the bell (BEL) while the window is unfocused, `[bell] urgen
 
 deal asks Fontconfig for bold, italic and bold italic faces of the configured family. When the family has no matching face, FreeType synthesizes the style from the regular face. `--diagnostics` lists the face chosen for each style. Fallback fonts for missing glyphs are also synthesized. Box-drawing, block and Powerline glyphs ignore italic so lines still meet.
 
+Box-drawing characters (U+2500 to U+257F) don't come from the font. deal draws their light, heavy, double and dashed lines, rounded corners and diagonals from the cell size, with every stroke of a weight in the same place, so junctions such as `┼` meet the plain lines around them exactly at any size and zoom. A font's own junction glyphs, stretched to the cell, miss by a pixel. Block elements and Powerline symbols still come from the font.
+
 | SGR | Effect |
 |---|---|
 | 1 / 22 | Bold face. With `[colors] bold_is_bright = true` (the default), bold also brightens the default and first eight colors. 22 also clears dim. |
@@ -157,6 +159,15 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 - A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
 
 ## Manual verification on dwl
+
+### 0.13.3 Box drawing
+
+Checked offline: at eight cell sizes from 7×15 to 24×50, every line character's strokes at each cell edge are the same pixels as the plain line of that weight (`─ ━ ═ │ ┃ ║`), and the double-line corners, tees and crossings come out as nested lines.
+
+- [ ] Build and check `./deal --version` reports 0.13.3.
+- [ ] `mark PLAN.md`: table borders and junctions (`┌ ┬ ┐ ├ ┼ ┤ └ ┴ ┘`) meet with no stubs or gaps, at the default size and after zooming in and out.
+- [ ] `printf '╔═╦═╗\n║ ║ ║\n╠═╬═╣\n╚═╩═╝\n╭─┬─╮\n│╱│╲│\n╰─┴─╯\n┏━┳━┓\n┗━┻━┛\n┄┅┆┇╌╍\n'` shows clean double, rounded, diagonal, heavy and dashed lines.
+- [ ] With `line_spacing` above 0, vertical lines still join between rows.
 
 ### 0.13.1 Tab bar
 

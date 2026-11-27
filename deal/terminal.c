@@ -62,7 +62,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.13.2";
+static const char deal_version[] = "0.13.3";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -1589,9 +1589,252 @@ static void glyph_tile(const FontRenderer *renderer, size_t slot, int *x, int *y
     *y = (int)(slot / (size_t)renderer->tile_columns) * renderer->metrics.height;
 }
 
+/* Box drawing, U+2500 to U+257F, drawn from the cell size instead of taken
+   from the font. A font's junction glyphs are hinted apart from its plain
+   lines, so stretched to the cell they miss each other by a pixel where
+   lines cross. Drawn here, every stroke of a given weight has the same
+   position and thickness in every glyph, so they meet exactly. */
+
+/* Each line character's arms: bits 0-1 up, 2-3 right, 4-5 down, 6-7 left,
+   as 0 none, 1 light, 2 heavy, 3 double. 0 marks the dashed, rounded and
+   diagonal characters, drawn separately. */
+static const unsigned char box_arms[128] = {
+    0x44, 0x88, 0x11, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x18, 0x24, 0x28,
+    0x50, 0x90, 0x60, 0xa0, 0x05, 0x09, 0x06, 0x0a, 0x41, 0x81, 0x42, 0x82, 0x15, 0x19, 0x16, 0x25,
+    0x26, 0x1a, 0x29, 0x2a, 0x51, 0x91, 0x52, 0x61, 0x62, 0x92, 0xa1, 0xa2, 0x54, 0x94, 0x58, 0x98,
+    0x64, 0xa4, 0x68, 0xa8, 0x45, 0x85, 0x49, 0x89, 0x46, 0x86, 0x4a, 0x8a, 0x55, 0x95, 0x59, 0x99,
+    0x56, 0x65, 0x66, 0x96, 0x5a, 0xa5, 0x69, 0x9a, 0xa9, 0xa6, 0x6a, 0xaa, 0x00, 0x00, 0x00, 0x00,
+    0xcc, 0x33, 0x1c, 0x34, 0x3c, 0xd0, 0x70, 0xf0, 0x0d, 0x07, 0x0f, 0xc1, 0x43, 0xc3, 0x1d, 0x37,
+    0x3f, 0xd1, 0x73, 0xf3, 0xdc, 0x74, 0xfc, 0xcd, 0x47, 0xcf, 0xdd, 0x77, 0xff, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x04, 0x10, 0x80, 0x02, 0x08, 0x20, 0x48, 0x21, 0x84, 0x12,
+};
+
+enum { BOX_NONE, BOX_LIGHT, BOX_HEAVY, BOX_DOUBLE };
+
+typedef struct {
+    unsigned char *pixels;
+    int width, height;
+    int light, heavy, double_span; /* Stroke thicknesses in pixels. */
+} BoxCanvas;
+
+static void box_fill(BoxCanvas *canvas, int x0, int y0, int x1, int y1)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > canvas->width) x1 = canvas->width;
+    if (y1 > canvas->height) y1 = canvas->height;
+    for (int y = y0; y < y1; ++y) {
+        if (x1 > x0) memset(canvas->pixels + (size_t)y * canvas->width + x0, 0xff, (size_t)(x1 - x0));
+    }
+}
+
+static void box_cover(BoxCanvas *canvas, int x, int y, double coverage)
+{
+    if (x < 0 || y < 0 || x >= canvas->width || y >= canvas->height || coverage <= 0) return;
+    int value = coverage >= 1 ? 255 : (int)(coverage * 255 + 0.5);
+    unsigned char *pixel = canvas->pixels + (size_t)y * canvas->width + x;
+    if (value > *pixel) *pixel = (unsigned char)value;
+}
+
+/* The width a stroke of this weight takes across its line. */
+static int box_span(const BoxCanvas *canvas, int weight)
+{
+    return weight == BOX_LIGHT ? canvas->light : weight == BOX_HEAVY ? canvas->heavy
+         : weight == BOX_DOUBLE ? canvas->double_span : 0;
+}
+
+/* Where a stroke of this weight starts on an axis of this length. Every
+   glyph uses the same rule, which is what makes neighbours meet. */
+static int box_start(int length, int span)
+{
+    return (length - span) / 2;
+}
+
+/* One stroke of an arm. along0..along1 runs along it; offset picks the
+   first or second line of a double stroke, or 0 for the only one. */
+static void box_stroke(BoxCanvas *canvas, bool horizontal, int weight, int line, int along0, int along1)
+{
+    int length = horizontal ? canvas->height : canvas->width;
+    int span = box_span(canvas, weight);
+    int a = box_start(length, span), b = a + span;
+    if (weight == BOX_DOUBLE) {
+        if (line == 0) b = a + canvas->light;
+        else a = b - canvas->light;
+    }
+    if (horizontal) box_fill(canvas, along0, a, along1, b);
+    else box_fill(canvas, a, along0, b, along1);
+}
+
+/* An arm from the cell's centre to an edge, as one stroke or two. */
+static void box_arm(BoxCanvas *canvas, bool horizontal, int weight, int along0, int along1)
+{
+    box_stroke(canvas, horizontal, weight, 0, along0, along1);
+    if (weight == BOX_DOUBLE) box_stroke(canvas, horizontal, weight, 1, along0, along1);
+}
+
+static void box_lines(BoxCanvas *canvas, unsigned char arms)
+{
+    int up = arms & 3, right = arms >> 2 & 3, down = arms >> 4 & 3, left = arms >> 6 & 3;
+    int w = canvas->width, h = canvas->height, light = canvas->light;
+    int vertical_weight = up > down ? up : down, horizontal_weight = left > right ? left : right;
+    int vertical = box_span(canvas, vertical_weight), horizontal = box_span(canvas, horizontal_weight);
+    /* The perpendicular strokes' footprint: arms reach across it so
+       corners and junctions close. With none, arms meet at the centre. */
+    int x0 = vertical ? box_start(w, vertical) : w / 2, x1 = vertical ? x0 + vertical : w / 2;
+    int y0 = horizontal ? box_start(h, horizontal) : h / 2, y1 = horizontal ? y0 + horizontal : h / 2;
+    /* A single arm stops at the near line of a double one only where that
+       double line runs straight through and the arm joins it from one
+       side (╟, ╤). At corners (╓) and crossings (╫) it runs to the far line. */
+    bool tee_vertical = up == BOX_DOUBLE && down == BOX_DOUBLE && !(left && right);
+    bool tee_horizontal = left == BOX_DOUBLE && right == BOX_DOUBLE && !(up && down);
+
+    /* A double arm's two lines turn separately: the line on the side of a
+       perpendicular arm stops at that arm's near line, the other runs to its
+       far line, so ╔ is two nested corners and ╬ leaves four. */
+    if (left == BOX_DOUBLE) {
+        box_stroke(canvas, true, left, 0, 0, up ? x0 + light : down ? x1 : w / 2);
+        box_stroke(canvas, true, left, 1, 0, down ? x0 + light : up ? x1 : w / 2);
+    } else if (left) {
+        box_arm(canvas, true, left, 0, tee_vertical ? x0 + light : x1);
+    }
+    if (right == BOX_DOUBLE) {
+        box_stroke(canvas, true, right, 0, up ? x1 - light : down ? x0 : w / 2, w);
+        box_stroke(canvas, true, right, 1, down ? x1 - light : up ? x0 : w / 2, w);
+    } else if (right) {
+        box_arm(canvas, true, right, tee_vertical ? x1 - light : x0, w);
+    }
+    if (up == BOX_DOUBLE) {
+        box_stroke(canvas, false, up, 0, 0, left ? y0 + light : right ? y1 : h / 2);
+        box_stroke(canvas, false, up, 1, 0, right ? y0 + light : left ? y1 : h / 2);
+    } else if (up) {
+        box_arm(canvas, false, up, 0, tee_horizontal ? y0 + light : y1);
+    }
+    if (down == BOX_DOUBLE) {
+        box_stroke(canvas, false, down, 0, left ? y1 - light : right ? y0 : h / 2, h);
+        box_stroke(canvas, false, down, 1, right ? y1 - light : left ? y0 : h / 2, h);
+    } else if (down) {
+        box_arm(canvas, false, down, tee_horizontal ? y1 - light : y0, h);
+    }
+}
+
+/* Dashed lines: count dashes along the cell, each with a gap. */
+static void box_dashes(BoxCanvas *canvas, bool horizontal, int weight, int count)
+{
+    int length = horizontal ? canvas->width : canvas->height;
+    for (int i = 0; i < count; ++i) {
+        int a = i * length / count, b = (i + 1) * length / count;
+        int gap = (b - a) / 3 > 0 ? (b - a) / 3 : 1;
+        int start = a + gap / 2, end = b - (gap - gap / 2);
+        if (end > start) box_arm(canvas, horizontal, weight, start, end);
+    }
+}
+
+/* Rounded corners. sx and sy point from the corner to the arc's centre:
+   +1, +1 is ╭. */
+static void box_arc(BoxCanvas *canvas, int sx, int sy)
+{
+    int w = canvas->width, h = canvas->height, t = canvas->light;
+    int vx0 = box_start(w, t), hy0 = box_start(h, t);
+    double cx = vx0 + t / 2.0, cy = hy0 + t / 2.0;
+    double room_x = sx > 0 ? w - cx : cx, room_y = sy > 0 ? h - cy : cy;
+    double radius = room_x < room_y ? room_x : room_y;
+    double ox = cx + sx * radius, oy = cy + sy * radius;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            double px = x + 0.5, py = y + 0.5;
+            if ((px - cx) * sx < -t || (px - ox) * sx > 0 || (py - cy) * sy < -t || (py - oy) * sy > 0) continue;
+            double distance = hypot(px - ox, py - oy);
+            box_cover(canvas, x, y, t / 2.0 + 0.5 - fabs(distance - radius));
+        }
+    }
+    /* Straight on from the arc's ends to the cell edges. */
+    int ey = (int)(sy > 0 ? ceil(oy) : floor(oy)), ex = (int)(sx > 0 ? ceil(ox) : floor(ox));
+    if (sy > 0) box_fill(canvas, vx0, ey, vx0 + t, h);
+    else box_fill(canvas, vx0, 0, vx0 + t, ey);
+    if (sx > 0) box_fill(canvas, ex, hy0, w, hy0 + t);
+    else box_fill(canvas, 0, hy0, ex, hy0 + t);
+}
+
+/* ╱ (rising) or ╲, corner to corner. */
+static void box_diagonal(BoxCanvas *canvas, bool rising)
+{
+    int w = canvas->width, h = canvas->height;
+    double norm = hypot(w, h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            double px = x + 0.5, py = y + 0.5;
+            double distance = rising ? fabs(h * px + w * py - (double)w * h) / norm : fabs(h * px - w * py) / norm;
+            box_cover(canvas, x, y, canvas->light / 2.0 + 0.5 - distance);
+        }
+    }
+}
+
+static void box_draw(BoxCanvas *canvas, uint32_t codepoint)
+{
+    unsigned char arms = box_arms[codepoint - 0x2500];
+    if (arms) {
+        box_lines(canvas, arms);
+        return;
+    }
+    switch (codepoint) {
+    case 0x2504: box_dashes(canvas, true, BOX_LIGHT, 3); break;
+    case 0x2505: box_dashes(canvas, true, BOX_HEAVY, 3); break;
+    case 0x2506: box_dashes(canvas, false, BOX_LIGHT, 3); break;
+    case 0x2507: box_dashes(canvas, false, BOX_HEAVY, 3); break;
+    case 0x2508: box_dashes(canvas, true, BOX_LIGHT, 4); break;
+    case 0x2509: box_dashes(canvas, true, BOX_HEAVY, 4); break;
+    case 0x250a: box_dashes(canvas, false, BOX_LIGHT, 4); break;
+    case 0x250b: box_dashes(canvas, false, BOX_HEAVY, 4); break;
+    case 0x254c: box_dashes(canvas, true, BOX_LIGHT, 2); break;
+    case 0x254d: box_dashes(canvas, true, BOX_HEAVY, 2); break;
+    case 0x254e: box_dashes(canvas, false, BOX_LIGHT, 2); break;
+    case 0x254f: box_dashes(canvas, false, BOX_HEAVY, 2); break;
+    case 0x256d: box_arc(canvas, 1, 1); break;
+    case 0x256e: box_arc(canvas, -1, 1); break;
+    case 0x256f: box_arc(canvas, -1, -1); break;
+    case 0x2570: box_arc(canvas, 1, -1); break;
+    case 0x2571: box_diagonal(canvas, true); break;
+    case 0x2572: box_diagonal(canvas, false); break;
+    case 0x2573:
+        box_diagonal(canvas, true);
+        box_diagonal(canvas, false);
+        break;
+    default: break;
+    }
+}
+
+/* Thicknesses follow the cell width: 1 pixel light up to 13-pixel cells. */
+static BoxCanvas box_canvas(unsigned char *pixels, int width, int height)
+{
+    BoxCanvas canvas = {.pixels = pixels, .width = width, .height = height};
+    canvas.light = (width + 4) / 9 > 0 ? (width + 4) / 9 : 1;
+    canvas.heavy = canvas.light * 2 > canvas.light + 2 ? canvas.light * 2 : canvas.light + 2;
+    canvas.double_span = canvas.light * 3;
+    return canvas;
+}
+
+static void box_upload(FontRenderer *renderer, CachedGlyph *glyph, size_t slot)
+{
+    int width = renderer->metrics.width, height = renderer->metrics.height;
+    memset(renderer->pixels, 0, (size_t)width * height);
+    BoxCanvas canvas = box_canvas(renderer->pixels, width, height);
+    box_draw(&canvas, glyph->codepoint);
+    glyph->x = 0;
+    glyph->y = 0;
+    glyph->width = width;
+    glyph->height = height;
+    int x, y;
+    glyph_tile(renderer, slot, &x, &y);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_ALPHA, GL_UNSIGNED_BYTE, renderer->pixels);
+}
+
 static void glyph_upload(FontRenderer *renderer, CachedGlyph *glyph, size_t slot)
 {
     uint32_t codepoint = glyph->codepoint;
+    if (codepoint >= 0x2500 && codepoint <= 0x257f && glyph->span == 1 && !glyph->mark) {
+        box_upload(renderer, glyph, slot);
+        return;
+    }
     FontFace *font = font_find_styled(renderer, codepoint, glyph->style);
     if (font == NULL && !glyph->mark) {
         codepoint = 0xfffd;
