@@ -157,7 +157,7 @@ Rough order, based on what gets touched most often day to day:
 4. `vol`
 5. `power`
 6. `mount`
-7. `view`
+7. `view` (pulled forward and started early; the detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md))
 8. `files`
 9. `ctl`
 10. Then everything else from the project list below
