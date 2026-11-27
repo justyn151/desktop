@@ -73,10 +73,10 @@ Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 si
 
 Checked offline under ASan and UBSan, by calling the browsing code directly: natural order without hidden files, a `FILE` starting at itself, an explicit non-image name included, several arguments in order with directories expanded in place; preloading forward then backward, a broken neighbour cached as failed, stepping onto a preloaded image without decoding it again, wrapping both ways, a rotated image not kept, reload of a replaced file (keeping the zoom at the same size), no decode for an unchanged file, and a broken replacement keeping the old image. Live on dwl, replacing the open file with `shot` showed the new capture.
 
-- [ ] `view ~/Pictures/Screenshots` steps through every screenshot in name order, and wraps.
-- [ ] Stepping forward through photos shows no decode delay after the first.
-- [ ] A corrupt file in the middle of a directory shows its error in the title and doesn't stop browsing.
-- [ ] Right and Left change images at fit and pan when zoomed in.
+- [x] `view ~/Pictures/Screenshots` steps through every screenshot in name order, and wraps.
+- [x] Stepping forward through photos shows no decode delay after the first.
+- [x] A corrupt file in the middle of a directory shows its error in the title and doesn't stop browsing.
+- [x] Right and Left change images at fit and pan when zoomed in.
 
 ## Manual checks (0.2)
 
