@@ -128,7 +128,7 @@ deal 0.12.0 started `desk/` early with `desk_palette_load` and `desk_watch_*`. d
 
 ## Phase 4: shot
 
-Built on desk from its first commit, so it's also a test of whether the desk API is pleasant to use.
+Built on desk from its first commit, so it's also a test of whether the desk API is pleasant to use. The detailed plan is in [docs/shot-roadmap.md](docs/shot-roadmap.md).
 
 dwl already supports `ext-image-copy-capture-v1`, `ext-image-capture-source-v1` and `ext-foreign-toplevel-image-capture-source`.
 
