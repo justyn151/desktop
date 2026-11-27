@@ -7,6 +7,7 @@ PKG_CONFIG ?= pkg-config
 WAYLAND_SCANNER ?= wayland-scanner
 PACKAGES := wayland-client wayland-egl egl opengl xkbcommon freetype2 fontconfig
 GENERATED := .build
+DESK := ../desk
 XDG_HEADER := $(GENERATED)/xdg-shell-client-protocol.h
 XDG_CODE := $(GENERATED)/xdg-shell-protocol.c
 PRIMARY_HEADER := $(GENERATED)/primary-selection-unstable-v1-client-protocol.h
@@ -34,13 +35,13 @@ export DEAL_INSTALL_DESTDIR := $(value DESTDIR)
 
 all: deal
 
-deal: terminal.c terminal.h $(XDG_HEADER) $(XDG_CODE) $(PRIMARY_HEADER) $(PRIMARY_CODE) \
+deal: terminal.c terminal.h $(DESK)/desk.c $(DESK)/desk.h $(XDG_HEADER) $(XDG_CODE) $(PRIMARY_HEADER) $(PRIMARY_CODE) \
       $(ACTIVATION_HEADER) $(ACTIVATION_CODE) Makefile | check-build
 	set -eu
 	native_cflags=$$($(PKG_CONFIG) --cflags $(PACKAGES))
 	native_libs=$$($(PKG_CONFIG) --libs $(PACKAGES))
 	$(CC) $(CPPFLAGS) -std=c11 -Wall -Wextra -Wpedantic $(CFLAGS) \
-	    $$native_cflags -I"$(GENERATED)" $(LDFLAGS) -o $@ terminal.c "$(XDG_CODE)" \
+	    $$native_cflags -I"$(GENERATED)" -I"$(DESK)" $(LDFLAGS) -o $@ terminal.c "$(DESK)/desk.c" "$(XDG_CODE)" \
 	    "$(PRIMARY_CODE)" "$(ACTIVATION_CODE)" -lutil $$native_libs $(LDLIBS)
 
 check-build:

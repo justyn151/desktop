@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "terminal.h"
+#include "desk.h"
 
 #define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
@@ -61,7 +62,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.11.2";
+static const char deal_version[] = "0.12.0";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -257,6 +258,9 @@ typedef struct {
     CursorStyle cursor_style;
     bool blink, decorations;
     bool scroll_on_input, primary_selection, bold_bright, osc52;
+    bool theme_wallpaper; /* [theme] source = wallpaper */
+    bool theme_loaded; /* The colors came from a wallpaper palette. */
+    uint16_t palette_set; /* [palette] entries given in the file, one bit per index. */
     Shortcut zoom_in, zoom_out, zoom_reset, reload, fullscreen, new_window;
     bool dynamic_title, mouse_reporting, hyperlinks;
 } Config;
@@ -444,7 +448,7 @@ static bool config_parse_color(const char *value, size_t length, TerminalColor *
 
 enum ConfigType {
     CFG_INT, CFG_BOOL, CFG_STRING, CFG_SHELL, CFG_COLOR, CFG_OPACITY,
-    CFG_PADDING, CFG_SHORTCUT, CFG_OPTIONAL_SHORTCUT, CFG_MODIFIER, CFG_CURSOR, CFG_TERM
+    CFG_PADDING, CFG_SHORTCUT, CFG_OPTIONAL_SHORTCUT, CFG_MODIFIER, CFG_CURSOR, CFG_TERM, CFG_THEME
 };
 
 typedef struct {
@@ -489,6 +493,7 @@ static const ConfigKey config_keys[] = {
     SETTING("selection", "osc52", CFG_BOOL, osc52),
     SETTING("terminal", "shell", CFG_SHELL, shell),
     SETTING("terminal", "term", CFG_TERM, custom_term),
+    SETTING("theme", "source", CFG_THEME, theme_wallpaper),
     INTEGER("scrollback", "capacity", history_capacity, 0, 1000000),
     SETTING("scrollback", "scroll_on_input", CFG_BOOL, scroll_on_input),
     INTEGER("scrollback", "scroll_lines", scroll_lines, 1, 100),
@@ -604,6 +609,11 @@ static const char *config_set_value(const ConfigKey *key, Config *config, const 
             }
         }
         return "expected block, underline, or bar";
+    case CFG_THEME:
+        if (strcmp(value, "manual") != 0 && strcmp(value, "wallpaper") != 0)
+            return "expected manual or wallpaper";
+        *(bool *)field = strcmp(value, "wallpaper") == 0;
+        return NULL;
     case CFG_TERM:
         if (strcmp(value, "deal") != 0 && strcmp(value, compatibility_term) != 0)
             return "expected deal or xterm-color";
@@ -674,7 +684,8 @@ static bool config_parse_file(FILE *file, Config *config, const char *path)
         if (strcmp(section, "palette") == 0) {
             int index;
             if (!config_parse_int(key, 1, 16, &index)) error = "expected a palette index from 1 to 16";
-            else if (!config_parse_color(value, strlen(value), &config->palette[index - 1]))
+            else if (config->palette_set |= (uint16_t)(1u << (index - 1)),
+                     !config_parse_color(value, strlen(value), &config->palette[index - 1]))
                 error = "expected a #RRGGBB color";
         } else {
             error = "unknown setting";
@@ -741,6 +752,206 @@ static void config_overrides(Config *config)
     if (options->rows != 0) config->rows = options->rows;
 }
 
+/* Wallpaper theme. wall publishes ten color roles. The sixteen ANSI colors
+   keep their usual hues, so red still reads as an error, with lightness and
+   chroma chosen in Oklab for contrast against the wallpaper's background.
+   The ANSI slot nearest the accent's hue takes the accent's hue instead. */
+
+typedef struct {
+    double l, a, b;
+} Oklab;
+
+static double srgb_linear(double c)
+{
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+static double linear_srgb(double c)
+{
+    return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+static Oklab oklab_from_color(TerminalColor color)
+{
+    double r = srgb_linear(color.red / 255.0), g = srgb_linear(color.green / 255.0),
+           b = srgb_linear(color.blue / 255.0);
+    double l = cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    double m = cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    double s = cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    return (Oklab){0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+                   1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+                   0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s};
+}
+
+/* Convert to linear sRGB and report whether the color is inside the gamut. */
+static bool oklab_linear(Oklab color, double rgb[3])
+{
+    double l = color.l + 0.3963377774 * color.a + 0.2158037573 * color.b;
+    double m = color.l - 0.1055613458 * color.a - 0.0638541728 * color.b;
+    double s = color.l - 0.0894841775 * color.a - 1.2914855480 * color.b;
+    l = l * l * l;
+    m = m * m * m;
+    s = s * s * s;
+    rgb[0] = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+    rgb[1] = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+    rgb[2] = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+    for (int i = 0; i < 3; ++i) if (rgb[i] < -0.0001 || rgb[i] > 1.0001) return false;
+    return true;
+}
+
+static TerminalColor color_from_oklab(Oklab color)
+{
+    double rgb[3];
+    oklab_linear(color, rgb);
+    unsigned char out[3];
+    for (int i = 0; i < 3; ++i) {
+        double value = linear_srgb(rgb[i] < 0 ? 0 : rgb[i] > 1 ? 1 : rgb[i]);
+        out[i] = (unsigned char)(value * 255.0 + 0.5);
+    }
+    return (TerminalColor){out[0], out[1], out[2]};
+}
+
+static double color_luminance(TerminalColor color)
+{
+    return 0.2126 * srgb_linear(color.red / 255.0) + 0.7152 * srgb_linear(color.green / 255.0) +
+           0.0722 * srgb_linear(color.blue / 255.0);
+}
+
+static double color_contrast(TerminalColor a, TerminalColor b)
+{
+    double x = color_luminance(a) + 0.05, y = color_luminance(b) + 0.05;
+    return x > y ? x / y : y / x;
+}
+
+/* The most saturated color with this lightness and hue, up to chroma. */
+static TerminalColor oklch_color(double lightness, double chroma, double hue)
+{
+    double radians = hue * 3.14159265358979323846 / 180.0, rgb[3];
+    double low = 0, high = chroma;
+    if (!oklab_linear((Oklab){lightness, chroma * cos(radians), chroma * sin(radians)}, rgb)) {
+        for (int i = 0; i < 16; ++i) {
+            double middle = (low + high) / 2;
+            if (oklab_linear((Oklab){lightness, middle * cos(radians), middle * sin(radians)}, rgb)) low = middle;
+            else high = middle;
+        }
+        chroma = low;
+    }
+    return color_from_oklab((Oklab){lightness, chroma * cos(radians), chroma * sin(radians)});
+}
+
+/* Move lightness away from the background until the color reaches target. */
+static TerminalColor theme_hue(double hue, double chroma, double lightness, TerminalColor background,
+                               bool dark, double target, double *chosen)
+{
+    TerminalColor color = oklch_color(lightness, chroma, hue);
+    while (color_contrast(color, background) < target && lightness > 0.02 && lightness < 0.98) {
+        lightness += dark ? 0.01 : -0.01;
+        color = oklch_color(lightness, chroma, hue);
+    }
+    if (chosen != NULL) *chosen = lightness;
+    return color;
+}
+
+static TerminalColor rgb_color(uint32_t rgb)
+{
+    return (TerminalColor){(unsigned char)(rgb >> 16), (unsigned char)(rgb >> 8), (unsigned char)rgb};
+}
+
+static TerminalColor oklab_shift(TerminalColor color, double amount)
+{
+    Oklab value = oklab_from_color(color);
+    value.l += amount;
+    return color_from_oklab(value);
+}
+
+static void theme_apply(Config *config, const DeskPalette *palette)
+{
+    TerminalColor background = rgb_color(palette->rgb[DESK_BACKGROUND]);
+    TerminalColor foreground = rgb_color(palette->rgb[DESK_FOREGROUND]);
+    TerminalColor accent = rgb_color(palette->rgb[DESK_ACCENT]);
+    TerminalColor muted = rgb_color(palette->rgb[DESK_MUTED]);
+    bool dark = oklab_from_color(background).l < 0.5;
+    config->background = background;
+    config->foreground = foreground;
+    config->cursor = accent;
+    config->selection_background = rgb_color(palette->rgb[DESK_SELECTION_BACKGROUND]);
+    config->selection_foreground = rgb_color(palette->rgb[DESK_SELECTION_FOREGROUND]);
+
+    /* Red, green, yellow, blue, magenta and cyan as Oklab hues in degrees. */
+    double hues[6] = {27, 145, 95, 255, 330, 200};
+    double chroma[6] = {0.13, 0.13, 0.13, 0.13, 0.13, 0.11};
+    Oklab tone = oklab_from_color(accent);
+    double accent_chroma = hypot(tone.a, tone.b);
+    if (accent_chroma >= 0.06) {
+        double accent_hue = atan2(tone.b, tone.a) * 180.0 / 3.14159265358979323846;
+        if (accent_hue < 0) accent_hue += 360;
+        int nearest = 0;
+        double distance = 360;
+        for (int i = 0; i < 6; ++i) {
+            double gap = fabs(hues[i] - accent_hue);
+            if (gap > 180) gap = 360 - gap;
+            if (gap < distance) {
+                distance = gap;
+                nearest = i;
+            }
+        }
+        if (distance < 35) {
+            hues[nearest] = accent_hue;
+            if (accent_chroma > chroma[nearest]) chroma[nearest] = accent_chroma < 0.18 ? accent_chroma : 0.18;
+        }
+    }
+
+    TerminalColor ansi[16];
+    for (int i = 0; i < 6; ++i) {
+        double lightness;
+        ansi[1 + i] = theme_hue(hues[i], chroma[i], dark ? 0.68 : 0.52, background, dark, 4.5, &lightness);
+        ansi[9 + i] = theme_hue(hues[i], chroma[i] + 0.02, lightness + (dark ? 0.08 : -0.06), background, dark,
+                                5.5, NULL);
+    }
+    if (dark) {
+        ansi[0] = oklab_shift(background, 0.08);
+        ansi[7] = oklab_shift(foreground, -0.10);
+        ansi[15] = foreground;
+    } else {
+        ansi[0] = foreground;
+        ansi[7] = oklab_shift(background, -0.12);
+        ansi[15] = oklab_shift(background, -0.05);
+    }
+    ansi[8] = muted;
+    for (int i = 0; i < 16; ++i) {
+        if (!(config->palette_set & (1u << i))) config->palette[i] = ansi[i];
+    }
+}
+
+/* Replace the configured colors with the wallpaper palette when enabled.
+   Return false when the palette is missing or invalid. */
+static bool config_theme(Config *config)
+{
+    if (!config->theme_wallpaper) return true;
+    char *path = desk_palette_path();
+    DeskPalette palette;
+    int error = desk_palette_load(path, &palette);
+    if (error == 0) theme_apply(config, &palette);
+    else fprintf(stderr, "deal: %s: %s, keeping the current colors\n", path != NULL ? path : "wallpaper palette",
+                 error == EINVAL ? "not a complete wallpaper palette" : strerror(error));
+    free(path);
+    return error == 0;
+}
+
+/* After a failed palette load, keep the wallpaper colors already in use
+   rather than falling back to deal.conf. Explicit [palette] entries still apply. */
+static void config_keep_theme(Config *next, const Config *current)
+{
+    next->background = current->background;
+    next->foreground = current->foreground;
+    next->cursor = current->cursor;
+    next->selection_background = current->selection_background;
+    next->selection_foreground = current->selection_foreground;
+    for (int i = 0; i < 16; ++i) {
+        if (!(next->palette_set & (1u << i))) next->palette[i] = current->palette[i];
+    }
+}
+
 static bool config_load(Config *config, const Options *options)
 {
     *config = config_defaults();
@@ -752,6 +963,7 @@ static bool config_load(Config *config, const Options *options)
         if (options->config_path != NULL) return false;
     }
     config_overrides(config);
+    config->theme_loaded = config->theme_wallpaper && config_theme(config);
     return true;
 }
 
@@ -4048,6 +4260,28 @@ static void parser_finish_string(Terminal *terminal)
         }
         return;
     }
+    if (length >= 2 && text[0] == '4' && text[1] == ';') {
+        /* OSC 4 ; index ; ? [; index ; ? ...] reports palette entries. Sets are ignored. */
+        char *cursor = text + 2;
+        while (*cursor != 0) {
+            char *end;
+            unsigned long index = strtoul(cursor, &end, 10);
+            if (end == cursor || *end != ';' || index > 255) return;
+            cursor = end + 1;
+            char *next = strchr(cursor, ';');
+            size_t spec = next != NULL ? (size_t)(next - cursor) : strlen(cursor);
+            if (spec == 1 && cursor[0] == '?') {
+                TerminalColor color = index < 16 ? terminal->palette[index] : palette_color((unsigned int)index);
+                char response[64];
+                snprintf(response, sizeof response, "\033]4;%lu;rgb:%04x/%04x/%04x\033\\", index,
+                         257u * color.red, 257u * color.green, 257u * color.blue);
+                terminal_reply(terminal, response);
+            }
+            if (next == NULL) break;
+            cursor = next + 1;
+        }
+        return;
+    }
     if (length != 4 || text[0] != '1' || text[2] != ';' || text[3] != '?') return;
     TerminalColor color;
     switch (parser->string[1]) {
@@ -6098,6 +6332,12 @@ static bool config_reload(Config *config, Terminal *terminal, FontRenderer *rend
     }
 
     config_overrides(&next);
+    bool themed = config_theme(&next);
+    if (!themed && next.theme_wallpaper && config->theme_loaded) {
+        config_keep_theme(&next, config);
+        themed = true;
+    }
+    next.theme_loaded = next.theme_wallpaper && themed;
     size_t capacity = (size_t)next.history_capacity;
     bool change_history = capacity != terminal->history.capacity;
     if (change_history && capacity != 0) {
@@ -6169,9 +6409,9 @@ static const char *platform_poll(Platform *platform, struct pollfd *events, nfds
     return NULL;
 }
 
-static const char *run(Platform *platform, Terminal *terminal, Session *session,
-                       Config *config, FontRenderer *renderer, Clipboard *clipboard,
-                       char *zoom_path, bool *save_zoom)
+static const char *run_loop(Platform *platform, Terminal *terminal, Session *session,
+                            Config *config, FontRenderer *renderer, Clipboard *clipboard,
+                            char *zoom_path, bool *save_zoom, DeskWatch *theme)
 {
     int display_fd = wl_display_get_fd(platform->display);
     int width = platform->width, height = platform->height;
@@ -6304,13 +6544,20 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
             timeout = earlier_timeout(timeout, deadline_timeout(now, drain_deadline));
         }
 
-        enum { WAYLAND, PTY, SIGNAL, STARTUP, PASTE, SENDS };
+        if (config->theme_wallpaper && theme->fd < 0) {
+            char *path = desk_palette_path();
+            desk_watch_open(theme, path);
+            free(path);
+        } else if (!config->theme_wallpaper && theme->fd >= 0) desk_watch_close(theme);
+
+        enum { WAYLAND, PTY, SIGNAL, STARTUP, PASTE, THEME, SENDS };
         struct pollfd events[SENDS + CLIPBOARD_SENDS] = {
             [WAYLAND] = {display_fd, POLLIN, 0},
             [PTY] = {pty_closed ? -1 : session->master, POLLIN | (session->input_length ? POLLOUT : 0), 0},
             [SIGNAL] = {session->signal_fd, POLLIN, 0},
             [STARTUP] = {session->startup, POLLIN, 0},
-            [PASTE] = {clipboard->receive.fd, POLLIN, 0}
+            [PASTE] = {clipboard->receive.fd, POLLIN, 0},
+            [THEME] = {theme->fd, POLLIN, 0}
         };
         for (size_t i = 0; i < CLIPBOARD_SENDS; ++i)
             events[SENDS + i] = (struct pollfd){clipboard->send[i].fd, POLLOUT, 0};
@@ -6325,6 +6572,8 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
             error = session_check_startup(session);
             if (error != NULL) return error;
         }
+        /* A new palette goes through the reload path, which recolors live. */
+        if (desk_watch_changed(theme, events[THEME].revents)) input.reload = true;
         if (events[SIGNAL].revents & (POLLHUP | POLLERR | POLLNVAL))
             return "lost the signal notification descriptor";
         if (events[SIGNAL].revents & POLLIN) {
@@ -6435,6 +6684,17 @@ static int options_parse(Options *options, int argc, char **argv)
     return 0;
 }
 
+static const char *run(Platform *platform, Terminal *terminal, Session *session,
+                       Config *config, FontRenderer *renderer, Clipboard *clipboard,
+                       char *zoom_path, bool *save_zoom)
+{
+    DeskWatch theme = {.fd = -1};
+    const char *error = run_loop(platform, terminal, session, config, renderer, clipboard,
+                                 zoom_path, save_zoom, &theme);
+    desk_watch_close(&theme);
+    return error;
+}
+
 static void print_diagnostics(const Config *config, FontRenderer *renderer,
                               const Platform *platform, const char *graphical_error)
 {
@@ -6449,6 +6709,15 @@ static void print_diagnostics(const Config *config, FontRenderer *renderer,
     printf("Wayland: %s\nxdg-shell: %s\nApplication ID: %s\n",
            platform->display != NULL ? "connected" : "unavailable",
            platform->configured ? "configured" : "unavailable", platform_app_id(config));
+    if (config->theme_wallpaper) {
+        char *palette_path = desk_palette_path();
+        DeskPalette palette;
+        int palette_error = desk_palette_load(palette_path, &palette);
+        printf("Theme: wallpaper (%s%s%s)\n", palette_path != NULL ? palette_path : "no cache directory",
+               palette_error == 0 ? "" : ", unavailable: ",
+               palette_error == 0 ? "" : palette_error == EINVAL ? "incomplete palette" : strerror(palette_error));
+        free(palette_path);
+    } else puts("Theme: manual");
     printf("Compose: %s\nUrgency (xdg-activation): %s\n",
            platform->compose_locale != NULL ? platform->compose_locale : "unavailable",
            platform->activation == NULL ? "unavailable" : config->bell_urgency ? "enabled" : "disabled");
@@ -6492,7 +6761,7 @@ static void print_diagnostics(const Config *config, FontRenderer *renderer,
          "Wayland keyboard repeat, keyboard and wheel zoom, selection, clipboard, mouse reports, "
          "focus reporting, OSC titles and links, bold and italic faces, underline styles and colors, "
          "strikethrough, overline, compose and dead keys, visual and urgency bells, OSC 52 copy, "
-         "synchronized output, OSC 7 and new windows, INI reload");
+         "synchronized output, OSC 7 and new windows, wallpaper theme, INI reload");
 }
 
 int main(int argc, char **argv)

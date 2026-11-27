@@ -260,6 +260,6 @@ Release work:
 | Deferred | Kitty keyboard protocol | Skipped for now |
 | Deferred | Scrollback search and prompt marks | Skipped for now |
 | (Phase 1.4) | deal becomes the default, foot removed | Planned |
-| 0.12.0 | Palette from desk, OSC color queries | After Phase 3 step 1 |
+| 0.12.0 | Palette from desk, OSC color queries | Code done, checklist pending |
 | 0.13.0 | Renderer, damage and parser optimization | After Phase 3 |
 | 1.0.0 | vttest, fuzzing, terminfo, docs | Final |

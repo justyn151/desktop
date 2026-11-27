@@ -118,7 +118,7 @@ Migrate one step at a time. Behavior must stay identical, verified with each app
 | 5 | Font rasterizing and glyph cache | 4 copies | bar, run, wall, deal (rasterizer only; GL atlas stays in deal) |
 | 6 | Keyboard, repeat and compose | 2 copies | run, deal |
 
-After step 1: do deal 0.12.0 (map the palette's `ansi[16]` and roles onto deal's colors).
+deal 0.12.0 started `desk/` early with `desk_palette_load` and `desk_watch_*`. deal already uses them, so step 1 now means moving net, dwl, bar, run and wall onto the same functions. The palette has no `ansi[16]`, so deal derives its ANSI colors from the roles.
 
 **Phase 3 is done when:** no app contains its own palette parser, config parser, shm buffer code or font loader.
 

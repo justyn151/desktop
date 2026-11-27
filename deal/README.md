@@ -1,8 +1,8 @@
-# deal 0.11.2
+# deal 0.12.0
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.11.2 keeps the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 
@@ -15,7 +15,7 @@ Version 0.11.2 keeps the window margins even and answers resizes without waiting
 | Optional custom terminfo compiler | `ncurses` for `tic` |
 | Optional HTTP/HTTPS opener | `xdg-utils` for `xdg-open` |
 
-Linux's libc and libutil provide PTY support. Make generates bindings for xdg-shell, `primary-selection-unstable-v1` and `xdg-activation-v1` in `.build/`. Use `make clean` to remove the executable and generated bindings.
+The palette reader comes from [desk](../desk/README.md), which Make compiles into the executable. Linux's libc and libutil provide PTY support. Make generates bindings for xdg-shell, `primary-selection-unstable-v1` and `xdg-activation-v1` in `.build/`. Use `make clean` to remove the executable and generated bindings.
 
 From the repository root:
 
@@ -80,6 +80,21 @@ Key repeat follows the compositor's rate and delay for XKB-repeatable keys. Relo
 
 With `mouse.reporting` enabled, applications can request button, motion and wheel reports in legacy or SGR format. Hold `mouse.selection_override` (Shift by default) for local selection, primary paste or scrollback. Set selection colors under `[selection]`. Set `click_interval` from 100 to 1000 milliseconds to change the double- and triple-click interval. Set `primary = false` to disable primary selection.
 
+## Wallpaper theme
+
+Set `[theme] source = wallpaper` to take the colors from the palette that [wall](../wall/README.md#wallpaper-colors) publishes in `$XDG_CACHE_HOME/wall/colors.conf` (or `~/.cache/wall/colors.conf`). Turn on palette generation with `[colors] enabled = true` in `wall.conf`. Open windows recolor when the wallpaper changes, without restarting the shell.
+
+| Palette role | deal color |
+|---|---|
+| `background`, `foreground` | Default background and foreground, ANSI 15 on dark themes |
+| `accent` | Cursor. It also replaces the hue of the nearest ANSI color when it's saturated enough. |
+| `muted` | ANSI 8 (bright black) |
+| `selection_background`, `selection_foreground` | Selection colors |
+
+The palette has no ANSI colors, so deal derives them. Red, green, yellow, blue, magenta and cyan keep their usual hues so their meaning survives, such as errors in red. deal picks their lightness in the Oklab color space to reach a contrast of at least 4.5:1 against the background (5.5:1 for the bright colors). Black and white come from the background and foreground. Explicit `[palette]` entries still override the derived colors. When the palette is missing or invalid, deal keeps the colors it's using. `--diagnostics` shows the palette path and whether it's usable.
+
+Programs can read the current colors with OSC 4 (`ESC ] 4 ; N ; ? BEL`) and OSC 10, 11 and 12. Setting colors through OSC is not supported.
+
 ## Remote copy, synchronized output and new windows
 
 **OSC 52.** Programs can copy to the clipboard by printing `ESC ] 52 ; c ; <base64> BEL`. This works over ssh, so Neovim's `"+y` reaches the local clipboard (Neovim 0.10 and later use OSC 52 automatically in an ssh session without another clipboard tool). In tmux, set `set -g set-clipboard on`. Targets `c` (or empty) copy to the clipboard, and `p` or `s` to the primary selection. Payloads up to 16 MiB of base64 are accepted. Reading the clipboard with `?` is not supported, because it would let any program read what you copied. Set `[selection] osc52 = false` to ignore OSC 52 completely.
@@ -133,6 +148,15 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 - A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
 
 ## Manual verification on dwl
+
+### 0.12.0 Wallpaper theme
+
+- [ ] Build and check `./deal --version` reports 0.12.0, and that diagnostics show `Theme: wallpaper (...colors.conf)` with `[theme] source = wallpaper`.
+- [ ] Check the background, foreground, cursor and selection match `wall --colors`.
+- [ ] Run `for i in $(seq 0 15); do printf '\e[48;5;%dm  ' $i; done; printf '\e[0m\n'` and `git diff` or `ls --color`. Every color is readable against the background, and red, green and blue still look like themselves.
+- [ ] Change the wallpaper with Super+W. Open deal windows recolor within a second, the shell keeps running, and colored text already on screen changes to the new palette.
+- [ ] Set `2 = #ff0000` under `[palette]` and reload. ANSI 1 (red) stays `#ff0000` after a wallpaper change.
+- [ ] Set `source = manual` and reload. The colors from `deal.conf` come back.
 
 ### 0.11.1 Remote copy, synchronized output and new windows
 
