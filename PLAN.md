@@ -13,14 +13,18 @@ Ground rules that apply to every phase:
 
 ## Where things stand (2026-11-27)
 
-**Now:** `view`, the image viewer, pulled forward from Phase 5. 0.1 to 0.4 are done and pushed; 0.5's code is done and waiting on its live checks (dwl restart, `run`, a wallpaper change). Each milestone's details and checks are in [docs/view-roadmap.md](docs/view-roadmap.md).
+**Now:** `mark`, the terminal markdown viewer. `view`'s features are all in (0.1 to 0.5); what's left for it is 1.0, which is mostly a week of daily use, so it runs alongside `mark` instead of blocking it. Details for view are in [docs/view-roadmap.md](docs/view-roadmap.md).
 
 **Next, in order:**
 
-1. `view` 0.5 live checks: install view and dwl, restart dwl, then the four checks in `view/README.md`
-2. `view` 1.0: checklists, fuzzing `desk_image_load` (PNG, JPEG, GIF, WebP and the EXIF parser) under ASan/UBSan, README, tag `view-1.0.0`
-3. `mark`, the terminal markdown viewer: write `docs/mark-roadmap.md` first, then build it
-4. Back to the open items: deal 0.10.4 and 0.11.0 (Phase 1), the week on deal and removing foot (Phase 1.4), shot 0.5 and 1.0 (Phase 4), then Phase 3
+1. `mark`: write `docs/mark-roadmap.md` first (what it renders, how it pages, which deal features it relies on), then build it milestone by milestone
+2. Alongside `mark`, `view` toward 1.0:
+   - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
+   - 0.4 live checks once there are sample files: a portrait phone photo, a WebP, an animated GIF
+   - A week as the default image viewer, with annoyances in `docs/view-papercuts.md`
+   - Fuzz `desk_image_load` (PNG, JPEG, GIF, WebP, EXIF) under ASan/UBSan for a few hours, especially the hand-written GIF decoder
+   - Final README pass and tag `view-1.0.0`
+3. Back to the open items: deal 0.10.4 and 0.11.0 (Phase 1), the week on deal and removing foot (Phase 1.4), shot 0.5 and 1.0 (Phase 4), then Phase 3
 
 **Recently finished:**
 
@@ -195,7 +199,7 @@ Rough order, based on what gets touched most often day to day:
 5. `power`
 6. `mount`
 7. `view`: pulled forward and in progress (see below)
-   - `mark` comes right after `view` is finished, ahead of the rest of this list
+   - `mark` follows `view`, ahead of the rest of this list. It starts now, while `view` 1.0's week of use runs
 8. `files`
 9. `ctl`
 10. Then everything else from the project list below
@@ -211,11 +215,11 @@ The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on d
 | 0.3 | Browse a file's directory, a directory or a list; preload neighbours; reload a replaced file | Done |
 | 0.4 | GIF (built-in) and WebP, EXIF orientation, checkerboard, unsupported formats named | Done (live checks wait for sample files) |
 | 0.5 | Config, palette background, start directory, dwl float rule, desktop entry, shot's open-after-capture | Code done, live checks pending |
-| 1.0 | Checklists, fuzzing the decoders, README, tag | Next |
+| 1.0 | Live checks, a week of use, fuzzing the decoders, README, tag | In progress alongside `mark` |
 
 ### mark
 
-A terminal markdown viewer, built as soon as `view` reaches 1.0. It renders headings, emphasis, lists, tables, code blocks and links in a pager, using deal's text attributes (real bold and italic faces, strikethrough, colored underlines, OSC 8 links). The roadmap, `docs/mark-roadmap.md`, gets written before the first line of code.
+A terminal markdown viewer, started once `view`'s features were done (0.5), while view 1.0's week of use runs. It renders headings, emphasis, lists, tables, code blocks and links in a pager, using deal's text attributes (real bold and italic faces, strikethrough, colored underlines, OSC 8 links). The roadmap, `docs/mark-roadmap.md`, gets written before the first line of code.
 
 ---
 
