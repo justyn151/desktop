@@ -1,8 +1,8 @@
-# deal 0.12.1
+# deal 0.13.0
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.12.1 gives explicit backgrounds that match the default background the window's opacity. Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.13.0 adds tabs. Version 0.12.1 gave explicit backgrounds that match the default background the window's opacity. Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 
@@ -73,12 +73,21 @@ Reload with **Ctrl+Shift+R** or send **SIGHUP** to the deal process with `kill -
 | Ctrl+left click | Open an HTTP or HTTPS OSC 8 link |
 | F11 | Request fullscreen or return to the previous layout |
 | Ctrl+Shift+N | Open a new window in the shell's current directory |
+| Ctrl+Shift+T / Ctrl+Shift+W | Open a tab in the current directory / close the current tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab, with two or more tabs |
+| Alt+1 … Alt+9 | Go to tab 1 to 9, with two or more tabs |
 
 Under `[font]`, set `zoom_min` and `zoom_max` between 6 and 96 pixels and keep `size` within those limits. `zoom_step` is a positive number of pixels from 1 to 90. The `[shortcuts]` keys `zoom_in`, `zoom_out`, and `zoom_reset` are configurable. Zoom keeps the window dimensions and updates the terminal grid and PTY. With the default configuration path, deal remembers the runtime size separately in `font-zoom`. Zoom leaves `deal.conf` untouched.
 
 Key repeat follows the compositor's rate and delay for XKB-repeatable keys. Reload, fullscreen, copy and paste are single-press actions. Vertical wheel zoom consumes the gesture locally. High-resolution wheels accumulate fractional detents, and touchpads accumulate logical scroll distance. Set `[scrollback] scroll_lines` from 1 to 100 to change the number of history lines per detent. It defaults to 3.
 
 With `mouse.reporting` enabled, applications can request button, motion and wheel reports in legacy or SGR format. Hold `mouse.selection_override` (Shift by default) for local selection, primary paste or scrollback. Set selection colors under `[selection]`. Set `click_interval` from 100 to 1000 milliseconds to change the double- and triple-click interval. Set `primary = false` to disable primary selection.
+
+## Tabs
+
+Each tab has its own shell, screens, scrollback, selection and title. Background tabs keep running and receive their output. Only the active tab is drawn and receives keyboard and mouse input, and the window title follows it. A new tab runs your shell, not the `-e` command, in the current tab's directory. A tab closes when its shell exits, and closing the last tab closes the window. A window holds up to 16 tabs. Resizes, zoom and configuration reloads apply to every tab. The switching shortcuts only act with two or more tabs, so with one tab Ctrl+Tab and Alt+digits still reach the application. Set any tab shortcut to `false` under `[keybinds]` to disable it.
+
+There's no tab bar yet. It comes next, with click to switch and a marker for background tabs that rang the bell.
 
 ## Wallpaper theme
 
@@ -148,6 +157,17 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 - A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
 
 ## Manual verification on dwl
+
+### 0.13.0 Tabs
+
+- [ ] Build and check `./deal --version` reports 0.13.0.
+- [ ] `cd /tmp`, press Ctrl+Shift+T and run `pwd` in the new tab. Switch with Ctrl+Tab, Ctrl+Shift+Tab and Alt+1/Alt+2, and check each tab keeps its own screen, scrollback and title.
+- [ ] Run `for i in $(seq 30); do echo $i; sleep 0.2; done` in one tab and switch away. Come back and check every line arrived.
+- [ ] Resize the window and zoom with two tabs open, then run `stty size` in both. Reload the configuration and check both tabs change.
+- [ ] Open Neovim in one tab and a shell in another. Switch back and forth and check Neovim redraws correctly and receives focus events.
+- [ ] Type `exit` in a background-free tab and check the tab closes and the next one is shown. Close tabs with Ctrl+Shift+W until the window closes.
+- [ ] With one tab, check Ctrl+Tab reaches the application (for example in `cat -v`).
+- [ ] Copy in one tab and paste in another. Run `deal -e sh -c 'exit 3'; echo $?` from another terminal and check it prints 3.
 
 ### 0.12.0 Wallpaper theme
 

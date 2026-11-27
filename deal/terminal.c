@@ -62,7 +62,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.12.1";
+static const char deal_version[] = "0.13.0";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -182,6 +182,10 @@ static const char default_zoom_reset[] = "Ctrl+Shift+0";
 static const char default_reload[] = "Ctrl+Shift+R";
 static const char default_fullscreen[] = "F11";
 static const char default_new_window[] = "Ctrl+Shift+N";
+static const char default_new_tab[] = "Ctrl+Shift+T";
+static const char default_close_tab[] = "Ctrl+Shift+W";
+static const char default_next_tab[] = "Ctrl+Tab";
+static const char default_previous_tab[] = "Ctrl+Shift+Tab";
 
 typedef struct {
     xkb_keysym_t key;
@@ -262,6 +266,7 @@ typedef struct {
     bool theme_loaded; /* The colors came from a wallpaper palette. */
     uint16_t palette_set; /* [palette] entries given in the file, one bit per index. */
     Shortcut zoom_in, zoom_out, zoom_reset, reload, fullscreen, new_window;
+    Shortcut new_tab, close_tab, next_tab, previous_tab;
     bool dynamic_title, mouse_reporting, hyperlinks;
 } Config;
 
@@ -286,6 +291,10 @@ static Config config_defaults(void)
     shortcut_parse(default_reload, &defaults.reload, false);
     shortcut_parse(default_fullscreen, &defaults.fullscreen, true);
     shortcut_parse(default_new_window, &defaults.new_window, true);
+    shortcut_parse(default_new_tab, &defaults.new_tab, true);
+    shortcut_parse(default_close_tab, &defaults.close_tab, true);
+    shortcut_parse(default_next_tab, &defaults.next_tab, true);
+    shortcut_parse(default_previous_tab, &defaults.previous_tab, true);
     return defaults;
 }
 
@@ -510,6 +519,10 @@ static const ConfigKey config_keys[] = {
     SETTING("keybinds", "reload_config", CFG_SHORTCUT, reload),
     SETTING("keybinds", "fullscreen", CFG_OPTIONAL_SHORTCUT, fullscreen),
     SETTING("keybinds", "new_window", CFG_OPTIONAL_SHORTCUT, new_window),
+    SETTING("keybinds", "new_tab", CFG_OPTIONAL_SHORTCUT, new_tab),
+    SETTING("keybinds", "close_tab", CFG_OPTIONAL_SHORTCUT, close_tab),
+    SETTING("keybinds", "next_tab", CFG_OPTIONAL_SHORTCUT, next_tab),
+    SETTING("keybinds", "previous_tab", CFG_OPTIONAL_SHORTCUT, previous_tab),
 };
 #undef INTEGER
 #undef SETTING
@@ -4881,7 +4894,9 @@ static void session_reap(Session *session, int options)
     }
 }
 
-static void session_close(Session *session)
+/* End the shell and release its descriptors, keeping the signal descriptor
+   that every tab shares. */
+static void session_end(Session *session)
 {
     if (session->launch_gate >= 0) {
         close(session->launch_gate);
@@ -4910,6 +4925,11 @@ static void session_close(Session *session)
             session_reap(session, 0);
         }
     }
+}
+
+static void session_close(Session *session)
+{
+    session_end(session);
     if (session->signal_fd >= 0) {
         close(session->signal_fd);
         session->signal_fd = -1;
@@ -5748,7 +5768,11 @@ typedef struct {
     int font_size;
     bool reload;
     bool *redraw;
+    int tab_action; /* TabAction requested by a shortcut, handled by the run loop. */
+    size_t tab_target, tab_count;
 } Interaction;
+
+typedef enum { TAB_NONE, TAB_NEW, TAB_CLOSE, TAB_NEXT, TAB_PREVIOUS, TAB_GOTO } TabAction;
 
 static bool shortcut_matches(Shortcut shortcut, unsigned int modifiers, xkb_keysym_t key,
                              xkb_keysym_t unshifted)
@@ -5802,6 +5826,32 @@ static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint3
     if (shortcut_matches(config->new_window, modifiers, normalized, unshifted)) {
         if (event == KEY_PRESS) window_open(input);
         return true;
+    }
+    if (shortcut_matches(config->new_tab, modifiers, normalized, unshifted)) {
+        if (event == KEY_PRESS) input->tab_action = TAB_NEW;
+        return true;
+    }
+    if (shortcut_matches(config->close_tab, modifiers, normalized, unshifted)) {
+        if (event == KEY_PRESS) input->tab_action = TAB_CLOSE;
+        return true;
+    }
+    /* Switching shortcuts reach the application while there is only one tab. */
+    if (input->tab_count > 1) {
+        if (shortcut_matches(config->next_tab, modifiers, normalized, unshifted)) {
+            input->tab_action = TAB_NEXT;
+            return true;
+        }
+        if (shortcut_matches(config->previous_tab, modifiers, normalized, unshifted)) {
+            input->tab_action = TAB_PREVIOUS;
+            return true;
+        }
+        if (modifiers == MOD_ALT && unshifted >= XKB_KEY_1 && unshifted <= XKB_KEY_9) {
+            if (event == KEY_PRESS) {
+                input->tab_action = TAB_GOTO;
+                input->tab_target = (size_t)(unshifted - XKB_KEY_1);
+            }
+            return true;
+        }
     }
     if (modifiers == (MOD_CTRL | MOD_SHIFT) && (normalized == XKB_KEY_c || normalized == XKB_KEY_v)) {
         if (event == KEY_PRESS) {
@@ -5913,8 +5963,26 @@ static void link_open(Interaction *input, const char *url)
     }
 }
 
-/* Start another deal in the shell's directory: OSC 7 when the shell reports
-   it, otherwise the directory of the shell process itself. */
+/* The shell's directory: OSC 7 when the shell reports it, otherwise the
+   directory of the shell process itself. NULL when neither is known. */
+static const char *shell_directory(const Interaction *input, char directory[PATH_MAX])
+{
+    struct stat info;
+    if (input->terminal->directory[0] != 0 && stat(input->terminal->directory, &info) == 0 && S_ISDIR(info.st_mode))
+        return input->terminal->directory;
+    if (input->session->child > 0) {
+        char link[64];
+        snprintf(link, sizeof link, "/proc/%d/cwd", (int)input->session->child);
+        ssize_t count = readlink(link, directory, PATH_MAX - 1);
+        if (count > 0) {
+            directory[count] = 0;
+            return directory;
+        }
+    }
+    return NULL;
+}
+
+/* Start another deal in the shell's directory. */
 static void window_open(Interaction *input)
 {
     extern char **environ;
@@ -5926,19 +5994,7 @@ static void window_open(Interaction *input)
     static const char deleted[] = " (deleted)";
     if ((size_t)length > sizeof deleted - 1 && strcmp(executable + length - (sizeof deleted - 1), deleted) == 0)
         executable[length - (sizeof deleted - 1)] = 0;
-    const char *chosen = NULL;
-    struct stat info;
-    if (input->terminal->directory[0] != 0 && stat(input->terminal->directory, &info) == 0 && S_ISDIR(info.st_mode)) {
-        chosen = input->terminal->directory;
-    } else if (input->session->child > 0) {
-        char link[64];
-        snprintf(link, sizeof link, "/proc/%d/cwd", (int)input->session->child);
-        ssize_t count = readlink(link, directory, sizeof directory - 1);
-        if (count > 0) {
-            directory[count] = 0;
-            chosen = directory;
-        }
-    }
+    const char *chosen = shell_directory(input, directory);
     char *arguments[6];
     size_t count = 0;
     arguments[count++] = executable;
@@ -6413,23 +6469,159 @@ static const char *platform_poll(Platform *platform, struct pollfd *events, nfds
     return NULL;
 }
 
-static const char *run_loop(Platform *platform, Terminal *terminal, Session *session,
-                            Config *config, FontRenderer *renderer, Clipboard *clipboard,
-                            char *zoom_path, bool *save_zoom, DeskWatch *theme)
+/* Tabs. Each owns a terminal and its shell. The first tab uses main's
+   terminal and session, which main releases. Others are allocated here. */
+enum { TAB_LIMIT = 16 };
+
+typedef struct {
+    Terminal *terminal;
+    Session *session;
+    bool owned, hangup, closed, bell;
+    int64_t drain_deadline;
+} Tab;
+
+typedef struct {
+    Tab tabs[TAB_LIMIT];
+    size_t count, active;
+} Tabs;
+
+/* Release a terminal's memory. Safe to repeat. */
+static void terminal_free(Terminal *terminal)
+{
+    links_clear(terminal);
+    free(terminal->osc52);
+    terminal->osc52 = NULL;
+    terminal->osc52_length = terminal->osc52_capacity = 0;
+    free(terminal->clipboard_write);
+    terminal->clipboard_write = NULL;
+    history_clear(&terminal->history);
+    free(terminal->history.lines);
+    terminal->history.lines = NULL;
+    terminal->history.capacity = 0;
+    terminal_screen_destroy(&terminal->primary.screen);
+    terminal_screen_destroy(&terminal->alternate.screen);
+}
+
+static void tab_remove(Tabs *tabs, size_t index)
+{
+    Tab *tab = &tabs->tabs[index];
+    session_end(tab->session);
+    terminal_free(tab->terminal);
+    if (tab->owned) {
+        free(tab->terminal);
+        free(tab->session);
+    }
+    memmove(tab, tab + 1, (tabs->count - index - 1) * sizeof *tab);
+    --tabs->count;
+    if (tabs->active > index || (tabs->active == tabs->count && tabs->active > 0)) --tabs->active;
+}
+
+/* Open a shell in the active tab's directory, after the active tab. */
+static const char *tab_open(Tabs *tabs, const Interaction *input, const Config *config,
+                            const FontRenderer *renderer, int display_fd)
+{
+    if (tabs->count == TAB_LIMIT) return "the window already has the maximum number of tabs";
+    char directory[PATH_MAX];
+    const char *cwd = shell_directory(input, directory);
+    Terminal *terminal = malloc(sizeof *terminal);
+    Session *session = malloc(sizeof *session);
+    if (terminal == NULL || session == NULL) {
+        free(terminal);
+        free(session);
+        return "could not allocate a tab";
+    }
+    const Platform *platform = input->platform;
+    terminal_init(terminal, config->foreground, config->background, config->cursor,
+                  config->cursor_style, config->blink);
+    terminal_configure(terminal, config);
+    *session = (Session){.master = -1, .signal_fd = input->session->signal_fd, .startup = -1,
+                         .launch_gate = -1, .original_signal_mask = input->session->original_signal_mask,
+                         .original_sighup = input->session->original_sighup};
+    const char *error = NULL;
+    if (config->history_capacity > 0) {
+        terminal->history.lines = calloc((size_t)config->history_capacity, sizeof *terminal->history.lines);
+        if (terminal->history.lines == NULL) error = "could not allocate the scrollback ring";
+        else terminal->history.capacity = (size_t)config->history_capacity;
+    }
+    if (error == NULL && !terminal_resize_window(terminal, platform->width, platform->height,
+                                                 config->padding, &renderer->metrics))
+        error = "could not allocate the screen buffers";
+    /* A tab runs the shell, not the -e command, in the current directory. */
+    Options options = *config->options;
+    options.command = NULL;
+    options.directory = cwd;
+    Config tab_config = *config;
+    tab_config.options = &options;
+    if (error == NULL) {
+        error = session_open(session, session_size(&terminal->primary.screen, platform->width,
+                                                   platform->height, config->padding),
+                             display_fd, &tab_config);
+    }
+    if (error == NULL) error = session_launch(session);
+    if (error != NULL) {
+        session_end(session);
+        terminal_free(terminal);
+        free(terminal);
+        free(session);
+        return error;
+    }
+    terminal->reply = session_reply;
+    terminal->reply_context = session;
+    size_t position = tabs->active + 1;
+    memmove(&tabs->tabs[position + 1], &tabs->tabs[position], (tabs->count - position) * sizeof *tabs->tabs);
+    tabs->tabs[position] = (Tab){.terminal = terminal, .session = session, .owned = true};
+    ++tabs->count;
+    tabs->active = position;
+    return NULL;
+}
+
+/* Apply a reloaded configuration to a tab other than the active one, which
+   config_reload already updated. */
+static void tab_reconfigure(Terminal *terminal, const Config *config)
+{
+    size_t capacity = (size_t)config->history_capacity;
+    if (capacity != terminal->history.capacity) {
+        HistoryLine *lines = capacity != 0 ? calloc(capacity, sizeof *lines) : NULL;
+        if (capacity == 0 || lines != NULL) history_replace(terminal, lines, capacity);
+    }
+    terminal_configure(terminal, config);
+}
+
+/* Point input at the active tab. Return true when it changed. */
+static bool tab_select(Tabs *tabs, Interaction *input, Clipboard *clipboard, bool focused)
+{
+    Tab *tab = &tabs->tabs[tabs->active];
+    input->tab_count = tabs->count;
+    if (input->terminal == tab->terminal) return false;
+    input->terminal = tab->terminal;
+    input->session = tab->session;
+    tab->bell = false;
+    tab->terminal->title_dirty = true;
+    ++tab->terminal->mouse_generation;
+    /* A paste in progress belongs to the tab it was started in. */
+    clipboard_drop_receive(&clipboard->receive);
+    if (focused && tab->terminal->focus_reporting && !tab->closed) terminal_reply(tab->terminal, "\033[I");
+    return true;
+}
+
+static const char *run_loop(Platform *platform, Tabs *tabs, Config *config, FontRenderer *renderer,
+                            Clipboard *clipboard, char *zoom_path, bool *save_zoom, DeskWatch *theme)
 {
     int display_fd = wl_display_get_fd(platform->display);
     int width = platform->width, height = platform->height;
+    Terminal *terminal = tabs->tabs[0].terminal;
+    Session *session = tabs->tabs[0].session;
     terminal->reply = session_reply;
     terminal->reply_context = session;
 
     bool redraw = true;
-    bool focused = false, pty_hangup = false, pty_closed = false;
-    int64_t drain_deadline = 0, link_deadline = 0, zoom_deadline = 0, sync_since = 0;
+    bool focused = false;
+    int64_t link_deadline = 0, zoom_deadline = 0, sync_since = 0;
     CursorBlink blink = {0};
     Bell bell = {0};
     Interaction input = {.platform = platform, .terminal = terminal, .session = session,
                          .config = config, .renderer = renderer, .clipboard = clipboard,
-                         .font_size = renderer->size, .redraw = &redraw};
+                         .font_size = renderer->size, .redraw = &redraw, .tab_count = tabs->count};
     platform->key_pressed = keyboard_event;
     platform->scrolled = pointer_scroll;
     platform->pointer_button_event = pointer_button_event;
@@ -6443,12 +6635,40 @@ static const char *run_loop(Platform *platform, Terminal *terminal, Session *ses
         if (platform->error != NULL || platform->closed) return platform->error;
         redraw |= platform->needs_redraw;
         platform->needs_redraw = false;
+        Tab *tab = &tabs->tabs[tabs->active];
         if (focused != platform->focused) {
             focused = platform->focused;
             redraw = true;
-            if (terminal->focus_reporting && !pty_closed)
+            if (terminal->focus_reporting && !tab->closed)
                 terminal_reply(terminal, focused ? "\033[I" : "\033[O");
         }
+
+        if (input.tab_action != TAB_NONE) {
+            int action = input.tab_action;
+            input.tab_action = TAB_NONE;
+            if (action != TAB_CLOSE && focused && terminal->focus_reporting && !tab->closed)
+                terminal_reply(terminal, "\033[O");
+            if (action == TAB_NEW) {
+                const char *error = tab_open(tabs, &input, config, renderer, display_fd);
+                if (error != NULL) fprintf(stderr, "deal: could not open a tab: %s\n", error);
+            } else if (action == TAB_CLOSE) {
+                tab_remove(tabs, tabs->active);
+                if (tabs->count == 0) return NULL;
+            } else if (action == TAB_NEXT) {
+                tabs->active = (tabs->active + 1) % tabs->count;
+            } else if (action == TAB_PREVIOUS) {
+                tabs->active = (tabs->active + tabs->count - 1) % tabs->count;
+            } else if (action == TAB_GOTO && input.tab_target < tabs->count) {
+                tabs->active = input.tab_target;
+            }
+        }
+        if (tab_select(tabs, &input, clipboard, focused)) {
+            redraw = true;
+            sync_since = 0;
+        }
+        terminal = input.terminal;
+        session = input.session;
+        tab = &tabs->tabs[tabs->active];
 
         bool reloaded = false, zoomed = false;
         if (input.reload) {
@@ -6462,7 +6682,7 @@ static const char *run_loop(Platform *platform, Terminal *terminal, Session *ses
             }
         }
         if (!clipboard_sync(clipboard, platform, config)) return "could not initialize Wayland selections";
-        if (!pty_closed) platform_repeat_key(platform, monotonic_milliseconds());
+        if (!tab->closed) platform_repeat_key(platform, monotonic_milliseconds());
         if (input.font_size != renderer->size) {
             zoomed = font_zoom(renderer, terminal, config, platform, input.font_size);
             input.font_size = renderer->size;
@@ -6485,11 +6705,18 @@ static const char *run_loop(Platform *platform, Terminal *terminal, Session *ses
         }
         if (resized || reloaded || zoomed) {
             redraw = true;
-            if (!pty_closed) {
-                PtyResult result = session_resize(session, session_size(&terminal->primary.screen, width,
-                                                                       height, config->padding));
+            for (size_t i = 0; i < tabs->count; ++i) {
+                Tab *other = &tabs->tabs[i];
+                if (i != tabs->active) {
+                    if (reloaded) tab_reconfigure(other->terminal, config);
+                    if (!terminal_resize_window(other->terminal, width, height, config->padding, &renderer->metrics))
+                        return "could not resize the screen buffers";
+                }
+                if (other->closed) continue;
+                PtyResult result = session_resize(other->session, session_size(&other->terminal->primary.screen,
+                                                                              width, height, config->padding));
                 if (result == PTY_FAILED) return "could not resize the pseudoterminal";
-                if (result == PTY_CLOSED) pty_hangup = true;
+                if (result == PTY_CLOSED) other->hangup = true;
             }
         }
 
@@ -6497,7 +6724,15 @@ static const char *run_loop(Platform *platform, Terminal *terminal, Session *ses
             platform_title(platform, config, terminal->dynamic_title);
             terminal->title_dirty = false;
         }
-        clipboard_remote_write(clipboard, platform, terminal);
+        for (size_t i = 0; i < tabs->count; ++i) {
+            Tab *other = &tabs->tabs[i];
+            clipboard_remote_write(clipboard, platform, other->terminal);
+            /* Step 2 shows this on the tab bar. */
+            if (i != tabs->active && other->terminal->bell_pending) {
+                other->bell = true;
+                other->terminal->bell_pending = false;
+            }
+        }
         int64_t now = monotonic_milliseconds();
         int timeout = clipboard_timeout(clipboard, terminal, now);
         if (!terminal->synchronized) sync_since = 0;
@@ -6541,12 +6776,32 @@ static const char *run_loop(Platform *platform, Terminal *terminal, Session *ses
             redraw = false;
         }
 
-        if (pty_closed && session->child == 0) return session_check_startup(session);
-        if (pty_closed || (session->child == 0 && !pty_hangup)) {
-            if (drain_deadline == 0) drain_deadline = now + 250;
-            if (now < 0 || now >= drain_deadline) return session_check_startup(session);
-            timeout = earlier_timeout(timeout, deadline_timeout(now, drain_deadline));
+        /* A tab closes once its shell has exited and its output is drained. */
+        for (size_t i = 0; i < tabs->count;) {
+            Tab *other = &tabs->tabs[i];
+            bool finished = other->closed && other->session->child == 0;
+            if (!finished && (other->closed || (other->session->child == 0 && !other->hangup))) {
+                if (other->drain_deadline == 0) other->drain_deadline = now + 250;
+                if (now < 0 || now >= other->drain_deadline) finished = true;
+                else timeout = earlier_timeout(timeout, deadline_timeout(now, other->drain_deadline));
+            }
+            if (!finished) {
+                ++i;
+                continue;
+            }
+            const char *error = session_check_startup(other->session);
+            if (tabs->count == 1) return error;
+            if (error != NULL) fprintf(stderr, "deal: %s\n", error);
+            tab_remove(tabs, i);
+            timeout = 0;
         }
+        if (tab_select(tabs, &input, clipboard, focused)) {
+            redraw = true;
+            sync_since = 0;
+        }
+        terminal = input.terminal;
+        session = input.session;
+        tab = &tabs->tabs[tabs->active];
 
         if (config->theme_wallpaper && theme->fd < 0) {
             char *path = desk_palette_path();
@@ -6554,27 +6809,36 @@ static const char *run_loop(Platform *platform, Terminal *terminal, Session *ses
             free(path);
         } else if (!config->theme_wallpaper && theme->fd >= 0) desk_watch_close(theme);
 
-        enum { WAYLAND, PTY, SIGNAL, STARTUP, PASTE, THEME, SENDS };
-        struct pollfd events[SENDS + CLIPBOARD_SENDS] = {
+        enum { WAYLAND, SIGNAL, PASTE, THEME, SENDS };
+        enum { PTYS = SENDS + CLIPBOARD_SENDS, STARTUPS = PTYS + TAB_LIMIT, EVENTS = STARTUPS + TAB_LIMIT };
+        struct pollfd events[EVENTS] = {
             [WAYLAND] = {display_fd, POLLIN, 0},
-            [PTY] = {pty_closed ? -1 : session->master, POLLIN | (session->input_length ? POLLOUT : 0), 0},
             [SIGNAL] = {session->signal_fd, POLLIN, 0},
-            [STARTUP] = {session->startup, POLLIN, 0},
             [PASTE] = {clipboard->receive.fd, POLLIN, 0},
             [THEME] = {theme->fd, POLLIN, 0}
         };
         for (size_t i = 0; i < CLIPBOARD_SENDS; ++i)
             events[SENDS + i] = (struct pollfd){clipboard->send[i].fd, POLLOUT, 0};
-        bool parser_pending = session->output_start < session->output_end;
-        if (!pty_closed && (parser_pending || pty_hangup)) timeout = 0;
-        if (!pty_closed && platform->repeat.key != 0)
+        for (size_t i = 0; i < TAB_LIMIT; ++i) {
+            const Tab *other = i < tabs->count ? &tabs->tabs[i] : NULL;
+            events[PTYS + i] = (struct pollfd){other == NULL || other->closed ? -1 : other->session->master,
+                (short)(POLLIN | (other != NULL && other->session->input_length ? POLLOUT : 0)), 0};
+            events[STARTUPS + i] = (struct pollfd){other != NULL ? other->session->startup : -1, POLLIN, 0};
+            if (other != NULL && !other->closed &&
+                (other->session->output_start < other->session->output_end || other->hangup)) timeout = 0;
+        }
+        if (!tab->closed && platform->repeat.key != 0)
             timeout = earlier_timeout(timeout, deadline_timeout(monotonic_milliseconds(), platform->repeat.deadline));
         const char *error = platform_poll(platform, events, sizeof events / sizeof events[0], timeout);
         if (error != NULL) return error;
 
-        if (events[STARTUP].revents) {
-            error = session_check_startup(session);
-            if (error != NULL) return error;
+        for (size_t i = 0; i < tabs->count; ++i) {
+            if (!events[STARTUPS + i].revents) continue;
+            error = session_check_startup(tabs->tabs[i].session);
+            if (error == NULL) continue;
+            if (tabs->count == 1) return error;
+            fprintf(stderr, "deal: %s\n", error);
+            tabs->tabs[i].closed = true;
         }
         /* A new palette goes through the reload path, which recolors live. */
         if (desk_watch_changed(theme, events[THEME].revents)) input.reload = true;
@@ -6588,27 +6852,34 @@ static const char *run_loop(Platform *platform, Terminal *terminal, Session *ses
             for (ssize_t i = 0; i < count / (ssize_t)sizeof *signals; ++i) {
                 if (signals[i].ssi_signo == SIGHUP) input.reload = true;
                 if (signals[i].ssi_signo == SIGCHLD) {
-                    session_reap(session, WNOHANG);
+                    for (size_t j = 0; j < tabs->count; ++j) session_reap(tabs->tabs[j].session, WNOHANG);
                     link_reap(&input);
                 }
             }
         }
-        if (events[PTY].revents & POLLNVAL) return "lost the pseudoterminal descriptor";
-        pty_hangup |= (events[PTY].revents & (POLLHUP | POLLERR)) != 0;
-        if (!pty_closed && ((events[PTY].revents & POLLIN) || parser_pending || pty_hangup)) {
-            PtyResult result = session_read(session, terminal, &redraw, pty_hangup);
-            if (result == PTY_FAILED) return "could not read from the pseudoterminal";
-            pty_closed = result == PTY_CLOSED;
-        }
-        if (!pty_closed && (events[PTY].revents & POLLOUT)) {
-            PtyResult result = session_write(session);
-            if (result == PTY_FAILED) return "could not write to the pseudoterminal";
-            if (result == PTY_CLOSED) {
-                session->input_length = 0;
-                pty_hangup = true;
+        for (size_t i = 0; i < tabs->count; ++i) {
+            Tab *other = &tabs->tabs[i];
+            short revents = events[PTYS + i].revents;
+            if (revents & POLLNVAL) return "lost the pseudoterminal descriptor";
+            other->hangup |= (revents & (POLLHUP | POLLERR)) != 0;
+            bool pending = other->session->output_start < other->session->output_end;
+            if (!other->closed && ((revents & POLLIN) || pending || other->hangup)) {
+                bool background = false;
+                PtyResult result = session_read(other->session, other->terminal,
+                                                i == tabs->active ? &redraw : &background, other->hangup);
+                if (result == PTY_FAILED) return "could not read from the pseudoterminal";
+                other->closed = result == PTY_CLOSED;
+            }
+            if (!other->closed && (revents & POLLOUT)) {
+                PtyResult result = session_write(other->session);
+                if (result == PTY_FAILED) return "could not write to the pseudoterminal";
+                if (result == PTY_CLOSED) {
+                    other->session->input_length = 0;
+                    other->hangup = true;
+                }
             }
         }
-        if (pty_closed) clipboard_drop_receive(&clipboard->receive);
+        if (tab->closed) clipboard_drop_receive(&clipboard->receive);
         else clipboard_read(&clipboard->receive, session, terminal, config, &redraw, events[PASTE].revents);
         for (size_t i = 0; i < CLIPBOARD_SENDS; ++i)
             clipboard_write(&clipboard->send[i], events[SENDS + i].revents);
@@ -6693,8 +6964,16 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
                        char *zoom_path, bool *save_zoom)
 {
     DeskWatch theme = {.fd = -1};
-    const char *error = run_loop(platform, terminal, session, config, renderer, clipboard,
-                                 zoom_path, save_zoom, &theme);
+    Tabs *tabs = calloc(1, sizeof *tabs);
+    if (tabs == NULL) return "could not allocate the tab list";
+    tabs->tabs[0] = (Tab){.terminal = terminal, .session = session};
+    tabs->count = 1;
+    const char *error = run_loop(platform, tabs, config, renderer, clipboard, zoom_path, save_zoom, &theme);
+    /* main releases the first tab's terminal and session. */
+    for (size_t i = tabs->count; i-- > 0;) {
+        if (tabs->tabs[i].owned) tab_remove(tabs, i);
+    }
+    free(tabs);
     desk_watch_close(&theme);
     return error;
 }
@@ -6851,13 +7130,7 @@ int main(int argc, char **argv)
     if (save_zoom) config_save_zoom(zoom_path, config.font_size, renderer.size);
     clipboard_close(&clipboard);
     session_close(&session);
-    links_clear(&terminal);
-    free(terminal.osc52);
-    free(terminal.clipboard_write);
-    history_clear(&terminal.history);
-    free(terminal.history.lines);
-    terminal_screen_destroy(&terminal.primary.screen);
-    terminal_screen_destroy(&terminal.alternate.screen);
+    terminal_free(&terminal);
     font_close(&renderer);
     platform_close(&platform);
     config_destroy(&config);
