@@ -143,7 +143,7 @@ Split out of 0.11.0.
 
 ---
 
-## 0.11.2: Keyboard protocol (new)
+## Deferred: Keyboard protocol (new)
 
 Modern TUIs (Neovim, Helix, fish 4, and later `lead`) can tell Ctrl+I from Tab and Ctrl+Shift+letter from Ctrl+letter only with an extended keyboard protocol.
 
@@ -156,7 +156,7 @@ Manual check: `kitten show-key` or a small test script that sends `CSI > 1 u` an
 
 ---
 
-## 0.11.3: Scrollback navigation (new)
+## Deferred: Scrollback navigation (new)
 
 - **Search:** Ctrl+Shift+F opens a one-line search bar drawn over the bottom row. Search history plus the screen, case-insensitive by default, with Enter/Shift+Enter for next/previous, highlight all matches, and Escape to close. Search the logical (unwrapped) lines so matches across a soft wrap are found.
 - **Prompt marks (OSC 133):** record `A`/`B`/`C`/`D` marks per line. Ctrl+Shift+Up/Down jumps to the previous or next prompt. Add a small fish/bash snippet to the README that emits the marks.
@@ -256,8 +256,9 @@ Release work:
 | 0.10.5 | Text attributes, bold/italic faces | Done |
 | 0.11.0 | Compose and dead keys, urgency bell (off by default) | Done (Compose untested) |
 | 0.11.1 | OSC 52, synchronized output, OSC 7 | Code done, checklist pending |
-| 0.11.2 | Kitty keyboard protocol | **New** |
-| 0.11.3 | Scrollback search and prompt marks | **New** |
+| 0.11.2 | Even margins, immediate redraw on resize | Done |
+| Deferred | Kitty keyboard protocol | Skipped for now |
+| Deferred | Scrollback search and prompt marks | Skipped for now |
 | (Phase 1.4) | deal becomes the default, foot removed | Planned |
 | 0.12.0 | Palette from desk, OSC color queries | After Phase 3 step 1 |
 | 0.13.0 | Renderer, damage and parser optimization | After Phase 3 |

@@ -61,7 +61,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.11.1";
+static const char deal_version[] = "0.11.2";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -1465,6 +1465,18 @@ static int grid_extent(int pixels, int padding)
     return pixels > 2 * padding ? pixels - 2 * padding : 0;
 }
 
+/* The grid holds whole cells. Split the remaining pixels between both sides
+   so the margins stay even instead of collecting at the right and bottom. */
+static Padding grid_padding(Padding padding, int width, int height, const FontMetrics *metrics,
+                            const TerminalScreen *screen)
+{
+    int spare_x = grid_extent(width, padding.horizontal) - (int)screen->columns * metrics->width;
+    int spare_y = grid_extent(height, padding.vertical) - (int)screen->rows * metrics->height;
+    if (spare_x > 0) padding.horizontal += spare_x / 2;
+    if (spare_y > 0) padding.vertical += spare_y / 2;
+    return padding;
+}
+
 static void render_glyph(FontRenderer *renderer, uint32_t codepoint, unsigned char span,
                          unsigned char style, bool mark, TerminalColor foreground, int x, int y)
 {
@@ -1568,7 +1580,8 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
                  background.blue * background_scale, opacity);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    int pad_x = config->padding.horizontal, pad_y = config->padding.vertical;
+    Padding padding = grid_padding(config->padding, width, height, &renderer->metrics, screen);
+    int pad_x = padding.horizontal, pad_y = padding.vertical;
     int cell_width = renderer->metrics.width;
     int cell_height = renderer->metrics.height;
     glScissor(pad_x, pad_y, grid_extent(width, pad_x), grid_extent(height, pad_y));
@@ -2475,6 +2488,9 @@ static const struct wl_callback_listener frame_listener = {.done = platform_fram
 
 static const char *platform_swap(Platform *platform)
 {
+    /* A resize can present before the previous callback fires. Only the
+       newest callback paces the next frame. */
+    if (platform->frame != NULL) wl_callback_destroy(platform->frame);
     platform->frame = wl_surface_frame(platform->surface);
     if (platform->frame == NULL || wl_callback_add_listener(platform->frame, &frame_listener, platform) < 0)
         return "could not request a Wayland frame callback";
@@ -5592,11 +5608,17 @@ static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint3
 
 /* Local pointer interaction and terminal mouse reporting */
 
+static Padding input_padding(const Interaction *input)
+{
+    return grid_padding(input->config->padding, input->platform->width, input->platform->height,
+                        &input->renderer->metrics, &terminal_buffer(input->terminal)->screen);
+}
+
 static bool mouse_cell(const Interaction *input, unsigned int *column, unsigned int *row)
 {
     const FontMetrics *metrics = &input->renderer->metrics;
     const TerminalScreen *screen = &terminal_buffer(input->terminal)->screen;
-    Padding padding = input->config->padding;
+    Padding padding = input_padding(input);
     double x = input->platform->pointer_x - padding.horizontal;
     double y = input->platform->pointer_y - padding.vertical;
     if (x < 0 || y < 0 || x / metrics->width >= (double)screen->columns ||
@@ -5756,7 +5778,7 @@ static bool mouse_send(Interaction *input, unsigned int code, unsigned int colum
 static SelectionPoint mouse_selection_point(const Interaction *input)
 {
     TerminalView view = terminal_view(input->terminal);
-    return selection_point(&view, &input->renderer->metrics, input->config->padding,
+    return selection_point(&view, &input->renderer->metrics, input_padding(input),
                            (int)input->platform->pointer_x, (int)input->platform->pointer_y);
 }
 
@@ -5920,7 +5942,7 @@ static int mouse_tick(Interaction *input, int64_t now)
     Mouse *mouse = &input->mouse;
     Terminal *terminal = input->terminal;
     const FontMetrics *metrics = &input->renderer->metrics;
-    int top = input->config->padding.vertical;
+    int top = input_padding(input).vertical;
     int bottom = top + (int)terminal->primary.screen.rows * metrics->height;
     double y = input->platform->pointer_y;
     bool up = y < top && terminal->history.offset < terminal->history.count;
@@ -6263,7 +6285,9 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
         timeout = earlier_timeout(timeout, cursor_timeout(&blink, focused && buffer->cursor_visible &&
                                     buffer->cursor_blink && view.first_visible == view.first_live,
                                     config->blink_interval, now, &redraw));
-        if (redraw && !hold && platform->frame == NULL) {
+        /* Answer a new size at once, so the compositor's border doesn't run
+           ahead of the content during an interactive resize. */
+        if (redraw && !hold && (platform->frame == NULL || resized)) {
             render_screen(renderer, &view, width, height, buffer->cursor.column, buffer->cursor.row,
                           buffer->cursor_visible && blink.visible, buffer->cursor_style, config,
                           config->opacity);

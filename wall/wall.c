@@ -74,7 +74,7 @@ static const struct config default_config = {
 
 static const struct browser_config default_browser = {
     .recursive = true, .cache = true, .close_on_apply = true,
-    .thumbnail_width = 240, .thumbnail_height = 135, .font_size = 14,
+    .thumbnail_width = 312, .thumbnail_height = 176, .font_size = 14,
     .background = 0x353535, .foreground = 0xc5ad81,
     .highlight = 0xead4aa, .muted = 0x887d69,
 };
@@ -3654,7 +3654,7 @@ int main(int argc, char **argv)
 #define CATALOG_BYTES (32u * 1024 * 1024)
 #define CATALOG_LIMIT 100000u
 #define DIRECTORY_BYTES (8u * 1024 * 1024)
-#define THUMBNAIL_BYTES (24u * 1024 * 1024)
+#define THUMBNAIL_BYTES (40u * 1024 * 1024)
 #define THUMBNAIL_SLOTS 128
 #define DISK_SLOTS 1024
 #define BROWSER_PADDING 12
@@ -5775,7 +5775,7 @@ static int browser_run(const struct options *options)
     struct browser browser = {
         .config = default_browser, .signals = -1, .notify_files = -1, .session_lock = -1,
         .theme_watch = {.fd = -1},
-        .width = 1040, .height = 480, .last_clicked = SIZE_MAX,
+        .width = 1352, .height = 624, .last_clicked = SIZE_MAX,
         .pointer_x = -1, .pointer_y = -1,
     };
     struct config wallpaper = default_config;
