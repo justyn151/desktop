@@ -232,11 +232,22 @@ A terminal markdown viewer, started once `view`'s features were done (0.5), whil
 | 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Not started |
 | 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Not started |
 
+### note (idea, not scheduled)
+
+Noted 2026-11-28 so it isn't forgotten. No roadmap yet, and no place in the order above.
+
+- A note-taking app taking after Obsidian (plain-text notes in a folder, links between them) and Excalidraw (hand-drawn-looking freehand drawing on a canvas, which is the part to learn most from).
+- Notes are written in a new markup language of its own:
+  - Markdown-like for ordinary writing.
+  - LaTeX-like for math and math diagrams, rendered by the app itself. A real TeX install is too big to depend on.
+- mark's CommonMark parser is the natural starting point for the text half.
+- Open questions for the roadmap: the language's syntax and how drawings are stored in the same file, GUI on desk vs a terminal front end, and how much of TeX's math layout is worth reimplementing.
+
 ---
 
 ## Phase 6: Gaps (last)
 
-These are the pieces a laptop daily driver needs that aren't one of the 26 projects. They come after the core apps exist.
+These are the pieces a laptop daily driver needs that aren't one of the 27 projects. They come after the core apps exist.
 
 | Gap | Current state | Route |
 |---|---|---|
@@ -251,7 +262,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 26 proje
 
 ---
 
-## The 26 projects
+## The 27 projects
 
 ### Existing (7)
 
@@ -265,7 +276,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 26 proje
 | 6 | `deal` | Terminal emulator, migrating from X11 to native Wayland | 0.10.3, Phase 1 |
 | 7 | `lead` | Modal terminal text editor (installed as `editor`) | Early (Phase 0.3) |
 
-### Planned (19)
+### Planned (20)
 
 | # | Project | What it does |
 |---|---|---|
@@ -288,3 +299,4 @@ These are the pieces a laptop daily driver needs that aren't one of the 26 proje
 | 24 | `pkg` | Build and install tool for the desktop repo |
 | 25 | toolkit | Shared GUI widgets, extracted from `desk` once `files` shows what is really common |
 | 26 | `mark` | Markdown viewer for the terminal: renders headings, emphasis, lists, tables, code blocks and links with deal's text attributes, in a pager |
+| 27 | `note` (working name) | Note-taking app in the spirit of Obsidian and Excalidraw, on its own markup language |
