@@ -233,7 +233,7 @@ view [FILE|DIR]...
 
 | Version | Theme | Status |
 |---|---|---|
-| 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (key, resize, floating and scale checks pending) |
+| 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (fractional scale check pending, needs `wlr-randr`) |
 | 0.2 | Zoom, pan, rotate, filters, key repeat | Planned |
 | 0.3 | Directory browsing, preloading, reload on change | Planned |
 | 0.4 | EXIF orientation, transparency, format decision | Planned |

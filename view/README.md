@@ -48,7 +48,7 @@ Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 si
 - [x] A PNG smaller than the window is shown pixel-exact, not enlarged (a 64×48 one-pixel checker).
 - [x] A transparent PNG composites over the background.
 - [x] `view -` reads standard input; empty input, a non-image, a truncated JPEG, a missing file and a directory exit 1 with a message.
-- [ ] `q` and Escape close the window.
-- [ ] Resizing the window (tile ↔ float, Super+Space) refits immediately without stretching.
-- [ ] A floating window opens at the image's size, limited to 80% of the output.
+- [x] `q` and Escape close the window.
+- [x] Resizing the window (tile ↔ float, Super+Space) refits immediately without stretching.
+- [x] A floating window opens at the image's size, limited to 80% of the output.
 - [ ] Sharp at 1.25× and 1.5× output scale (`wlr-randr`, not installed yet).
