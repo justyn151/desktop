@@ -56,7 +56,7 @@ fill in settings omitted from the file that was loaded.
 | --- | --- |
 | `[bar]` | `height` (1–4096 logical pixels), `position` (`top` or `bottom`), `background`, `opacity` (0–1), `scale` (positive multiplier, default 1.0), `foreground` (network and clock color), `padding` (0–4096 pixels per side) |
 | `[font]` | `family` (an installed Fontconfig family or a generic family such as `monospace`), `size` (1–256 pixels) |
-| `[workspaces]` | `labels` (1–32 comma-separated labels in tag order, up to 63 bytes each), `hide_empty` and `underline_active` (`true` or `false`), `active_color`, `occupied_color`, `inactive_color`, `urgent_color`, `spacing` (0–4096 pixels) |
+| `[workspaces]` | `labels` (1–32 comma-separated labels in tag order, up to 63 bytes each), `hide_empty` (`true` or `false`), `active_style` (`box` for an opaque box in the workspace color with the label in the background color, `underline`, or `none`), `active_color`, `occupied_color`, `inactive_color`, `urgent_color`, `spacing` (0–4096 pixels) |
 | `[clock]` | `format` (a `strftime` format, including glibc extensions such as `%l` and `%P`) |
 | `[network]` | `enabled`, `show_ssid`, `show_strength`, `click_enabled` (`true` or `false`), `custom_text` (Wi-Fi label), `separator` (up to 63 bytes each, quote to preserve spaces), `command` (up to 1023 bytes) |
 

@@ -55,7 +55,7 @@ struct workspace_state {
 };
 
 struct workspace_view {
-    uint32_t visible, underlined, colors[BAR_MAX_WORKSPACES];
+    uint32_t visible, underlined, boxed, colors[BAR_MAX_WORKSPACES];
 };
 
 struct monitor {
@@ -390,7 +390,7 @@ static bool load_theme_palette(const char *path, uint32_t rgb[THEME_ROLE_COUNT])
 enum section { BAR_SECTION, FONT_SECTION, WORKSPACE_SECTION, CLOCK_SECTION, NETWORK_SECTION, THEME_SECTION };
 static const char *const sections[] = {"bar", "font", "workspaces", "clock", "network", "theme"};
 
-enum value_type { PIXELS, COLOR, OPACITY, SCALE, POSITION, BOOLEAN, STRING, LABELS, QUOTED_STRING, THEME_SOURCE };
+enum value_type { PIXELS, COLOR, OPACITY, SCALE, POSITION, BOOLEAN, STRING, LABELS, QUOTED_STRING, THEME_SOURCE, ACTIVE_STYLE };
 
 struct config_key {
     enum section section;
@@ -414,7 +414,7 @@ static const struct config_key keys[] = {
     KEY(FONT_SECTION, "size", PIXELS, font_size, 1, 256),
     KEY(WORKSPACE_SECTION, "labels", LABELS, labels, 0, 0),
     KEY(WORKSPACE_SECTION, "hide_empty", BOOLEAN, hide_empty, 0, 0),
-    KEY(WORKSPACE_SECTION, "underline_active", BOOLEAN, underline_active, 0, 0),
+    KEY(WORKSPACE_SECTION, "active_style", ACTIVE_STYLE, active_style, 0, 0),
     KEY(WORKSPACE_SECTION, "active_color", COLOR, active_color, 0, 0),
     KEY(WORKSPACE_SECTION, "occupied_color", COLOR, occupied_color, 0, 0),
     KEY(WORKSPACE_SECTION, "inactive_color", COLOR, inactive_color, 0, 0),
@@ -479,6 +479,16 @@ static const char *parse_value(struct bar_config *config, const struct config_ke
         if (strcmp(value, "manual") && strcmp(value, "wallpaper"))
             return "expected manual or wallpaper";
         *(bool *)field = !strcmp(value, "wallpaper");
+        break;
+    case ACTIVE_STYLE:
+        if (!strcmp(value, "box"))
+            *(enum bar_active_style *)field = BAR_ACTIVE_BOX;
+        else if (!strcmp(value, "underline"))
+            *(enum bar_active_style *)field = BAR_ACTIVE_UNDERLINE;
+        else if (!strcmp(value, "none"))
+            *(enum bar_active_style *)field = BAR_ACTIVE_NONE;
+        else
+            return "expected box, underline or none";
         break;
     case QUOTED_STRING:
         if (*value == '"') {
@@ -1468,8 +1478,12 @@ static struct workspace_view layout_workspaces(const struct bar *bar,
         if (x + width > limit)
             break;
         view.visible |= bit;
-        if (config->underline_active && config->height >= 3 && (state.active & bit))
-            view.underlined |= bit;
+        if (state.active & bit) {
+            if (config->active_style == BAR_ACTIVE_BOX)
+                view.boxed |= bit;
+            else if (config->active_style == BAR_ACTIVE_UNDERLINE && config->height >= 3)
+                view.underlined |= bit;
+        }
         if (state.urgent & bit)
             view.colors[i] = config->urgent_color;
         else if (state.active & bit)
@@ -1490,7 +1504,7 @@ static void update_layout(struct bar *bar)
     bar->layout_dirty = false;
     struct workspace_view view = layout_workspaces(bar, &bar->appearance);
     if (view.visible != bar->workspaces.visible ||
-        view.underlined != bar->workspaces.underlined ||
+        view.underlined != bar->workspaces.underlined || view.boxed != bar->workspaces.boxed ||
         memcmp(view.colors, bar->workspaces.colors, sizeof view.colors))
         bar->redraw = true;
     bar->workspaces = view;
@@ -1511,7 +1525,21 @@ static void paint(const struct bar *bar, const struct appearance *appearance,
             continue;
         struct text_bounds bounds = appearance->labels[i];
         hits->tags[i] = (struct hit_span){x, x + bounds.width};
-        draw_text(appearance->font, config->labels[i], view->colors[i], pixels,
+        uint32_t text_color = view->colors[i];
+        if (view->boxed & (UINT32_C(1) << i)) {
+            /* Half the spacing on each side, so neighboring boxes just meet. */
+            int margin = config->spacing / 2;
+            int left = x - margin, right = x + bounds.width + margin;
+            if (left < 0)
+                left = 0;
+            if (right > width)
+                right = width;
+            for (int row = 0; row < height; ++row)
+                for (int col = left; col < right; ++col)
+                    pixels[(size_t)row * width + col] = 0xff000000u | view->colors[i];
+            text_color = config->background;
+        }
+        draw_text(appearance->font, config->labels[i], text_color, pixels,
                   width, height, x - bounds.left, config->padding);
         if (view->underlined & (UINT32_C(1) << i)) {
             uint32_t *row = pixels + (size_t)(height - 2) * width;

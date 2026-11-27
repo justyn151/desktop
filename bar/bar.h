@@ -15,9 +15,17 @@ enum {
     BAR_NETWORK_COMMAND_SIZE = 1024,
 };
 
+/* How the active workspace stands out besides its color. */
+enum bar_active_style {
+    BAR_ACTIVE_BOX,       /* Opaque box in the workspace color, label in the background color. */
+    BAR_ACTIVE_UNDERLINE, /* Two-pixel line under the label. */
+    BAR_ACTIVE_NONE,
+};
+
 struct bar_config {
     int height, padding, font_size, spacing;
-    bool bottom, hide_empty, underline_active, wallpaper_theme;
+    bool bottom, hide_empty, wallpaper_theme;
+    enum bar_active_style active_style;
     uint32_t background, foreground;
     uint32_t active_color, occupied_color, inactive_color, urgent_color;
     double opacity, scale;
