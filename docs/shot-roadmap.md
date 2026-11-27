@@ -213,7 +213,7 @@ Manual checks: each binding saves into `~/Pictures/Screenshots` with the configu
 | Version | Theme | Status |
 |---|---|---|
 | 0.1 | Full-monitor capture to PNG, desk atomic write and shm | Done (multi-monitor and rotation untested) |
-| 0.2 | Region: freeze, layer-shell overlay, crop. Config file (pulled forward from 0.5) | Code done, drag checklist pending |
+| 0.2 | Region: freeze, layer-shell overlay, crop. Config file (pulled forward from 0.5) | Done (cancel, edge and scale checks pending) |
 | 0.3 | Clipboard through `ext-data-control-v1`, background server | Planned |
 | 0.4 | Focused window: dwl IPC identifier, toplevel capture source | Planned (needs a dwl change) |
 | 0.5 | Print bindings in dwl, install the sample config | Planned (config itself landed in 0.2) |

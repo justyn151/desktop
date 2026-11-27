@@ -73,7 +73,7 @@ shot reads `~/.config/shot/shot.conf` (or `$XDG_CONFIG_HOME/shot/shot.conf`). Wh
 - [x] Captures without `FILE` go to the configured directory, which is created when missing
 - [x] `shot -r -o X` is a usage error
 - [x] `shot -r` maps a dimmed frozen frame over the whole output, bar included
-- [ ] `shot -r`: dragging shows the selection undimmed with an accent outline, and release saves exactly that area
+- [x] `shot -r`: dragging shows the selection undimmed with an accent outline, and release saves exactly that area
 - [ ] `shot -r`: Escape, right-click and a plain click each cancel with status 1 and save nothing
 - [ ] `shot -r`: dragging past the output's edge stops at the edge
 - [ ] `shot -r` with a menu open: the menu is in the result
