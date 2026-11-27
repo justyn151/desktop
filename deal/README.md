@@ -160,14 +160,14 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 
 ### 0.13.0 Tabs
 
-- [ ] Build and check `./deal --version` reports 0.13.0.
-- [ ] `cd /tmp`, press Ctrl+Shift+T and run `pwd` in the new tab. Switch with Ctrl+Tab, Ctrl+Shift+Tab and Alt+1/Alt+2, and check each tab keeps its own screen, scrollback and title.
-- [ ] Run `for i in $(seq 30); do echo $i; sleep 0.2; done` in one tab and switch away. Come back and check every line arrived.
-- [ ] Resize the window and zoom with two tabs open, then run `stty size` in both. Reload the configuration and check both tabs change.
-- [ ] Open Neovim in one tab and a shell in another. Switch back and forth and check Neovim redraws correctly and receives focus events.
-- [ ] Type `exit` in a background-free tab and check the tab closes and the next one is shown. Close tabs with Ctrl+Shift+W until the window closes.
-- [ ] With one tab, check Ctrl+Tab reaches the application (for example in `cat -v`).
-- [ ] Copy in one tab and paste in another. Run `deal -e sh -c 'exit 3'; echo $?` from another terminal and check it prints 3.
+- [x] Build and check `./deal --version` reports 0.13.0.
+- [x] `cd /tmp`, press Ctrl+Shift+T and run `pwd` in the new tab. Switch with Ctrl+Tab, Ctrl+Shift+Tab and Alt+1/Alt+2, and check each tab keeps its own screen, scrollback and title.
+- [x] Run `for i in $(seq 30); do echo $i; sleep 0.2; done` in one tab and switch away. Come back and check every line arrived.
+- [x] Resize the window and zoom with two tabs open, then run `stty size` in both. Reload the configuration and check both tabs change.
+- [x] Open Neovim in one tab and a shell in another. Switch back and forth and check Neovim redraws correctly and receives focus events.
+- [x] Type `exit` in a background-free tab and check the tab closes and the next one is shown. Close tabs with Ctrl+Shift+W until the window closes.
+- [x] With one tab, check Ctrl+Tab reaches the application (for example in `cat -v`).
+- [x] Copy in one tab and paste in another. Run `deal -e sh -c 'exit 3'; echo $?` from another terminal and check it prints 3.
 
 ### 0.12.0 Wallpaper theme
 
