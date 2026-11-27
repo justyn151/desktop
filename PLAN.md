@@ -158,6 +158,7 @@ Rough order, based on what gets touched most often day to day:
 5. `power`
 6. `mount`
 7. `view` (pulled forward and started early; the detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md))
+   - `mark` comes right after `view` is finished, ahead of the rest of this list
 8. `files`
 9. `ctl`
 10. Then everything else from the project list below
@@ -166,7 +167,7 @@ Rough order, based on what gets touched most often day to day:
 
 ## Phase 6: Gaps (last)
 
-These are the pieces a laptop daily driver needs that aren't one of the 25 projects. They come after the core apps exist.
+These are the pieces a laptop daily driver needs that aren't one of the 26 projects. They come after the core apps exist.
 
 | Gap | Current state | Route |
 |---|---|---|
@@ -181,7 +182,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 25 proje
 
 ---
 
-## The 25 projects
+## The 26 projects
 
 ### Existing (7)
 
@@ -195,7 +196,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 25 proje
 | 6 | `deal` | Terminal emulator, migrating from X11 to native Wayland | 0.10.3, Phase 1 |
 | 7 | `lead` | Modal terminal text editor (installed as `editor`) | Early (Phase 0.3) |
 
-### Planned (18)
+### Planned (19)
 
 | # | Project | What it does |
 |---|---|---|
@@ -217,3 +218,4 @@ These are the pieces a laptop daily driver needs that aren't one of the 25 proje
 | 23 | `login` | Login screen, as a greetd greeter |
 | 24 | `pkg` | Build and install tool for the desktop repo |
 | 25 | toolkit | Shared GUI widgets, extracted from `desk` once `files` shows what is really common |
+| 26 | `mark` | Markdown viewer for the terminal: renders headings, emphasis, lists, tables, code blocks and links with deal's text attributes, in a pager |
