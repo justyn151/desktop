@@ -1,8 +1,8 @@
-# deal 0.10.5
+# deal 0.11.0
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.10.5 adds bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.11.0 adds Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 
@@ -15,7 +15,7 @@ Version 0.10.5 adds bold, italic and bold italic font faces, underline styles an
 | Optional custom terminfo compiler | `ncurses` for `tic` |
 | Optional HTTP/HTTPS opener | `xdg-utils` for `xdg-open` |
 
-Linux's libc and libutil provide PTY support. Make generates bindings for xdg-shell and `primary-selection-unstable-v1` in `.build/`. Use `make clean` to remove the executable and generated bindings.
+Linux's libc and libutil provide PTY support. Make generates bindings for xdg-shell, `primary-selection-unstable-v1` and `xdg-activation-v1` in `.build/`. Use `make clean` to remove the executable and generated bindings.
 
 From the repository root:
 
@@ -79,6 +79,12 @@ Key repeat follows the compositor's rate and delay for XKB-repeatable keys. Relo
 
 With `mouse.reporting` enabled, applications can request button, motion and wheel reports in legacy or SGR format. Hold `mouse.selection_override` (Shift by default) for local selection, primary paste or scrollback. Set selection colors under `[selection]`. Set `click_interval` from 100 to 1000 milliseconds to change the double- and triple-click interval. Set `primary = false` to disable primary selection.
 
+## Compose and the bell
+
+deal reads the Compose table for the locale in `LC_ALL`, `LC_CTYPE` or `LANG`, so dead keys and the Compose key (for example `setxkbmap -option compose:ralt` or `xkb_options compose:ralt` in dwl) work as in other applications. `~/.XCompose` is honored. A cancelled sequence types nothing, and composed characters don't repeat. `--diagnostics` shows the Compose locale in use.
+
+When a program rings the bell (BEL) while the window is unfocused, `[bell] urgency = true` (the default) asks the compositor for attention through `xdg-activation-v1`. dwl marks the window urgent and highlights its tag without moving focus. Focusing the window clears it. deal sends at most one request a second. `visual = true` flashes the window as before.
+
 ## Text attributes
 
 deal asks Fontconfig for bold, italic and bold italic faces of the configured family. When the family has no matching face, FreeType synthesizes the style from the regular face. `--diagnostics` lists the face chosen for each style. Fallback fonts for missing glyphs are also synthesized. Box-drawing, block and Powerline glyphs ignore italic so lines still meet.
@@ -109,15 +115,25 @@ The PTY, UTF-8 and wide cells, ANSI and DEC parsing, 256-color and RGB rendering
 
 The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custom terminfo defined in the [Makefile](Makefile). `make install` compiles the entry when `tic` is available. deal falls back to `xterm-color` if the custom entry is unavailable. Remote hosts also need the custom entry. Use `TERM=xterm-color ssh host` for a one-off connection.
 
-- Keyboard support covers XKB text, terminal keys and key repeat. Compose/dead-key composition, IME integration and multiple seats are deferred.
+- Keyboard support covers XKB text, Compose and dead keys, terminal keys and key repeat. IME integration and multiple seats are deferred until after 1.0.
 - Clipboard transfers support plain text, with a 32 MiB limit and a ten-second inactivity timeout. Clipboard persistence after the source exits depends on the compositor or a clipboard manager. File drag and drop and rich clipboard formats are outside this milestone.
 - Local scrollback is vertical. Applications requesting mouse reports can receive wheel reports on both axes. Selection highlighting can clear during reflow. An already copied selection retains its text.
-- Visual bell is available. Audible and urgency bells are deferred. Decoration policy is left to the compositor. The corresponding legacy settings remain accepted.
+- Visual and urgency bells are available. The audible bell is deferred. Decoration policy is left to the compositor. The corresponding legacy settings remain accepted.
 - Bold and italic come from the primary family or synthesis. Fallback fonts are not matched by style.
 - Rendering uses scale-1 buffers. HiDPI and fractional output scaling may appear soft. Font coverage depends on the installed fonts. Complex text shaping and terminal graphics protocols are outside this milestone.
 - A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
 
 ## Manual verification on dwl
+
+### 0.11.0 Compose and urgency
+
+- [ ] Build and check `./deal --version` reports 0.11.0. Diagnostics show a Compose locale and `Urgency (xdg-activation): enabled`.
+- [ ] With a Compose key, type Compose `'` `e`, Compose `o` `c`, and Compose `-` `-` `.`, then check `é`, `©` and `–`. Type a sequence that doesn't exist and check nothing is inserted.
+- [ ] With a dead-key layout such as `us(intl)`, check `'` `e` gives `é`, `'` Space gives `'`, and `"` `u` gives `ü`.
+- [ ] Hold the final key of a sequence and check it doesn't repeat. Start a sequence, change focus, come back and type a letter: the letter appears without composition.
+- [ ] Run `sleep 3; printf '\a'`, then focus another window. Check the deal window becomes urgent in dwl and the bar, and focusing it clears the urgency. A bell in the focused window does nothing.
+- [ ] Run `for i in $(seq 50); do printf '\a'; sleep 0.05; done` in an unfocused window and check dwl stays responsive. Set `urgency = false`, reload, and check the bell no longer marks the window.
+- [ ] Repeat the 0.10.5 and 0.10.3 keyboard checks for regressions.
 
 ### 0.10.5 text attributes
 

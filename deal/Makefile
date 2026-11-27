@@ -11,6 +11,8 @@ XDG_HEADER := $(GENERATED)/xdg-shell-client-protocol.h
 XDG_CODE := $(GENERATED)/xdg-shell-protocol.c
 PRIMARY_HEADER := $(GENERATED)/primary-selection-unstable-v1-client-protocol.h
 PRIMARY_CODE := $(GENERATED)/primary-selection-unstable-v1-protocol.c
+ACTIVATION_HEADER := $(GENERATED)/xdg-activation-v1-client-protocol.h
+ACTIVATION_CODE := $(GENERATED)/xdg-activation-v1-protocol.c
 
 # Clean and uninstall also work on systems without Wayland development files.
 ifneq ($(filter-out clean uninstall,$(or $(MAKECMDGOALS),all)),)
@@ -21,6 +23,8 @@ endif
 PRIMARY_XML ?= $(PROTOCOL_DIR)/unstable/primary-selection/primary-selection-unstable-v1.xml
 XDG_INPUT := $(wildcard $(XDG_SHELL_XML))
 PRIMARY_INPUT := $(wildcard $(PRIMARY_XML))
+ACTIVATION_XML ?= $(PROTOCOL_DIR)/staging/xdg-activation/xdg-activation-v1.xml
+ACTIVATION_INPUT := $(wildcard $(ACTIVATION_XML))
 endif
 
 export DEAL_INSTALL_PREFIX := $(or $(value PREFIX),$(if $(value HOME),$(value HOME)/.local))
@@ -30,13 +34,14 @@ export DEAL_INSTALL_DESTDIR := $(value DESTDIR)
 
 all: deal
 
-deal: terminal.c terminal.h $(XDG_HEADER) $(XDG_CODE) $(PRIMARY_HEADER) $(PRIMARY_CODE) Makefile | check-build
+deal: terminal.c terminal.h $(XDG_HEADER) $(XDG_CODE) $(PRIMARY_HEADER) $(PRIMARY_CODE) \
+      $(ACTIVATION_HEADER) $(ACTIVATION_CODE) Makefile | check-build
 	set -eu
 	native_cflags=$$($(PKG_CONFIG) --cflags $(PACKAGES))
 	native_libs=$$($(PKG_CONFIG) --libs $(PACKAGES))
 	$(CC) $(CPPFLAGS) -std=c11 -Wall -Wextra -Wpedantic $(CFLAGS) \
 	    $$native_cflags -I"$(GENERATED)" $(LDFLAGS) -o $@ terminal.c "$(XDG_CODE)" \
-	    "$(PRIMARY_CODE)" -lutil $$native_libs $(LDLIBS)
+	    "$(PRIMARY_CODE)" "$(ACTIVATION_CODE)" -lutil $$native_libs $(LDLIBS)
 
 check-build:
 	set -eu
@@ -58,6 +63,10 @@ check-build:
 	    printf 'deal: cannot read primary-selection protocol XML at %s\n' "$(PRIMARY_XML)" >&2
 	    exit 1
 	fi
+	if [ ! -r "$(ACTIVATION_XML)" ]; then
+	    printf 'deal: cannot read xdg-activation protocol XML at %s\n' "$(ACTIVATION_XML)" >&2
+	    exit 1
+	fi
 
 $(GENERATED):
 	mkdir -p -- "$@"
@@ -74,8 +83,15 @@ $(PRIMARY_HEADER): $(PRIMARY_INPUT) | check-build $(GENERATED)
 $(PRIMARY_CODE): $(PRIMARY_INPUT) | check-build $(GENERATED)
 	$(WAYLAND_SCANNER) private-code "$(PRIMARY_XML)" "$@"
 
+$(ACTIVATION_HEADER): $(ACTIVATION_INPUT) | check-build $(GENERATED)
+	$(WAYLAND_SCANNER) client-header "$(ACTIVATION_XML)" "$@"
+
+$(ACTIVATION_CODE): $(ACTIVATION_INPUT) | check-build $(GENERATED)
+	$(WAYLAND_SCANNER) private-code "$(ACTIVATION_XML)" "$@"
+
 clean:
-	rm -f -- deal "$(XDG_HEADER)" "$(XDG_CODE)" "$(PRIMARY_HEADER)" "$(PRIMARY_CODE)"
+	rm -f -- deal "$(XDG_HEADER)" "$(XDG_CODE)" "$(PRIMARY_HEADER)" "$(PRIMARY_CODE)" \
+	    "$(ACTIVATION_HEADER)" "$(ACTIVATION_CODE)"
 	rmdir -- "$(GENERATED)" 2>/dev/null || true
 
 install: deal deal.conf

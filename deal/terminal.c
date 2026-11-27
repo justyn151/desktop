@@ -8,8 +8,10 @@
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include "primary-selection-unstable-v1-client-protocol.h"
+#include "xdg-activation-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
@@ -59,7 +61,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.10.5";
+static const char deal_version[] = "0.11.0";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -262,7 +264,7 @@ static Config config_defaults(void)
                     .columns = INITIAL_COLUMNS, .rows = INITIAL_ROWS, .decorations = true, .opacity = 1.0f,
                     .blink_interval = DEFAULT_BLINK_INTERVAL, .cursor_thickness = DEFAULT_CURSOR_THICKNESS,
                     .history_capacity = 10000, .scroll_on_input = true, .scroll_lines = 3,
-                    .click_interval = 350, .primary_selection = true, .bold_bright = true,
+                    .click_interval = 350, .primary_selection = true, .bold_bright = true, .bell_urgency = true,
                     .foreground = blank_cell.foreground,
                     .background = blank_cell.background, .cursor = blank_cell.foreground,
                     .cursor_style = CURSOR_UNDERLINE, .selection_foreground = {16, 22, 30},
@@ -1755,7 +1757,14 @@ typedef struct {
     struct wl_pointer *pointer;
     struct xkb_context *xkb;
     struct xkb_state *keys;
-    uint32_t seat_name, clipboard_name, primary_name;
+    struct xkb_compose_table *compose_table;
+    struct xkb_compose_state *compose;
+    const char *compose_locale;
+    const char *composed; /* UTF-8 result of a finished compose sequence during key_pressed. */
+    xkb_keysym_t composed_key;
+    struct xdg_activation_v1 *activation;
+    struct xdg_activation_token_v1 *activation_token;
+    uint32_t seat_name, clipboard_name, primary_name, activation_name;
     KeyRepeat repeat;
     PointerAxis scroll[2];
     double pointer_x, pointer_y;
@@ -1869,6 +1878,7 @@ static void platform_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
     xkb_state_unref(platform->keys);
     platform->keys = keys;
     platform->repeat.key = 0;
+    if (platform->compose != NULL) xkb_compose_state_reset(platform->compose);
     platform->scroll[0].remainder = platform->scroll[1].remainder = 0;
     if (keys == NULL) fprintf(stderr, "deal: Wayland did not provide a usable keyboard keymap\n");
 }
@@ -1894,6 +1904,7 @@ static void platform_keyboard_leave(void *data, struct wl_keyboard *keyboard, ui
         platform->focused = false;
         platform->repeat.key = 0;
         platform->scroll[0].remainder = platform->scroll[1].remainder = 0;
+        if (platform->compose != NULL) xkb_compose_state_reset(platform->compose);
         if (platform->keys != NULL) xkb_state_update_mask(platform->keys, 0, 0, 0, 0, 0, 0);
     }
 }
@@ -1910,8 +1921,40 @@ static void platform_keyboard_key(void *data, struct wl_keyboard *keyboard, uint
         platform->repeat.key = 0;
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED || platform->keys == NULL ||
         !platform->focused || platform->key_pressed == NULL) return;
+    char composed[64];
+    bool finished = false;
+    if (platform->compose != NULL &&
+        xkb_compose_state_feed(platform->compose, xkb_state_key_get_one_sym(platform->keys, code)) ==
+            XKB_COMPOSE_FEED_ACCEPTED) {
+        switch (xkb_compose_state_get_status(platform->compose)) {
+        case XKB_COMPOSE_COMPOSING:
+            /* Dead keys and compose prefixes produce no input of their own. */
+            platform->repeat.key = 0;
+            return;
+        case XKB_COMPOSE_CANCELLED:
+            xkb_compose_state_reset(platform->compose);
+            platform->repeat.key = 0;
+            return;
+        case XKB_COMPOSE_COMPOSED: {
+            int length = xkb_compose_state_get_utf8(platform->compose, composed, sizeof composed);
+            platform->composed_key = xkb_compose_state_get_one_sym(platform->compose);
+            xkb_compose_state_reset(platform->compose);
+            if (length <= 0 || (size_t)length >= sizeof composed) {
+                if (platform->composed_key == XKB_KEY_NoSymbol) return;
+                composed[0] = 0;
+            }
+            platform->composed = composed;
+            finished = true;
+            break;
+        }
+        case XKB_COMPOSE_NOTHING:
+            break;
+        }
+    }
     bool shortcut = platform->key_pressed(platform->input_data, code, KEY_PRESS, serial);
-    if (xkb_keymap_key_repeats(xkb_state_get_keymap(platform->keys), code)) {
+    platform->composed = NULL;
+    /* A composed character comes from several keys, so it never repeats. */
+    if (!finished && xkb_keymap_key_repeats(xkb_state_get_keymap(platform->keys), code)) {
         platform->repeat.key = code;
         platform->repeat.shortcut = shortcut;
         platform_repeat_arm(&platform->repeat, monotonic_milliseconds());
@@ -2206,7 +2249,18 @@ static void platform_global(void *data, struct wl_registry *registry, uint32_t n
         platform->primary_manager = wl_registry_bind(registry, name,
                                                      &zwp_primary_selection_device_manager_v1_interface, 1);
         platform->primary_name = name;
+    } else if (strcmp(interface, xdg_activation_v1_interface.name) == 0 && platform->activation == NULL) {
+        platform->activation = wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1);
+        platform->activation_name = name;
     }
+}
+
+static void platform_drop_activation(Platform *platform)
+{
+    if (platform->activation_token != NULL) xdg_activation_token_v1_destroy(platform->activation_token);
+    if (platform->activation != NULL) xdg_activation_v1_destroy(platform->activation);
+    platform->activation_token = NULL;
+    platform->activation = NULL;
 }
 
 static void platform_global_remove(void *data, struct wl_registry *registry, uint32_t name)
@@ -2221,6 +2275,57 @@ static void platform_global_remove(void *data, struct wl_registry *registry, uin
     if (platform->primary_manager != NULL && platform->primary_name == name) {
         zwp_primary_selection_device_manager_v1_destroy(platform->primary_manager);
         platform->primary_manager = NULL;
+    }
+    if (platform->activation != NULL && platform->activation_name == name) platform_drop_activation(platform);
+}
+
+static void platform_activation_done(void *data, struct xdg_activation_token_v1 *token, const char *name)
+{
+    Platform *platform = data;
+    if (token == platform->activation_token) {
+        if (platform->activation != NULL && platform->surface != NULL) {
+            xdg_activation_v1_activate(platform->activation, name, platform->surface);
+        }
+        platform->activation_token = NULL;
+    }
+    xdg_activation_token_v1_destroy(token);
+}
+
+static const struct xdg_activation_token_v1_listener activation_token_listener = {
+    .done = platform_activation_done
+};
+
+/* Ask for attention without an input serial. dwl marks an unfocused window
+   urgent instead of focusing it, and ignores the request when focused. */
+static void platform_request_attention(Platform *platform)
+{
+    if (platform->activation == NULL || platform->activation_token != NULL || platform->surface == NULL) return;
+    struct xdg_activation_token_v1 *token = xdg_activation_v1_get_activation_token(platform->activation);
+    if (token == NULL) return;
+    xdg_activation_token_v1_add_listener(token, &activation_token_listener, platform);
+    xdg_activation_token_v1_set_surface(token, platform->surface);
+    xdg_activation_token_v1_commit(token);
+    platform->activation_token = token;
+}
+
+/* deal runs with a C.UTF-8 character type, so the Compose table follows the
+   user's environment instead, the same order setlocale would use. */
+static void platform_open_compose(Platform *platform)
+{
+    const char *candidates[] = {getenv("LC_ALL"), getenv("LC_CTYPE"), getenv("LANG"), "en_US.UTF-8"};
+    for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; ++i) {
+        const char *locale = candidates[i];
+        if (locale == NULL || *locale == 0) continue;
+        platform->compose_table = xkb_compose_table_new_from_locale(platform->xkb, locale,
+                                                                    XKB_COMPOSE_COMPILE_NO_FLAGS);
+        if (platform->compose_table == NULL) continue;
+        platform->compose = xkb_compose_state_new(platform->compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
+        if (platform->compose != NULL) {
+            platform->compose_locale = locale;
+            return;
+        }
+        xkb_compose_table_unref(platform->compose_table);
+        platform->compose_table = NULL;
     }
 }
 
@@ -2272,6 +2377,7 @@ static const char *platform_open(Platform *platform, const Config *config, const
     if (platform->display == NULL) return "could not connect to the Wayland display";
     platform->xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (platform->xkb == NULL) return "could not create the XKB context";
+    platform_open_compose(platform);
     platform->registry = wl_display_get_registry(platform->display);
     if (platform->registry == NULL ||
         wl_registry_add_listener(platform->registry, &registry_listener, platform) < 0 ||
@@ -2382,6 +2488,9 @@ static void platform_close(Platform *platform)
     if (platform->clipboard_manager != NULL) wl_data_device_manager_destroy(platform->clipboard_manager);
     if (platform->primary_manager != NULL)
         zwp_primary_selection_device_manager_v1_destroy(platform->primary_manager);
+    platform_drop_activation(platform);
+    xkb_compose_state_unref(platform->compose);
+    xkb_compose_table_unref(platform->compose_table);
     xkb_context_unref(platform->xkb);
     if (platform->toplevel != NULL) xdg_toplevel_destroy(platform->toplevel);
     if (platform->xdg_surface != NULL) xdg_surface_destroy(platform->xdg_surface);
@@ -5217,7 +5326,8 @@ static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint3
     struct xkb_state *keys = input->platform->keys;
     Terminal *terminal = input->terminal;
     const Config *config = input->config;
-    xkb_keysym_t key = xkb_state_key_get_one_sym(keys, code);
+    const char *composed = input->platform->composed;
+    xkb_keysym_t key = composed != NULL ? input->platform->composed_key : xkb_state_key_get_one_sym(keys, code);
     unsigned int modifiers = keyboard_modifiers(keys);
     const xkb_keysym_t *symbols;
     xkb_keysym_t normalized = shortcut_key(key), unshifted = normalized;
@@ -5267,7 +5377,14 @@ static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint3
     if (event == KEY_REPEAT_SHORTCUT) return true;
 
     char text[sizeof ((KeyInput){0}).bytes];
-    int count = xkb_state_key_get_utf8(keys, code, text, sizeof text);
+    int count = 0;
+    if (composed != NULL) {
+        size_t length = strlen(composed);
+        if (length < sizeof text) {
+            memcpy(text, composed, length + 1);
+            count = (int)length;
+        }
+    } else count = xkb_state_key_get_utf8(keys, code, text, sizeof text);
     if (count < 0 || (size_t)count >= sizeof text) count = 0;
     KeyInput encoded = keyboard_encode(key, modifiers, terminal->application_arrows,
                                        terminal->application_keypad, text, count);
@@ -5576,11 +5693,18 @@ static int mouse_tick(Interaction *input, int64_t now)
 }
 
 typedef struct {
-    int64_t next, flash_end;
+    int64_t next, flash_end, urgent_next;
 } Bell;
 
-static int bell_tick(Bell *bell, Terminal *terminal, const Config *config, int64_t now, bool *redraw)
+static int bell_tick(Bell *bell, Terminal *terminal, const Config *config, Platform *platform,
+                     int64_t now, bool *redraw)
 {
+    /* Limit requests so a flood of BEL characters makes one request a second. */
+    if (terminal->bell_pending && config->bell_urgency && !platform->focused && now >= 0 &&
+        now >= bell->urgent_next) {
+        bell->urgent_next = now + 1000;
+        platform_request_attention(platform);
+    }
     if (bell->flash_end && (now < 0 || now >= bell->flash_end || !config->visual_bell)) {
         bell->flash_end = 0;
         *redraw = true;
@@ -5859,7 +5983,7 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
         }
         int64_t now = monotonic_milliseconds();
         int timeout = clipboard_timeout(clipboard, terminal, now);
-        timeout = earlier_timeout(timeout, bell_tick(&bell, terminal, config, now, &redraw));
+        timeout = earlier_timeout(timeout, bell_tick(&bell, terminal, config, platform, now, &redraw));
         timeout = earlier_timeout(timeout, mouse_tick(&input, now));
         if (*save_zoom) {
             if (now < 0 || now >= zoom_deadline) {
@@ -6046,6 +6170,9 @@ static void print_diagnostics(const Config *config, FontRenderer *renderer,
     printf("Wayland: %s\nxdg-shell: %s\nApplication ID: %s\n",
            platform->display != NULL ? "connected" : "unavailable",
            platform->configured ? "configured" : "unavailable", platform_app_id(config));
+    printf("Compose: %s\nUrgency (xdg-activation): %s\n",
+           platform->compose_locale != NULL ? platform->compose_locale : "unavailable",
+           platform->activation == NULL ? "unavailable" : config->bell_urgency ? "enabled" : "disabled");
     printf("Clipboard protocol: %s\nPrimary selection: %s\n",
            platform->clipboard_manager != NULL ? "available" : "unavailable",
            platform->primary_manager == NULL ? "unavailable" : config->primary_selection ? "enabled" : "disabled");
@@ -6085,7 +6212,7 @@ static void print_diagnostics(const Config *config, FontRenderer *renderer,
     puts("Features: desktop OpenGL, UTF-8, ANSI 256/RGB, alternate screen, scrollback reflow, "
          "Wayland keyboard repeat, keyboard and wheel zoom, selection, clipboard, mouse reports, "
          "focus reporting, OSC titles and links, bold and italic faces, underline styles and colors, "
-         "strikethrough, overline, visual bell, INI reload");
+         "strikethrough, overline, compose and dead keys, visual and urgency bells, INI reload");
 }
 
 int main(int argc, char **argv)

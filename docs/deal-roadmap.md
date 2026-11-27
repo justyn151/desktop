@@ -100,11 +100,11 @@ Manual checks: `printf '\e[3mitalic\e[0m \e[1mbold\e[0m \e[9mstrike\e[0m \e[4:3;
 
 ---
 
-## 0.11.0: Wayland feature parity
+## 0.11.0: Compose and urgency bell
 
 ### Compose and dead keys
 
-- `xkb_compose_table_new_from_locale(ctx, setlocale(LC_CTYPE, NULL), 0)` and `xkb_compose_state_new`. It's part of libxkbcommon, so there's no new dependency.
+- `xkb_compose_table_new_from_locale` and `xkb_compose_state_new`. It's part of libxkbcommon, so there's no new dependency. deal forces `LC_CTYPE=C.UTF-8`, so the table's locale comes from `LC_ALL`, `LC_CTYPE` or `LANG`, falling back to `en_US.UTF-8`.
 - In the key handler, feed each keysym through `xkb_compose_state_feed`. On `COMPOSING`, send nothing. On `COMPOSED`, send `xkb_compose_state_get_utf8`. On `CANCELLED`, reset and drop the key. On `NOTHING`, use the normal path.
 - Key repeat must not repeat a compose sequence's intermediate keys.
 - Reset compose state on keyboard focus loss and on keymap change.
@@ -112,7 +112,7 @@ Manual checks: `printf '\e[3mitalic\e[0m \e[1mbold\e[0m \e[9mstrike\e[0m \e[4:3;
 ### Urgency bell
 
 - Bind `xdg_activation_v1`. On BEL while unfocused and with `[bell] urgency = true`, get a token and call `xdg_activation_v1_activate`. dwl turns that into the urgent flag on the client.
-- Check what dwl actually does with an activation request from an unfocused client (urgent or focus steal) and document it. If it steals focus, add a dwl patch so activation without a recent input serial only marks the client urgent.
+- Checked: dwl's `urgent()` handler ignores the focused client and only sets `isurgent` and the urgent border on others. It never steals focus, so no dwl patch is needed.
 - Rate-limit urgency to once a second so `yes $'\a'` can't flood it.
 - Audible bell: keep it unsupported. There's no system sound path yet (`vol` doesn't exist). Leave the setting accepted, as now.
 
@@ -120,7 +120,16 @@ Manual checks: `printf '\e[3mitalic\e[0m \e[1mbold\e[0m \e[9mstrike\e[0m \e[4:3;
 
 Recommendation: **defer `zwp_text_input_v3` to after 1.0**, but write the code shape down now. dwl would need `text-input-v3` and `input-method-v2` relays, and nothing on this system uses an IME today. Compose covers accented Latin input. Revisit if CJK input is ever needed.
 
-### Also in 0.11.0 (new)
+### Manual checks
+
+- Compose key + `'` + `e` gives `é`, and a dead-key layout (us intl) types `ê`.
+- `sleep 3; printf '\a'` in an unfocused window marks it urgent in dwl and the bar.
+
+---
+
+## 0.11.1: Remote clipboard, synchronized output and working directory (new)
+
+Split out of 0.11.0.
 
 - **OSC 52 clipboard write**, so Neovim's `"+y` works over SSH. Decode base64 and publish to the clipboard (`c`) or primary (`p`). Writes are on by default. Reads (`?`) are off by default and controlled by a config key, because reading the clipboard is a data-exfiltration path.
 - **Synchronized output (DECSET 2026):** while it's set, hold frame submission until it's reset or a 150 ms timeout. Report it in DECRQM. This removes tearing in Neovim and other fast TUIs.
@@ -128,13 +137,13 @@ Recommendation: **defer `zwp_text_input_v3` to after 1.0**, but write the code s
 
 ### Manual checks
 
-- Compose key + `'` + `e` gives `é`, and a dead-key layout (us intl) types `ê`.
-- `sleep 3; printf '\a'` in an unfocused window marks it urgent in dwl and the bar.
 - In Neovim over `ssh`, `"+y` reaches the local clipboard.
+- Neovim redraws without tearing while scrolling a large file.
+- `cd /tmp`, then Ctrl+Shift+N opens a window in `/tmp`.
 
 ---
 
-## 0.11.1: Keyboard protocol (new)
+## 0.11.2: Keyboard protocol (new)
 
 Modern TUIs (Neovim, Helix, fish 4, and later `lead`) can tell Ctrl+I from Tab and Ctrl+Shift+letter from Ctrl+letter only with an extended keyboard protocol.
 
@@ -147,7 +156,7 @@ Manual check: `kitten show-key` or a small test script that sends `CSI > 1 u` an
 
 ---
 
-## 0.11.2: Scrollback navigation (new)
+## 0.11.3: Scrollback navigation (new)
 
 - **Search:** Ctrl+Shift+F opens a one-line search bar drawn over the bottom row. Search history plus the screen, case-insensitive by default, with Enter/Shift+Enter for next/previous, highlight all matches, and Escape to close. Search the logical (unwrapped) lines so matches across a soft wrap are found.
 - **Prompt marks (OSC 133):** record `A`/`B`/`C`/`D` marks per line. Ctrl+Shift+Up/Down jumps to the previous or next prompt. Add a small fish/bash snippet to the README that emits the marks.
@@ -245,9 +254,10 @@ Release work:
 | 0.10.3 | Verify clipboard, selection, mouse | Done |
 | 0.10.4 | HiDPI and fractional scaling | Planned |
 | 0.10.5 | Text attributes, bold/italic faces | Done |
-| 0.11.0 | Compose, urgency, OSC 52, sync output, OSC 7 | Planned (extended) |
-| 0.11.1 | Kitty keyboard protocol | **New** |
-| 0.11.2 | Scrollback search and prompt marks | **New** |
+| 0.11.0 | Compose and dead keys, urgency bell | Code done, checklist pending |
+| 0.11.1 | OSC 52, synchronized output, OSC 7 | **New** (split from 0.11.0) |
+| 0.11.2 | Kitty keyboard protocol | **New** |
+| 0.11.3 | Scrollback search and prompt marks | **New** |
 | (Phase 1.4) | deal becomes the default, foot removed | Planned |
 | 0.12.0 | Palette from desk, OSC color queries | After Phase 3 step 1 |
 | 0.13.0 | Renderer, damage and parser optimization | After Phase 3 |
