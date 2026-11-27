@@ -111,6 +111,7 @@ struct browser_config {
     bool recursive, cache, close_on_apply, wallpaper_theme;
     int columns, thumbnail_width, thumbnail_height, font_size;
     uint32_t background, foreground, highlight, muted;
+    double opacity; /* Of the background only, from 0 to 1. */
 };
 
 struct image {

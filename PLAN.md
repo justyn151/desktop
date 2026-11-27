@@ -105,6 +105,8 @@ Precedence order, implemented once in `desk_conf_load`:
 3. `~/.config/desktop/desktop.conf` (shared `[font]`, `[theme]`)
 4. Built-in defaults
 
+Opacity is configured per application today: `[window] opacity` in deal and `[appearance] opacity` in wall's browser. Both apply it to the background only. Move it to `[theme] opacity` in `desktop.conf` in step 3, so every app reads one value. A compositor-wide setting in dwl (`wlr_scene_buffer_set_opacity`) would be simpler, but it fades text and images too, so the shared app setting is the better fit.
+
 ### Migration order
 
 Migrate one step at a time. Behavior must stay identical, verified with each app's README checklist.

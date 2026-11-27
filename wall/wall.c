@@ -74,7 +74,7 @@ static const struct config default_config = {
 
 static const struct browser_config default_browser = {
     .recursive = true, .cache = true, .close_on_apply = true,
-    .thumbnail_width = 312, .thumbnail_height = 176, .font_size = 14,
+    .thumbnail_width = 312, .thumbnail_height = 176, .font_size = 14, .opacity = 1.0,
     .background = 0x353535, .foreground = 0xc5ad81,
     .highlight = 0xead4aa, .muted = 0x887d69,
 };
@@ -226,6 +226,14 @@ static bool browser_setting(struct browser_config *config, bool appearance,
             number = &config->font_size;
             low = 6;
             high = 48;
+        } else if (!strcmp(key, "opacity")) {
+            char *end;
+            errno = 0;
+            double opacity = strtod(value, &end);
+            if (errno || end == value || *end || !(opacity >= 0.0 && opacity <= 1.0))
+                return false;
+            config->opacity = opacity;
+            return true;
         } else if (!strcmp(key, "background")) color = &config->background;
         else if (!strcmp(key, "foreground")) color = &config->foreground;
         else if (!strcmp(key, "highlight")) color = &config->highlight;
@@ -1861,7 +1869,9 @@ static bool buffer_available(const struct output *output, unsigned limit)
     return true;
 }
 
-static struct buffer *allocate_buffer(struct wl_shm *shm, int width, int height)
+/* The renderer's wallpapers are opaque. The browser uses premultiplied ARGB
+   so its background can follow [appearance] opacity. */
+static struct buffer *allocate_buffer(struct wl_shm *shm, int width, int height, bool alpha)
 {
     int stride = width * 4;
     int size = stride * height;
@@ -1890,7 +1900,7 @@ static struct buffer *allocate_buffer(struct wl_shm *shm, int width, int height)
     struct buffer *buffer = calloc(1, sizeof *buffer);
     if (buffer) {
         buffer->proxy = wl_shm_pool_create_buffer(pool, 0, width, height, stride,
-                                                  WL_SHM_FORMAT_XRGB8888);
+                                                  alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888);
     }
     wl_shm_pool_destroy(pool);
     if (!buffer || !buffer->proxy) {
@@ -1922,7 +1932,7 @@ static struct buffer *make_buffer(struct output *output, int width, int height, 
             destroy_buffer(buffer);
         }
     }
-    buffer = allocate_buffer(output->app->shm, width, height);
+    buffer = allocate_buffer(output->app->shm, width, height, false);
     if (buffer) {
         buffer->output = output;
         wl_list_insert(&output->buffers, &buffer->link);
@@ -4906,10 +4916,13 @@ static void outline(struct canvas *canvas, int x, int y, int width, int height, 
     rectangle(canvas, x + width - 1, y, 1, height, color);
 }
 
+/* Premultiplied "over": an opaque color with coverage alpha on top of base,
+   which may be translucent. */
 static uint32_t blend(uint32_t base, uint32_t foreground, unsigned alpha)
 {
-    uint32_t result = 0xff000000;
-    for (unsigned shift = 0; shift < 24; shift += 8) {
+    foreground |= 0xff000000;
+    uint32_t result = 0;
+    for (unsigned shift = 0; shift < 32; shift += 8) {
         unsigned bg = (base >> shift) & 255;
         unsigned fg = (foreground >> shift) & 255;
         result |= ((bg * (255 - alpha) + fg * alpha + 127) / 255) << shift;
@@ -4986,8 +4999,8 @@ static void draw_thumbnail(struct canvas *canvas, const struct thumbnail *thumb,
                 continue;
             if (alpha < 255) {
                 uint32_t background = target[column];
-                uint32_t rgb = 0xff000000u;
-                for (unsigned shift = 0; shift < 24; shift += 8) {
+                uint32_t rgb = 0;
+                for (unsigned shift = 0; shift < 32; shift += 8) {
                     unsigned old = (background >> shift) & 255u;
                     unsigned channel = ((pixel >> shift) & 255u) + (old * (255 - alpha) + 127) / 255;
                     rgb |= (uint32_t)smaller((int)channel, 255) << shift;
@@ -5006,7 +5019,17 @@ static void paint_browser(struct browser *browser, struct buffer *buffer)
     const int padding = BROWSER_PADDING, line = c->font_size + 6;
     const int usable = larger(0, buffer->width - 2 * padding);
     struct canvas canvas = {.buffer = buffer, .bottom = buffer->height};
-    rectangle(&canvas, 0, 0, buffer->width, buffer->height, c->background);
+    /* Only the background is translucent, as in deal. Text, outlines and
+       thumbnails are drawn opaque on top. */
+    unsigned opacity = (unsigned)(c->opacity * 255.0 + 0.5);
+    uint32_t background = (uint32_t)opacity << 24;
+    for (unsigned shift = 0; shift < 24; shift += 8)
+        background |= ((((c->background >> shift) & 255u) * opacity + 127) / 255) << shift;
+    for (int row = 0; row < buffer->height; ++row) {
+        uint32_t *pixels = buffer->pixels + (size_t)row * buffer->width;
+        for (int column = 0; column < buffer->width; ++column)
+            pixels[column] = background;
+    }
     draw_text(&canvas, browser->face, padding, padding, usable, "Wallpaper browser", c->highlight);
 
     int search_y = padding + line;
@@ -5144,7 +5167,7 @@ static bool draw_browser(struct browser *browser)
     for (size_t i = 0; !buffer && i < 2; ++i) {
         if (browser->frames[i])
             continue;
-        buffer = allocate_buffer(browser->shm, browser->width, browser->height);
+        buffer = allocate_buffer(browser->shm, browser->width, browser->height, true);
         if (!buffer)
             return false;
         wl_buffer_add_listener(buffer->proxy, &browser_buffer_listener, buffer);
