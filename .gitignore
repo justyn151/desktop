@@ -5,6 +5,7 @@
 /wall/wall
 /net/net
 /deal/deal
+/shot/shot
 /lead/editor
 /dwl/dwl-*.tar.gz
 *.o

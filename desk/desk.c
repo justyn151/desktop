@@ -3,11 +3,14 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* Palette */
@@ -175,4 +178,113 @@ void desk_watch_close(DeskWatch *watch)
     if (watch->fd >= 0) close(watch->fd);
     free(watch->path);
     *watch = (DeskWatch){.fd = -1};
+}
+
+/* Atomic files */
+
+int desk_atomic_open(DeskAtomic *atomic, const char *path, mode_t mode)
+{
+    *atomic = (DeskAtomic){0};
+    if (path == NULL || path[0] == 0) return EINVAL;
+    const char *name = strrchr(path, '/');
+    int length;
+    if (name == NULL) {
+        length = asprintf(&atomic->temporary, ".%s-XXXXXX", path);
+    } else {
+        /* Keep the temporary file in the target's directory so rename is atomic. */
+        length = asprintf(&atomic->temporary, "%.*s/.%s-XXXXXX", (int)(name - path), path, name + 1);
+    }
+    if (length < 0) atomic->temporary = NULL; /* asprintf leaves it undefined on failure. */
+    if (length < 0 || (atomic->path = strdup(path)) == NULL) {
+        desk_atomic_abort(atomic);
+        return ENOMEM;
+    }
+    int fd = mkostemp(atomic->temporary, O_CLOEXEC);
+    if (fd < 0) {
+        int error = errno;
+        free(atomic->temporary);
+        atomic->temporary = NULL;
+        desk_atomic_abort(atomic);
+        return error;
+    }
+    mode_t mask = umask(0);
+    umask(mask);
+    if (fchmod(fd, mode & ~mask) < 0 || (atomic->file = fdopen(fd, "wb")) == NULL) {
+        int error = errno;
+        close(fd);
+        desk_atomic_abort(atomic);
+        return error;
+    }
+    return 0;
+}
+
+int desk_atomic_retarget(DeskAtomic *atomic, const char *path)
+{
+    char *copy = strdup(path);
+    if (copy == NULL) return ENOMEM;
+    free(atomic->path);
+    atomic->path = copy;
+    return 0;
+}
+
+int desk_atomic_commit(DeskAtomic *atomic, bool replace)
+{
+    if (atomic->temporary == NULL) return EINVAL;
+    int error = 0;
+    if (atomic->file != NULL) {
+        if (ferror(atomic->file) || fflush(atomic->file) == EOF || fsync(fileno(atomic->file)) < 0)
+            error = errno ? errno : EIO;
+        if (fclose(atomic->file) == EOF && error == 0) error = errno;
+        atomic->file = NULL;
+    }
+    if (error == 0) {
+        if (replace) {
+            if (rename(atomic->temporary, atomic->path) < 0) error = errno;
+        } else if (renameat2(AT_FDCWD, atomic->temporary, AT_FDCWD, atomic->path, RENAME_NOREPLACE) < 0) {
+            error = errno;
+            if (error == EINVAL || error == ENOSYS) {
+                /* The filesystem can't rename without replacing: link refuses existing names too. */
+                error = link(atomic->temporary, atomic->path) < 0 ? errno : 0;
+                if (error == 0) unlink(atomic->temporary);
+            }
+            if (error == EEXIST) return EEXIST;
+        }
+    }
+    if (error == 0) {
+        free(atomic->temporary);
+        atomic->temporary = NULL;
+    }
+    desk_atomic_abort(atomic);
+    return error;
+}
+
+void desk_atomic_abort(DeskAtomic *atomic)
+{
+    if (atomic->file != NULL) fclose(atomic->file);
+    if (atomic->temporary != NULL) unlink(atomic->temporary);
+    free(atomic->temporary);
+    free(atomic->path);
+    *atomic = (DeskAtomic){0};
+}
+
+/* Shared memory */
+
+int desk_shm_open(size_t size)
+{
+    if (size == 0 || size > (size_t)INT64_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = memfd_create("desk-shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) return -1;
+    int error;
+    do error = ftruncate(fd, (off_t)size) < 0 ? errno : 0;
+    while (error == EINTR);
+    if (error != 0) {
+        close(fd);
+        errno = error;
+        return -1;
+    }
+    fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
+    return fd;
 }

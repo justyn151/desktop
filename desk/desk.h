@@ -6,7 +6,10 @@
    runs an event loop: functions return errors and the caller decides. */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <sys/types.h>
 
 /* Palette published by wall in $XDG_CACHE_HOME/wall/colors.conf. */
 enum desk_role {
@@ -55,5 +58,34 @@ bool desk_watch_open(DeskWatch *watch, const char *path);
 bool desk_watch_changed(DeskWatch *watch, short revents);
 
 void desk_watch_close(DeskWatch *watch);
+
+/* Atomic file replacement: write to a temporary file in the target's
+   directory, then rename it over the target, so readers never see a partial
+   file. */
+typedef struct {
+    FILE *file; /* Write here between open and commit. */
+    char *path;
+    char *temporary;
+} DeskAtomic;
+
+/* Create the temporary file with permissions mode & ~umask. Return 0 or an
+   errno value. */
+int desk_atomic_open(DeskAtomic *atomic, const char *path, mode_t mode);
+
+/* Flush, sync and rename onto the target. With replace false an existing
+   target is left alone and EEXIST is returned, and the temporary file is
+   kept so the caller can retry with desk_atomic_retarget. On any other
+   error the temporary file is removed. Return 0 or an errno value. */
+int desk_atomic_commit(DeskAtomic *atomic, bool replace);
+
+/* Change the target path before committing. Return 0 or ENOMEM. */
+int desk_atomic_retarget(DeskAtomic *atomic, const char *path);
+
+/* Remove the temporary file and release everything. Safe after commit. */
+void desk_atomic_abort(DeskAtomic *atomic);
+
+/* Anonymous shared memory of the given size, for wl_shm pools. Return a
+   file descriptor, or -1 with errno set. */
+int desk_shm_open(size_t size);
 
 #endif

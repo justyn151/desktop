@@ -4,7 +4,7 @@ Implementation plan for shot, the screenshot tool, from 0.1 to 1.0. It expands [
 
 ## Starting point
 
-shot doesn't exist yet. It is one `shot.c` and one `shot.h`, built on `desk/` from its first commit, so it's also a test of whether the desk API is pleasant to use.
+shot is one `shot.c` and one `shot.h`, built on `desk/` from its first commit, so it's also a test of whether the desk API is pleasant to use.
 
 Checked in `dwl/dwl.c`, the compositor already provides everything shot needs except one IPC event:
 
@@ -209,7 +209,7 @@ Manual checks: each binding saves into `~/Pictures/Screenshots` with the configu
 
 | Version | Theme | Status |
 |---|---|---|
-| 0.1 | Full-monitor capture to PNG, desk atomic write and shm | Planned |
+| 0.1 | Full-monitor capture to PNG, desk atomic write and shm | Done (multi-monitor and rotation untested) |
 | 0.2 | Region: freeze, layer-shell overlay, crop | Planned |
 | 0.3 | Clipboard through `ext-data-control-v1`, background server | Planned |
 | 0.4 | Focused window: dwl IPC identifier, toplevel capture source | Planned (needs a dwl change) |
