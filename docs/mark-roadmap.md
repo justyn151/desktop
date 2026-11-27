@@ -184,6 +184,7 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 | Mouse wheel | Scroll three lines per notch |
 | `q`, Escape, Ctrl+C | Quit |
 | `r`, Ctrl+L | Redraw |
+| Ctrl+Z | Suspend to the shell; `fg` comes back |
 
 ### Design
 
@@ -196,11 +197,24 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 
 ### Manual checks
 
-- Scrolling a long file (`docs/deal-roadmap.md`) with `j` held is smooth and never shows a half-drawn frame.
-- Resizing the deal window (tile ↔ float) reflows the text and keeps the same paragraph at the top.
-- Ctrl+C, `q` and `kill` all leave the shell prompt exactly as it was.
-- With mouse reporting on, the wheel scrolls and Shift+drag selects text in deal.
-- `mark file | less` still works (no pager, plain escapes).
+- [ ] Scrolling a long file (`docs/deal-roadmap.md`) with `j` held is smooth and never shows a half-drawn frame.
+- [ ] Resizing the deal window (tile ↔ float) reflows the text and keeps the same paragraph at the top.
+- [ ] Ctrl+C, `q` and `kill` all leave the shell prompt exactly as it was.
+- [ ] With mouse reporting on, the wheel scrolls and Shift+drag selects text in deal.
+- [ ] `mark file | less` still works (no pager, plain escapes).
+- [ ] Ctrl+Z in the pager drops to the shell with the screen restored, and `fg` brings the pager back.
+
+### As built
+
+- The pager takes keys from `/dev/tty`, so `cat file | mark` pages too; frames go to standard output. It runs when standard output is a terminal and neither `--no-pager` nor `--plain` is given (`--plain` promises no escape sequences, so it prints). Without a `/dev/tty` it prints.
+- Every frame is redrawn whole inside `?2026h`/`?2026l`, each row cleared to its end. The scroll-region shortcut wasn't needed: a full 80×50 frame is a few kilobytes and deal applies it in one go.
+- Each laid-out line records the block it came from (numbered in document order) and the heading it falls under. Resize finds the top line's block and how far into it the top was, lays out again, and puts the same block at the top the same fraction of the way in. With `--width`, the layout keeps its width and resize only reclips.
+- Text width in the pager is the terminal's up to 80, as when printing. Wide tables aren't cut with `…` in the pager. Lines wider than the screen move together with `←`/`→` (a quarter screen, at least 8 columns, per press), each only as far as its own right edge; everything else stays put. A wide character cut by the left edge shows as spaces.
+- The wheel scrolls 3 lines; horizontal wheel buttons (66 and 67) scroll sideways. Modifier bits are ignored. Clicks are reported but unused until links (0.4).
+- Status line: the file's base name (`standard input` for a pipe), `›` and the heading the top line is under, and `All`, `Top`, `End` or how far the bottom of the screen is through the document, as `less` counts it. The left part is cut with `…` to fit.
+- Extra keys: Enter, Ctrl+N/Ctrl+E and `e` scroll down; Ctrl+P/Ctrl+Y and `y` up; Ctrl+F and Ctrl+B a screen; Ctrl+D and Ctrl+U half a screen; `<` and `>` top and bottom, as in `less`. Ctrl+Z restores the terminal and stops; on `fg` the pager comes back at the new size.
+- A killing signal restores the terminal, then mark dies by the same signal, so the shell sees it.
+- Checked offline in a pty: every way out (`q`, Escape, Ctrl+C, `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`) leaves the main screen untouched and termios as it was; arrows in CSI and SS3 forms, modified forms, PageDown and the wheel; resize keeps the paragraph at the top; a 14-column table scrolls to its edge and back; piped input pages; sizes from 1×1 to 1×200, and 650 random keys, mouse reports and broken sequences, under ASan and UBSan.
 
 ---
 
@@ -301,7 +315,7 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 |---|---|---|
 | 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Done (652/652 spec examples; live checks in deal pending) |
 | 0.2 | GitHub tables, strikethrough, task lists, extended autolinks | Done (21/21 GitHub examples; live checks in deal pending) |
-| 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Not started |
+| 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Done (live checks in deal pending) |
 | 0.4 | Following links, back stack, search, heading jumps, outline | Not started |
 | 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Not started |
 | 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Final |

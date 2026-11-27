@@ -1,6 +1,6 @@
 # mark
 
-`mark` shows markdown in the terminal. Version 0.2 parses a file and prints it laid out for the terminal's width, with real bold and italic, underlined links you can Ctrl+click in deal, shaded code blocks and box-drawn tables. The pager, link following and the config file come next; what's left is in [docs/mark-roadmap.md](../docs/mark-roadmap.md).
+`mark` shows markdown in the terminal. It lays a file out for the terminal's width, with real bold and italic, underlined links you can Ctrl+click in deal, shaded code blocks and box-drawn tables, and shows it in its own pager (0.3). Link following, search and the config file come next; what's left is in [docs/mark-roadmap.md](../docs/mark-roadmap.md).
 
 The parser is hand-written and follows CommonMark 0.31.2, passing all 652 of the spec's examples, plus GitHub's tables, strikethrough, task lists and bare-URL autolinks, passing GitHub's 21 examples for them. It's one `mark.c` and one `mark.h` with nothing beyond the C library.
 
@@ -24,13 +24,34 @@ mark [OPTIONS] [FILE]
 |---|---|
 | `FILE` | The markdown file. `-`, or no argument, reads standard input when it isn't a terminal |
 | `--width N` | Lay out for `N` columns (1 to 1000) |
-| `--plain` | No escape sequences at all: no colors, attributes or links |
+| `--plain` | No escape sequences at all: no colors, attributes or links. Prints instead of paging |
+| `--no-pager` | Print instead of paging, even to a terminal |
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show the version |
 
 Without `--width`, text is as wide as the terminal up to 80 columns, so long lines stay readable in a wide window. When the output isn't a terminal, the width is 80.
 
-mark prints the document and exits. The output keeps its escape sequences when piped (`mark README.md | less -R` works); `--plain` drops them. Setting `NO_COLOR` drops the colors but keeps bold, italic and underlines.
+When standard output is a terminal, mark shows the document in its pager (below). Otherwise it prints the document and exits. Printed output keeps its escape sequences (`mark README.md | less -R` works); `--plain` drops them. Setting `NO_COLOR` drops the colors but keeps bold, italic and underlines.
+
+## The pager
+
+The document opens on the terminal's alternate screen, so quitting leaves the shell as it was, and a status line at the bottom shows the file, the heading you're in and how far through you are (`Top`, `End`, `All` or a percentage). Keys are read from the terminal itself, so `cat notes.md | mark` pages too.
+
+| Key | Action |
+|---|---|
+| `j`, Down, Enter | Down a line (also `e`, Ctrl+N, Ctrl+E) |
+| `k`, Up | Up a line (also `y`, Ctrl+P, Ctrl+Y) |
+| Space, `f`, PageDown, Ctrl+F | Down a screen |
+| `b`, PageUp, Ctrl+B | Up a screen |
+| `d`, Ctrl+D / `u`, Ctrl+U | Down / up half a screen |
+| `g`, Home, `<` / `G`, End, `>` | Top / bottom |
+| `l`, Right / `h`, Left | Scroll tables wider than the screen sideways |
+| Mouse wheel | Three lines per notch; a horizontal wheel scrolls sideways |
+| `q`, Escape, Ctrl+C | Quit |
+| `r`, Ctrl+L | Redraw |
+| Ctrl+Z | Suspend to the shell (`fg` to come back) |
+
+Resizing the window reflows the text and keeps the paragraph you were reading at the top. Code blocks wrap; only tables too wide even after their columns shrink run past the right edge, and only they move with `←` and `→`. The pager reports mouse clicks so the wheel works, so in deal select text with Shift held.
 
 ## What it draws
 
@@ -64,7 +85,7 @@ Control characters in the file, such as an escape character, are shown as `�`,
 
 Files up to 64 MiB open. Container blocks (quotes and lists) nest up to 32 levels; anything deeper reads as text.
 
-A table gets each column's natural width when it fits. When it doesn't, each column gets at least its longest word and the rest of the room goes to the columns with the most text, whose cells wrap (if even the words don't fit, the widest columns shrink together, none below 6 columns); if any row then wraps, a rule separates every row. A table that still doesn't fit, with many columns, is cut with `…` until the pager can scroll it sideways.
+A table gets each column's natural width when it fits. When it doesn't, each column gets at least its longest word and the rest of the room goes to the columns with the most text, whose cells wrap (if even the words don't fit, the widest columns shrink together, none below 6 columns); if any row then wraps, a rule separates every row. A table that still doesn't fit, with many columns, scrolls sideways in the pager and is cut with `…` when printed.
 
 Only the most common named entities are known (`&copy;`, `&mdash;`, `&nbsp;` and about eighty more); numeric references (`&#169;`) always work, and an unknown name stays as written.
 
@@ -83,6 +104,17 @@ Only the most common named entities are known (`&copy;`, `&mdash;`, `&nbsp;` and
 - Each `tests/NAME.md` must render to `NAME.txt` with `--plain`, and to `NAME.ansi` with escapes. A name ending in `-N` renders at width `N`.
 - Exit codes, standard input, line endings, invalid UTF-8 and `NO_COLOR`.
 - `tests/commonmark.py` runs the CommonMark 0.31.2 examples (`tests/spec.json`) through a test build with extra `--html` and `--commonmark` options and compares the HTML, does the same for GitHub's examples of the extensions (`tests/gfm.json`, from cmark-gfm's `test/spec.txt`), then times inputs that make naive parsers quadratic (thousands of unclosed brackets, emphasis or comments, deep nesting, one very long line, huge tables). Each must finish within two seconds.
+
+## Manual checks (0.3)
+
+Checked offline in a pty: quitting by every key and signal leaves the main screen and terminal modes as they were; arrows, PageDown, Home/End and the wheel; resize keeps the top paragraph; a wide table scrolls sideways to its edge; piped input pages; tiny sizes and random input under ASan and UBSan.
+
+- [ ] In deal, hold `j` in `mark docs/deal-roadmap.md`: smooth, never a half-drawn frame.
+- [ ] Resize the window (tile ↔ float): the text reflows and the same paragraph stays at the top.
+- [ ] `q`, Ctrl+C and `kill` from another terminal all leave the prompt as it was.
+- [ ] The wheel scrolls; Shift+drag selects text.
+- [ ] Ctrl+Z drops to the shell with the screen restored; `fg` brings the pager back.
+- [ ] `mark file | less -R` and `mark --no-pager file` still print.
 
 ## Manual checks (0.2)
 

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MARK_VERSION "0.2.0"
+#define MARK_VERSION "0.3.0"
 
 /* Exit statuses. */
 enum {
@@ -171,6 +171,8 @@ struct line {
     int width;
     int pad_to;          /* Fill the line to this width with pad_style. */
     uint16_t pad_style;
+    int32_t block;       /* The block it came from, numbered in document order. */
+    int32_t heading;     /* Into page.headings: the section it's in, or -1. */
 };
 
 /* The document laid out for one width. */
@@ -184,6 +186,8 @@ struct page {
     size_t style_count, style_cap;
     char **links;
     size_t link_count, link_cap;
+    char **headings;     /* Each heading's text, for the pager's status line. */
+    size_t heading_count, heading_cap;
 };
 
 struct options {
@@ -193,6 +197,8 @@ struct options {
     const char *path;    /* NULL for standard input. */
     char *file_url;      /* file://host/dir/name.md, or NULL for stdin. */
     char *dir_url;       /* file://host/dir/ */
+    bool pager;          /* Laid out for the pager: wide tables aren't cut. */
+    bool no_pager;       /* --no-pager */
 #ifdef MARK_TEST
     bool html;
     bool commonmark; /* No extensions, for the CommonMark examples. */

@@ -5,6 +5,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <poll.h>
+#include <signal.h>
+#include <termios.h>
+#include <time.h>
 #include <limits.h>
 #include <locale.h>
 #include <stdio.h>
@@ -2466,6 +2470,8 @@ struct layout {
     struct style base; /* Italic inside block quotes. */
     int list_depth;
     struct glyphs tmp;
+    int32_t block, blocks; /* The current block's number, and the count so far. */
+    int32_t heading;
 };
 
 static const struct style plain_style = {0, 0, COLOR_NONE, COLOR_NONE, COLOR_NONE};
@@ -2603,6 +2609,8 @@ static void emit_line(struct layout *L, const struct glyph *glyphs, size_t count
         .width = width,
         .pad_to = pad_to ? L->prefix_width + pad_to : 0,
         .pad_style = pad_style,
+        .block = L->block,
+        .heading = L->heading,
     };
     pg->glyph_count += line.count;
     free(line.items);
@@ -2853,7 +2861,18 @@ static void layout_heading(struct layout *L, const struct block *b)
         break;
     }
     }
+    size_t marks = L->tmp.count;
     flatten(L, b->inlines->first, style, &L->tmp);
+    struct buf text = {0};
+    for (size_t i = marks; i < L->tmp.count; ++i) {
+        const struct glyph *g = &L->tmp.items[i];
+        if (g->link == GLYPH_BREAK) buf_putc(&text, ' ');
+        else buf_put(&text, L->page->text.data + g->offset, g->length);
+    }
+    struct page *pg = L->page;
+    grow(&pg->headings, &pg->heading_cap, pg->heading_count + 1, sizeof *pg->headings);
+    pg->headings[pg->heading_count] = text.data ? text.data : xstrdup("");
+    L->heading = (int32_t)pg->heading_count++;
     wrap(L, L->tmp.items, L->tmp.count);
 }
 
@@ -3031,7 +3050,7 @@ static void table_border(struct layout *L, const int *widths, int columns, const
         for (int i = 0; i < widths[c] + 2; ++i) push_string(L, &L->tmp, "─", style);
         push_string(L, &L->tmp, c + 1 < columns ? middle : right, style);
     }
-    cut_line(L, &L->tmp, 0, available(L), style);
+    if (!L->opt->pager) cut_line(L, &L->tmp, 0, available(L), style);
     emit_line(L, L->tmp.items, L->tmp.count, 0, 0);
 }
 
@@ -3163,7 +3182,7 @@ static void layout_table(struct layout *L, const struct block *b)
                 for (int i = 0; i < gap - before + 1; ++i) push_text(pg, &L->tmp, " ", 1, space, -1, NULL);
                 push_string(L, &L->tmp, "│", border);
             }
-            cut_line(L, &L->tmp, 0, available(L), border);
+            if (!L->opt->pager) cut_line(L, &L->tmp, 0, available(L), border);
             emit_line(L, L->tmp.items, L->tmp.count, 0, 0);
         }
         if (row->next && (row->header || ruled)) table_border(L, widths, columns, "├", "┼", "┤", border);
@@ -3182,6 +3201,7 @@ static void layout_table(struct layout *L, const struct block *b)
 
 static void layout_block(struct layout *L, const struct block *b)
 {
+    L->block = L->blocks++;
     switch (b->type) {
     case B_PARAGRAPH: layout_paragraph(L, b); break;
     case B_HEADING: layout_heading(L, b); break;
@@ -3207,7 +3227,7 @@ static void layout_blocks(struct layout *L, const struct block *first, bool tigh
 
 static void layout_document(struct page *pg, const struct document *doc, const struct options *opt)
 {
-    struct layout L = {.page = pg, .opt = opt, .width = opt->width, .base = plain_style};
+    struct layout L = {.page = pg, .opt = opt, .width = opt->width, .base = plain_style, .heading = -1};
     intern_style(pg, plain_style);
     layout_blocks(&L, doc->root->first, false);
     free(L.tmp.items);
@@ -3221,6 +3241,8 @@ static void free_page(struct page *pg)
     free(pg->styles);
     for (size_t i = 0; i < pg->link_count; ++i) free(pg->links[i]);
     free(pg->links);
+    for (size_t i = 0; i < pg->heading_count; ++i) free(pg->headings[i]);
+    free(pg->headings);
     *pg = (struct page){0};
 }
 
@@ -3267,26 +3289,45 @@ static void put_link(struct buf *out, const char *url)
     buf_puts(out, "\x1b\\");
 }
 
-static void render_line(struct buf *out, const struct page *pg, const struct line *line, const struct options *opt)
+/* The line's cells from column from, at most cols of them (INT_MAX for
+   all). A wide character cut by the left edge shows as spaces in its style. */
+static void render_cells(struct buf *out, const struct page *pg, const struct line *line, const struct options *opt,
+                         int from, int cols)
 {
     int style = 0;
     int32_t link = -1;
-    for (size_t i = 0; i < line->count; ++i) {
+    int end = cols == INT_MAX ? INT_MAX : from + cols;
+    int column = 0;
+    for (size_t i = 0; i < line->count && column < end; ++i) {
         const struct glyph *g = &pg->glyphs[line->first + i];
+        int next = column + g->width;
+        if (next > end) break;
+        bool partial = column < from;
+        if (partial && next <= from) {
+            column = next;
+            continue;
+        }
         if (opt->styled) {
             if (g->style != style) {
                 put_style(out, &pg->styles[g->style], opt->color);
                 style = g->style;
             }
-            int32_t target = g->link >= 0 ? g->link : -1;
+            int32_t target = g->link >= 0 && !partial ? g->link : -1;
             if (target != link) {
                 put_link(out, target >= 0 ? pg->links[target] : NULL);
                 link = target;
             }
         }
-        buf_put(out, pg->text.data + g->offset, g->length);
+        if (partial) {
+            for (int k = from; k < next; ++k) buf_putc(out, ' ');
+        } else {
+            buf_put(out, pg->text.data + g->offset, g->length);
+        }
+        column = next;
     }
-    if (opt->styled && opt->color && line->pad_to > line->width) {
+    int pad_end = line->pad_to < end ? line->pad_to : end;
+    int pad_start = line->width > from ? line->width : from;
+    if (opt->styled && opt->color && pad_end > pad_start) {
         if (link >= 0) {
             put_link(out, NULL);
             link = -1;
@@ -3295,10 +3336,15 @@ static void render_line(struct buf *out, const struct page *pg, const struct lin
             put_style(out, &pg->styles[line->pad_style], opt->color);
             style = line->pad_style;
         }
-        for (int i = line->width; i < line->pad_to; ++i) buf_putc(out, ' ');
+        for (int i = pad_start; i < pad_end; ++i) buf_putc(out, ' ');
     }
     if (link >= 0) put_link(out, NULL);
     if (style != 0) buf_puts(out, "\x1b[0m");
+}
+
+static void render_line(struct buf *out, const struct page *pg, const struct line *line, const struct options *opt)
+{
+    render_cells(out, pg, line, opt, 0, INT_MAX);
     buf_putc(out, '\n');
 }
 
@@ -3332,17 +3378,468 @@ static bool print_page(const struct page *pg, const struct options *opt)
     return ok;
 }
 
+/* Pager */
+
+static volatile sig_atomic_t pager_resized, pager_stop, pager_continued;
+
+static void pager_signal(int sig)
+{
+    if (sig == SIGWINCH) pager_resized = 1;
+    else if (sig == SIGCONT) pager_continued = 1;
+    else pager_stop = sig;
+}
+
+struct pager {
+    int tty;                 /* Keys come from here; frames go to stdout. */
+    struct termios saved;
+    bool active;
+    int rows, cols;
+    size_t top;              /* The first line on screen. */
+    int left;                /* Columns scrolled off the left of wide lines. */
+    int widest;              /* The widest line, padding included. */
+    bool fixed_width;        /* --width was given. */
+    const char *name;
+    const struct document *doc;
+    struct options *opt;
+    struct page page;
+    unsigned char input[256];
+    size_t input_len;
+    bool quit;
+};
+
+static const int pager_signals[] = {SIGWINCH, SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGCONT};
+
+static bool pager_write(const char *s)
+{
+    return write_all(STDOUT_FILENO, s, strlen(s));
+}
+
+/* Raw input with ISIG off, so Ctrl+C and Ctrl+Z arrive as keys; the
+   alternate screen; no cursor; wheel and click reports in SGR form. */
+static void pager_enter(struct pager *P)
+{
+    struct termios raw = P->saved;
+    raw.c_iflag &= (tcflag_t) ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= (tcflag_t)~OPOST;
+    raw.c_cflag |= CS8;
+    raw.c_lflag &= (tcflag_t) ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(P->tty, TCSAFLUSH, &raw);
+    pager_write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
+    P->active = true;
+}
+
+static void pager_leave(struct pager *P)
+{
+    if (!P->active) return;
+    pager_write("\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?1049l\x1b[?25h");
+    tcsetattr(P->tty, TCSAFLUSH, &P->saved);
+    P->active = false;
+}
+
+static int pager_text_rows(const struct pager *P)
+{
+    return P->rows > 1 ? P->rows - 1 : P->rows;
+}
+
+static size_t pager_max_top(const struct pager *P)
+{
+    size_t rows = (size_t)pager_text_rows(P);
+    return P->page.line_count > rows ? P->page.line_count - rows : 0;
+}
+
+static void pager_clamp(struct pager *P)
+{
+    if (P->top > pager_max_top(P)) P->top = pager_max_top(P);
+    int max_left = P->widest > P->cols ? P->widest - P->cols : 0;
+    if (P->left > max_left) P->left = max_left;
+    if (P->left < 0) P->left = 0;
+}
+
+static void pager_layout(struct pager *P)
+{
+    free_page(&P->page);
+    layout_document(&P->page, P->doc, P->opt);
+    P->widest = 0;
+    for (size_t i = 0; i < P->page.line_count; ++i) {
+        const struct line *line = &P->page.lines[i];
+        int width = line->width > line->pad_to ? line->width : line->pad_to;
+        if (width > P->widest) P->widest = width;
+    }
+}
+
+static void pager_size(struct pager *P)
+{
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+        P->cols = ws.ws_col;
+        P->rows = ws.ws_row;
+    } else {
+        P->cols = DEFAULT_WIDTH;
+        P->rows = 24;
+    }
+}
+
+/* A new terminal size. The text reflows when its width follows the
+   terminal, and the block at the top of the screen stays there, as far
+   through itself as it was. */
+static void pager_resize(struct pager *P)
+{
+    pager_size(P);
+    int width = P->cols < DEFAULT_WIDTH ? P->cols : DEFAULT_WIDTH;
+    if (!P->fixed_width && width != P->opt->width) {
+        int32_t block = -1;
+        size_t into = 0, length = 1;
+        if (P->top < P->page.line_count) {
+            const struct line *lines = P->page.lines;
+            block = lines[P->top].block;
+            size_t first = P->top, last = P->top;
+            while (first > 0 && lines[first - 1].block == block) --first;
+            while (last + 1 < P->page.line_count && lines[last + 1].block == block) ++last;
+            into = P->top - first;
+            length = last - first + 1;
+        }
+        P->opt->width = width;
+        pager_layout(P);
+        if (block >= 0) {
+            const struct line *lines = P->page.lines;
+            size_t first = 0;
+            while (first < P->page.line_count && lines[first].block < block) ++first;
+            size_t last = first;
+            while (last + 1 < P->page.line_count && lines[last + 1].block == block) ++last;
+            size_t now = first < P->page.line_count ? last - first + 1 : 1;
+            P->top = first + into * now / length;
+        }
+    }
+    pager_clamp(P);
+}
+
+/* Text for the status line, made safe and cut with … to max cells. */
+static int put_clipped(struct buf *out, const char *s, int max)
+{
+    int width = text_width(s) <= max ? INT_MAX : max - 1;
+    int used = 0;
+    for (size_t i = 0, n = strlen(s); i < n;) {
+        uint32_t cp;
+        i += utf8_decode(s + i, n - i, &cp);
+        if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) cp = 0xfffd;
+        int w = char_width(cp);
+        if (used + w > width) break;
+        char bytes[4];
+        buf_put(out, bytes, utf8_encode(cp, bytes));
+        used += w;
+    }
+    if (width != INT_MAX && max > 0) {
+        buf_puts(out, "…");
+        ++used;
+    }
+    return used;
+}
+
+static void pager_status(const struct pager *P, struct buf *out)
+{
+    char position[32];
+    size_t rows = (size_t)pager_text_rows(P);
+    if (P->page.line_count <= rows) {
+        snprintf(position, sizeof position, "All ");
+    } else if (P->top == 0) {
+        snprintf(position, sizeof position, "Top ");
+    } else if (P->top >= pager_max_top(P)) {
+        snprintf(position, sizeof position, "End ");
+    } else {
+        snprintf(position, sizeof position, "%zu%% ", (P->top + rows) * 100 / P->page.line_count);
+    }
+    struct buf left = {0};
+    buf_putc(&left, ' ');
+    buf_puts(&left, P->name);
+    int32_t heading = P->top < P->page.line_count ? P->page.lines[P->top].heading : -1;
+    if (heading >= 0) {
+        buf_puts(&left, "  ›  ");
+        buf_puts(&left, P->page.headings[heading]);
+    }
+    buf_putc(&left, '\0');
+    int right = (int)strlen(position);
+    buf_puts(out, "\x1b[0;7m");
+    int room = P->cols - right - 1;
+    int used = room > 0 ? put_clipped(out, left.data, room) : 0;
+    for (int i = used; i < P->cols - right; ++i) buf_putc(out, ' ');
+    if (right <= P->cols) buf_puts(out, position);
+    buf_puts(out, "\x1b[0m");
+    buf_free(&left);
+}
+
+/* One frame, drawn whole inside synchronized output so it never tears. */
+static bool pager_draw(const struct pager *P)
+{
+    struct buf out = {0};
+    buf_puts(&out, "\x1b[?2026h\x1b[H");
+    int rows = pager_text_rows(P);
+    for (int r = 0; r < rows; ++r) {
+        size_t i = P->top + (size_t)r;
+        if (i < P->page.line_count) {
+            const struct line *line = &P->page.lines[i];
+            int width = line->width > line->pad_to ? line->width : line->pad_to;
+            int from = width > P->cols ? (P->left < width - P->cols ? P->left : width - P->cols) : 0;
+            render_cells(&out, &P->page, line, P->opt, from, P->cols);
+        }
+        buf_puts(&out, "\x1b[K");
+        if (r + 1 < P->rows) buf_puts(&out, "\r\n");
+    }
+    if (rows < P->rows) pager_status(P, &out);
+    buf_puts(&out, "\x1b[?2026l");
+    bool ok = write_all(STDOUT_FILENO, out.data, out.len);
+    buf_free(&out);
+    return ok;
+}
+
+static void pager_scroll(struct pager *P, long delta)
+{
+    if (delta < 0 && (size_t)-delta > P->top) P->top = 0;
+    else P->top += (size_t)delta;
+    pager_clamp(P);
+}
+
+static void pager_suspend(struct pager *P)
+{
+    pager_leave(P);
+    raise(SIGTSTP);
+    pager_enter(P);
+    pager_resize(P);
+}
+
+/* Keys: arrows and the like come as CSI or SS3 sequences, the wheel as SGR
+   mouse reports. */
+static void pager_key(struct pager *P, int key)
+{
+    long page = pager_text_rows(P);
+    long half = page / 2 > 0 ? page / 2 : 1;
+    int step = P->cols / 4 > 8 ? P->cols / 4 : 8;
+    switch (key) {
+    case 'j': case 'e': case '\r': case '\n': case 0x05: case 0x0e: pager_scroll(P, 1); break;
+    case 'k': case 'y': case 0x10: case 0x19: pager_scroll(P, -1); break;
+    case ' ': case 'f': case 0x06: pager_scroll(P, page); break;
+    case 'b': case 0x02: pager_scroll(P, -page); break;
+    case 'd': case 0x04: pager_scroll(P, half); break;
+    case 'u': case 0x15: pager_scroll(P, -half); break;
+    case 'g': case '<': P->top = 0; break;
+    case 'G': case '>': P->top = pager_max_top(P); break;
+    case 'l': P->left += step; pager_clamp(P); break;
+    case 'h': P->left -= step; pager_clamp(P); break;
+    case 'q': case 'Q': case 0x03: case 0x1b: P->quit = true; break;
+    case 0x1a: pager_suspend(P); break;
+    default: break; /* r and Ctrl+L just redraw, as every key does. */
+    }
+}
+
+enum { KEY_UP = 0x100, KEY_DOWN, KEY_RIGHT, KEY_LEFT, KEY_HOME, KEY_END, KEY_PAGE_UP, KEY_PAGE_DOWN };
+
+static void pager_special(struct pager *P, int key)
+{
+    static const int keys[][2] = {
+        {KEY_UP, 'k'},   {KEY_DOWN, 'j'},     {KEY_RIGHT, 'l'},     {KEY_LEFT, 'h'},
+        {KEY_HOME, 'g'}, {KEY_END, 'G'},      {KEY_PAGE_UP, 'b'},   {KEY_PAGE_DOWN, ' '},
+    };
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; ++i) {
+        if (keys[i][0] == key) pager_key(P, keys[i][1]);
+    }
+}
+
+static void pager_csi(struct pager *P, bool mouse, const int *params, int count, char final)
+{
+    int first = count > 0 ? params[0] : 0;
+    if (mouse) {
+        if (final != 'M') return;
+        int button = first & ~(4 | 8 | 16); /* Without Shift, Alt and Ctrl. */
+        if (button == 64) pager_scroll(P, -3);
+        else if (button == 65) pager_scroll(P, 3);
+        else if (button == 66) pager_special(P, KEY_LEFT);
+        else if (button == 67) pager_special(P, KEY_RIGHT);
+        return;
+    }
+    switch (final) {
+    case 'A': pager_special(P, KEY_UP); break;
+    case 'B': pager_special(P, KEY_DOWN); break;
+    case 'C': pager_special(P, KEY_RIGHT); break;
+    case 'D': pager_special(P, KEY_LEFT); break;
+    case 'H': pager_special(P, KEY_HOME); break;
+    case 'F': pager_special(P, KEY_END); break;
+    case '~':
+        if (first == 1 || first == 7) pager_special(P, KEY_HOME);
+        else if (first == 4 || first == 8) pager_special(P, KEY_END);
+        else if (first == 5) pager_special(P, KEY_PAGE_UP);
+        else if (first == 6) pager_special(P, KEY_PAGE_DOWN);
+        break;
+    default: break;
+    }
+}
+
+/* Handles the keys in P->input and keeps an unfinished escape sequence
+   for later, unless flush says no more is coming: then a lone Escape is
+   the Escape key and a cut-off sequence is dropped. */
+static void pager_input(struct pager *P, bool flush)
+{
+    const unsigned char *s = P->input;
+    size_t n = P->input_len, i = 0;
+    while (i < n && !P->quit) {
+        if (s[i] != 0x1b) {
+            pager_key(P, s[i++]);
+            continue;
+        }
+        if (i + 1 == n) {
+            if (!flush) break;
+            pager_key(P, 0x1b);
+            ++i;
+            continue;
+        }
+        unsigned char next = s[i + 1];
+        if (next == '[') {
+            size_t j = i + 2;
+            bool mouse = j < n && s[j] == '<';
+            if (mouse) ++j;
+            int params[4] = {0}, count = 0;
+            bool digits = false;
+            while (j < n && s[j] >= 0x20 && s[j] <= 0x3f) {
+                if (s[j] >= '0' && s[j] <= '9') {
+                    if (count < 4 && params[count] < 100000) params[count] = params[count] * 10 + (s[j] - '0');
+                    digits = true;
+                } else if (s[j] == ';') {
+                    if (count < 4) ++count;
+                    digits = false;
+                }
+                ++j;
+            }
+            if (j == n) {
+                if (!flush) break;
+                i = n;
+                continue;
+            }
+            if (digits || count > 0) ++count;
+            if (count > 4) count = 4;
+            if (s[j] >= 0x40 && s[j] <= 0x7e) pager_csi(P, mouse, params, count, (char)s[j]);
+            i = j + 1;
+        } else if (next == 'O') {
+            if (i + 2 == n) {
+                if (!flush) break;
+                i = n;
+                continue;
+            }
+            pager_csi(P, false, NULL, 0, (char)s[i + 2]);
+            i += 3;
+        } else if (next == 0x1b) {
+            pager_key(P, 0x1b);
+            ++i;
+        } else {
+            i += 2; /* Alt and a key: nothing is bound to it. */
+        }
+    }
+    if (P->quit) i = n;
+    memmove(P->input, P->input + i, n - i);
+    P->input_len = n - i;
+}
+
+/* Shows the page until a quit key or a signal. Returns false when there's
+   no terminal to page on, and the caller prints instead. */
+static bool run_pager(const struct document *doc, struct options *opt, bool fixed_width)
+{
+    struct pager P = {.doc = doc, .opt = opt, .fixed_width = fixed_width};
+    P.tty = open("/dev/tty", O_RDWR | O_CLOEXEC | O_NOCTTY);
+    if (P.tty < 0) return false;
+    if (tcgetattr(P.tty, &P.saved) != 0) {
+        close(P.tty);
+        return false;
+    }
+    if (opt->path) {
+        const char *slash = strrchr(opt->path, '/');
+        P.name = slash && slash[1] ? slash + 1 : opt->path;
+    } else {
+        P.name = "standard input";
+    }
+
+    sigset_t blocked, waiting;
+    sigemptyset(&blocked);
+    struct sigaction action = {.sa_handler = pager_signal};
+    sigemptyset(&action.sa_mask);
+    for (size_t i = 0; i < sizeof pager_signals / sizeof pager_signals[0]; ++i) {
+        sigaction(pager_signals[i], &action, NULL);
+        sigaddset(&blocked, pager_signals[i]);
+    }
+    sigprocmask(SIG_BLOCK, &blocked, &waiting);
+    for (size_t i = 0; i < sizeof pager_signals / sizeof pager_signals[0]; ++i) sigdelset(&waiting, pager_signals[i]);
+
+    opt->pager = true;
+    pager_size(&P);
+    if (!fixed_width) opt->width = P.cols < DEFAULT_WIDTH ? P.cols : DEFAULT_WIDTH;
+    pager_layout(&P);
+    pager_enter(&P);
+    bool redraw = true;
+    while (!P.quit && !pager_stop) {
+        if (pager_continued) {
+            pager_continued = 0;
+            pager_enter(&P);
+            redraw = true;
+        }
+        if (pager_resized) {
+            pager_resized = 0;
+            pager_resize(&P);
+            redraw = true;
+        }
+        if (redraw && !pager_draw(&P)) break;
+        redraw = false;
+        struct pollfd fd = {.fd = P.tty, .events = POLLIN};
+        /* A lone Escape is the key itself once 25 ms pass with nothing after it. */
+        struct timespec wait = {0, 25 * 1000 * 1000};
+        int ready = ppoll(&fd, 1, P.input_len ? &wait : NULL, &waiting);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) {
+            pager_input(&P, true);
+            redraw = true;
+            continue;
+        }
+        if (fd.revents & POLLIN) {
+            ssize_t got = read(P.tty, P.input + P.input_len, sizeof P.input - P.input_len);
+            if (got <= 0) {
+                if (got < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+                break;
+            }
+            P.input_len += (size_t)got;
+            pager_input(&P, P.input_len == sizeof P.input);
+            redraw = true;
+        } else if (fd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            break;
+        }
+    }
+    pager_leave(&P);
+    close(P.tty);
+    free_page(&P.page);
+    struct sigaction ignore = {.sa_handler = SIG_IGN};
+    sigemptyset(&ignore.sa_mask);
+    sigaction(SIGWINCH, &ignore, NULL);
+    sigaction(SIGCONT, &ignore, NULL);
+    /* Killed: go on to die by the same signal, so the shell sees it. */
+    if (pager_stop) {
+        signal(pager_stop, SIG_DFL);
+        raise(pager_stop);
+    }
+    sigprocmask(SIG_UNBLOCK, &blocked, NULL);
+    return true;
+}
+
 /* Command line */
 
 static void usage(FILE *out)
 {
     fputs("Usage: mark [OPTIONS] [FILE]\n"
-          "Show a markdown file in the terminal.\n"
+          "Show a markdown file in the terminal, in a pager when the output is one.\n"
           "\n"
           "  FILE          Markdown file. \"-\" or no argument reads standard input\n"
           "                when it isn't a terminal.\n"
           "  --width N     Text width (default: the terminal's, up to 80)\n"
-          "  --plain       No colors or attributes\n"
+          "  --plain       No colors or attributes; prints instead of paging\n"
+          "  --no-pager    Print instead of paging, even to a terminal\n"
           "  -h, --help    Show this help\n"
           "  -v, --version Show the version\n",
           out);
@@ -3423,10 +3920,11 @@ int main(int argc, char **argv)
     const char *no_color = getenv("NO_COLOR");
     if (no_color && no_color[0]) opt.color = false;
 
-    enum { OPT_WIDTH = 256, OPT_PLAIN, OPT_HTML, OPT_COMMONMARK };
+    enum { OPT_WIDTH = 256, OPT_PLAIN, OPT_NO_PAGER, OPT_HTML, OPT_COMMONMARK };
     static const struct option long_options[] = {
         {"width", required_argument, NULL, OPT_WIDTH},
         {"plain", no_argument, NULL, OPT_PLAIN},
+        {"no-pager", no_argument, NULL, OPT_NO_PAGER},
         {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'v'},
 #ifdef MARK_TEST
@@ -3450,6 +3948,7 @@ int main(int argc, char **argv)
             break;
         }
         case OPT_PLAIN: opt.styled = false; break;
+        case OPT_NO_PAGER: opt.no_pager = true; break;
 #ifdef MARK_TEST
         case OPT_HTML: opt.html = true; break;
         case OPT_COMMONMARK: opt.commonmark = true; break;
@@ -3474,6 +3973,7 @@ int main(int argc, char **argv)
         return EXIT_USAGE;
     }
 
+    bool fixed_width = opt.width != 0;
     if (opt.width == 0) {
         struct winsize ws;
         opt.width = DEFAULT_WIDTH;
@@ -3506,10 +4006,14 @@ int main(int argc, char **argv)
     } else
 #endif
     {
-        struct page page = {0};
-        layout_document(&page, doc, &opt);
-        ok = print_page(&page, &opt);
-        free_page(&page);
+        ok = true;
+        bool paged = !opt.no_pager && opt.styled && isatty(STDOUT_FILENO) && run_pager(doc, &opt, fixed_width);
+        if (!paged) {
+            struct page page = {0};
+            layout_document(&page, doc, &opt);
+            ok = print_page(&page, &opt);
+            free_page(&page);
+        }
     }
     free_document(doc);
     free(text);

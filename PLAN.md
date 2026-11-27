@@ -11,13 +11,13 @@ Ground rules that apply to every phase:
 
 ---
 
-## Where things stand (2026-11-27)
+## Where things stand (2026-11-28)
 
-**Now:** `mark`, the terminal markdown viewer: 0.1 (parse and print) and 0.2 (tables and the other GitHub extensions) are done, 0.3 (the pager) is next. `view`'s features are all in (0.1 to 0.5); what's left for it is 1.0, which is mostly a week of daily use, so it runs alongside `mark` instead of blocking it. Details for view are in [docs/view-roadmap.md](docs/view-roadmap.md).
+**Now:** `mark`, the terminal markdown viewer: 0.1 (parse and print), 0.2 (tables and the other GitHub extensions) and 0.3 (the pager) are done, 0.4 (links, search, navigation) is next. `view`'s features are all in (0.1 to 0.5); what's left for it is 1.0, which is mostly a week of daily use, so it runs alongside `mark` instead of blocking it. Details for view are in [docs/view-roadmap.md](docs/view-roadmap.md).
 
 **Next, in order:**
 
-1. `mark`: 0.3, the pager, from [docs/mark-roadmap.md](docs/mark-roadmap.md); the 0.1 and 0.2 live checks in deal (`mark/README.md`) go alongside
+1. `mark`: 0.4, links, search and navigation, from [docs/mark-roadmap.md](docs/mark-roadmap.md); the 0.1 to 0.3 live checks in deal (`mark/README.md`) go alongside
 2. Alongside `mark`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
    - 0.4 live checks once there are sample files: a portrait phone photo, a WebP, an animated GIF
@@ -38,6 +38,7 @@ Ground rules that apply to every phase:
 | view 0.5 | `view.conf` (background, transparency, fit_enlarge, filter, start, wrap, sort), palette background that follows the wallpaper, no-argument start directory, dwl float rule, `view.desktop` and `make default`, shot's `[save] open` |
 | mark 0.1 | CommonMark parser (all 652 spec examples), wrapped output with deal's bold, italic, underline colors and OSC 8 links, shaded code |
 | mark 0.2 | GitHub tables (box drawn, columns fitted to the width), strikethrough, task lists, bare-URL autolinks; all 21 GitHub examples |
+| mark 0.3 | The pager: scrolling by key and wheel, resize reflow that keeps your place, sideways scrolling of wide tables, status line with the current heading, clean exit on every key and signal |
 | desk | Image decoding moved from wall (`desk_image_load`), key repeat (`DeskRepeat`), alongside shot's atomic files, shm, INI config and buffer pool |
 
 ---
@@ -227,7 +228,7 @@ A terminal markdown viewer, started once `view`'s features were done (0.5), whil
 |---|---|---|
 | 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Done (live checks in deal pending) |
 | 0.2 | GitHub tables, strikethrough, task lists, extended autolinks | Done (live checks in deal pending) |
-| 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Not started |
+| 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Done (live checks in deal pending) |
 | 0.4 | Following links, back stack, search, heading jumps, outline | Not started |
 | 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Not started |
 | 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Not started |
