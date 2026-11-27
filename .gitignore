@@ -13,7 +13,6 @@
 *-protocol.h
 *-client-protocol.h
 default-config.h
-/dwl/config.h
 .build/
 build/
 .cache/

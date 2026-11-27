@@ -63,7 +63,7 @@ Goal: fix existing problems before refactoring, so the migration to desk starts 
 
 ### Known issues
 
-- [x] **dwl config mismatch:** `config.def.h` still uses `MODKEY = Alt` and `Alt+Shift+Enter` for the terminal. The README documents a Super-based layout (Super+Enter, Super+Q) that only exists in the gitignored `config.h`. Commit the real layout as `config.def.h`.
+- [x] **dwl config mismatch:** `config.def.h` still uses `MODKEY = Alt` and `Alt+Shift+Enter` for the terminal. The README documents a Super-based layout (Super+Enter, Super+Q) that only exists in the gitignored `config.h`. Commit the real layout as `config.def.h`. `config.h` is tracked too, so the running layout is in git.
 - [ ] **Remaining foot references:** sweep the repo after Phase 1.4 (`grep -rn foot`)
 - [ ] **dwl TODO/FIXME:** review the 4 markers in `dwl.c`
 
