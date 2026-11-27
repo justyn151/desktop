@@ -264,6 +264,6 @@ view [FILE|DIR]...
 | 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (fractional scale check skipped: 1× only for now) |
 | 0.2 | Zoom, pan, rotate, filters, key repeat | Done |
 | 0.3 | Directory browsing, preloading, reload on change | Done |
-| 0.4 | EXIF orientation, checkerboard, GIF and WebP | Code done, checklist pending |
+| 0.4 | EXIF orientation, checkerboard, GIF and WebP | Done (live checks untested: no sample files yet; covered offline) |
 | 0.5 | Config, palette, dwl rule, desktop entry, install | Planned |
 | 1.0 | Checklists, fuzzing, README | Final |

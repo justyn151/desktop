@@ -86,6 +86,8 @@ Checked offline under ASan and UBSan: six generated GIFs (plain, interlaced, tra
 - [ ] A WebP from the web opens.
 - [ ] An animated GIF shows its first frame.
 
+These three are untested live: there were no portrait photos, WebP or GIF files to try yet. The offline checks above cover the same code.
+
 ## Manual checks (0.3)
 
 Checked offline under ASan and UBSan, by calling the browsing code directly: natural order without hidden files, a `FILE` starting at itself, an explicit non-image name included, several arguments in order with directories expanded in place; preloading forward then backward, a broken neighbour cached as failed, stepping onto a preloaded image without decoding it again, wrapping both ways, a rotated image not kept, reload of a replaced file (keeping the zoom at the same size), no decode for an unchanged file, and a broken replacement keeping the old image. Live on dwl, replacing the open file with `shot` showed the new capture.
