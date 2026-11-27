@@ -142,6 +142,8 @@ Manual checks: `shot -r -C`, paste into a browser or image editor; `wl-paste -l`
 
 ## 0.4: Focused-window capture
 
+Skipped for now: region capture covers the need. The plan below stays for if it's wanted later.
+
 ### dwl change
 
 Add the focused toplevel's `ext_foreign_toplevel_list_v1` identifier to dwl IPC: a new `focused_identifier(string)` event on `zdwl_ipc_output_v2`, protocol version 3, sent next to `title` and `appid` when focus changes. Update both copies of `dwl-ipc-unstable-v2.xml` (`dwl/protocols` and `bar/protocols`), which are identical today. bar binds version 2, so it keeps working unchanged.
@@ -186,7 +188,6 @@ The config file, its parser and the `~/Pictures/Screenshots` default landed earl
   |---|---|
   | Print | `shot -r` (region) |
   | Shift+Print | `shot` (focused monitor) |
-  | Super+Print | `shot -w` (focused window) |
 
 - `make install` installs `shot` and a sample `shot.conf`, following bar's `PREFIX`/`BINDIR`/`DESTDIR` conventions. Add `!/shot/shot.conf` and `/shot/shot` to `.gitignore`.
 
@@ -215,7 +216,7 @@ Manual checks: each binding saves into `~/Pictures/Screenshots` with the configu
 |---|---|---|
 | 0.1 | Full-monitor capture to PNG, desk atomic write and shm | Done (multi-monitor and rotation untested) |
 | 0.2 | Region: freeze, layer-shell overlay, crop. Config file (pulled forward from 0.5) | Done (cancel, edge and scale checks pending) |
-| 0.3 | Clipboard through `ext-data-control-v1`, background server | Code done, paste into an app pending |
-| 0.4 | Focused window: dwl IPC identifier, toplevel capture source | Planned (needs a dwl change) |
+| 0.3 | Clipboard through `ext-data-control-v1`, background server | Done |
+| 0.4 | Focused window: dwl IPC identifier, toplevel capture source | Skipped (needs a dwl change) |
 | 0.5 | Print bindings in dwl, install the sample config | Planned (config itself landed in 0.2) |
 | 1.0 | Checklists, exit codes, README | Final |
