@@ -13,11 +13,11 @@ Ground rules that apply to every phase:
 
 ## Where things stand (2026-11-27)
 
-**Now:** `mark`, the terminal markdown viewer. `view`'s features are all in (0.1 to 0.5); what's left for it is 1.0, which is mostly a week of daily use, so it runs alongside `mark` instead of blocking it. Details for view are in [docs/view-roadmap.md](docs/view-roadmap.md).
+**Now:** `mark`, the terminal markdown viewer: 0.1 (parse and print) is done, 0.2 (the pager) is next. `view`'s features are all in (0.1 to 0.5); what's left for it is 1.0, which is mostly a week of daily use, so it runs alongside `mark` instead of blocking it. Details for view are in [docs/view-roadmap.md](docs/view-roadmap.md).
 
 **Next, in order:**
 
-1. `mark`: build it milestone by milestone from [docs/mark-roadmap.md](docs/mark-roadmap.md), starting with 0.1 (parse and print)
+1. `mark`: 0.2, the pager, from [docs/mark-roadmap.md](docs/mark-roadmap.md); the 0.1 live checks in deal (`mark/README.md`) go alongside
 2. Alongside `mark`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
    - 0.4 live checks once there are sample files: a portrait phone photo, a WebP, an animated GIF
@@ -36,6 +36,7 @@ Ground rules that apply to every phase:
 | view 0.3 | Browse a directory or a list, preload neighbours, reload a replaced file |
 | view 0.4 | GIF (built-in decoder) and WebP, EXIF orientation, checkerboard behind transparency, unsupported formats named. Live checks for portrait photos, WebP and GIF still to do once there are sample files |
 | view 0.5 | `view.conf` (background, transparency, fit_enlarge, filter, start, wrap, sort), palette background that follows the wallpaper, no-argument start directory, dwl float rule, `view.desktop` and `make default`, shot's `[save] open` |
+| mark 0.1 | CommonMark parser (all 652 spec examples), wrapped output with deal's bold, italic, underline colors and OSC 8 links, shaded code |
 | desk | Image decoding moved from wall (`desk_image_load`), key repeat (`DeskRepeat`), alongside shot's atomic files, shm, INI config and buffer pool |
 
 ---
@@ -223,7 +224,7 @@ A terminal markdown viewer, started once `view`'s features were done (0.5), whil
 
 | Version | Milestone | Status |
 |---|---|---|
-| 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Not started |
+| 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Done (live checks in deal pending) |
 | 0.2 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Not started |
 | 0.3 | GitHub tables, strikethrough, task lists, extended autolinks | Not started |
 | 0.4 | Following links, back stack, search, heading jumps, outline | Not started |

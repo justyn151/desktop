@@ -1,0 +1,12 @@
+Text with emphasis, strong, both, code, and a ` tick.
+
+Inline, reference, collapsed, ref, https://autolink.example, someone@example.com
+and [image: an image].
+
+Escapes: *not emphasis* [not a link] \ and entities: © © © &unknown;
+
+A hard break with spaces
+and with a backslash
+then a soft break.
+
+Inline <span class="x">HTML</span> stays as text.

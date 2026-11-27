@@ -1,0 +1,11 @@
+Short words wrap at the width of twenty-four columns here.
+
+Averyveryveryverylongwordthatcannotfit at all.
+
+漢字とかなを含む日本語の文章は二列ずつ数えます。
+
+Combining marks stay with their letter: café café café.
+
+- A list item whose text wraps under its marker.
+
+> A quote whose text wraps under its bar.

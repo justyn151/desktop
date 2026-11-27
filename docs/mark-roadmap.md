@@ -120,6 +120,17 @@ No argument with stdin on a terminal prints usage and exits 2. A file that can't
 - Wide characters (CJK, emoji) never split across a wrap and never misalign a table.
 - A file without a trailing newline renders the last line.
 
+### As built
+
+- The parser passes all 652 examples of CommonMark 0.31.2, so the spec corpus planned for 1.0 came forward: a test build (`-DMARK_TEST`) adds `--html`, and `make check` compares it with `tests/spec.json` through `tests/commonmark.py`. The shipped binary has no HTML output.
+- The pathological inputs are cmark's list plus a few of mark's own (nested images, one 2 MB line, many short lines, wide characters). Each finishes in well under the two seconds `make check` allows, in both the HTML and the terminal output.
+- Inline rendering walks the tree without recursion, since emphasis and image alt text can nest as deep as a line is long. Block nesting stops at 32 levels, as planned.
+- Until 0.5 brings the palette, colors are ANSI indices: accent 4, inline code 3, muted 8, code shading 0. deal derives all sixteen from the wallpaper (8 is the muted role, 0 the background lifted a little), so in deal they follow it already. The underline color is sent as `58:5:N` and underline styles as `4:2`, colon forms that terminals without them read as one unknown parameter.
+- Code blocks have no padding rows. The language label sits on a shaded row of its own above the code, and only when there is one. So the plain text and the styled text are the same lines, apart from the spaces that fill shaded code lines in styled output.
+- Piped output keeps its escapes; only `--plain` removes them. That's what makes `mark file | cat` show links, as the "What deal gives it" table says.
+- desk isn't linked yet: 0.1 uses nothing from it. It joins in 0.5 with the config file, palette and file watch.
+- `-v` works as well as `--version`, like view.
+
 ### Manual checks
 
 - `mark README.md` for every README in this repo looks right: headings stand out, code is shaded, links are underlined in the accent color and Ctrl+click opens the HTTP ones in deal.
@@ -278,7 +289,7 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 
 | Version | Theme | Status |
 |---|---|---|
-| 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Not started |
+| 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Done (652/652 spec examples; live checks in deal pending) |
 | 0.2 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Not started |
 | 0.3 | GitHub tables, strikethrough, task lists, extended autolinks | Not started |
 | 0.4 | Following links, back stack, search, heading jumps, outline | Not started |

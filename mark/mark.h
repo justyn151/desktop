@@ -1,0 +1,191 @@
+#ifndef MARK_H
+#define MARK_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define MARK_VERSION "0.1.0"
+
+/* Exit statuses. */
+enum {
+    EXIT_OK = 0,
+    EXIT_FAILED = 1, /* The file couldn't be read. */
+    EXIT_USAGE = 2,
+};
+
+#define MAX_INPUT_BYTES ((size_t)64 << 20)
+#define DEFAULT_WIDTH 80
+#define MAX_WIDTH 1000
+#define TAB_STOP 4
+#define CODE_INDENT 4
+/* Container blocks (quotes, lists and items) nested deeper than this are
+   read as text, so a crafted file can't build an unbounded tree. */
+#define MAX_NESTING 32
+#define MAX_LINK_LABEL 999
+#define MAX_LINK_PARENS 32
+#define MAX_BACKTICKS 1000
+
+/* A growable byte string. */
+struct buf {
+    char *data;
+    size_t len, cap;
+};
+
+/* Memory for one document, released at once. */
+struct arena_block;
+struct arena {
+    struct arena_block *head;
+};
+
+/* Block structure (CommonMark 0.31, section 4 and 5). */
+enum block_type {
+    B_DOCUMENT,
+    B_QUOTE,
+    B_LIST,
+    B_ITEM,
+    B_PARAGRAPH,
+    B_HEADING,
+    B_BREAK,
+    B_CODE,
+    B_HTML,
+};
+
+struct list_data {
+    bool ordered;
+    char bullet;    /* - + or * */
+    char delimiter; /* . or ) */
+    int start;
+    int marker_offset; /* Columns before the marker. */
+    int padding;       /* Marker width plus the spaces after it. */
+    bool tight;
+};
+
+struct inline_node;
+
+struct block {
+    enum block_type type;
+    struct block *parent, *first, *last, *prev, *next;
+    bool open;
+    bool last_line_blank;
+    int start_line;
+    struct buf content;           /* Leaf text, one '\n' per line. */
+    struct inline_node *inlines;  /* Paragraphs and headings, after parsing. */
+
+    int level;           /* Heading. */
+    bool setext;
+    bool fenced;         /* Code. */
+    char fence_char;
+    int fence_length;
+    int fence_offset;
+    char *info;
+    int html_type;       /* HTML block, 1 to 7. */
+    struct list_data list; /* List and item. */
+};
+
+/* Inline structure (section 6). */
+enum inline_type {
+    I_TEXT,
+    I_SOFTBREAK,
+    I_LINEBREAK,
+    I_CODE,
+    I_HTML,
+    I_EMPH,
+    I_STRONG,
+    I_LINK,
+    I_IMAGE,
+};
+
+struct inline_node {
+    enum inline_type type;
+    struct inline_node *parent, *first, *last, *prev, *next;
+    const char *text; /* Text, code and HTML: bytes, not terminated. */
+    size_t len;
+    char *url;        /* Link and image, unescaped. */
+    char *title;
+};
+
+struct ref {
+    char *label; /* Normalized. NULL for an empty slot. */
+    char *url;
+    char *title;
+};
+
+struct refmap {
+    struct ref *slots;
+    size_t count, cap;
+};
+
+struct document {
+    struct arena arena;
+    struct block *root;
+    struct refmap refs;
+};
+
+/* Rendering. A style is interned in the page and glyphs refer to it. */
+enum {
+    ATTR_BOLD = 1,
+    ATTR_DIM = 2,
+    ATTR_ITALIC = 4,
+    ATTR_STRIKE = 8,
+};
+
+enum {
+    UNDERLINE_NONE = 0,
+    UNDERLINE_SINGLE = 1,
+    UNDERLINE_DOUBLE = 2,
+    UNDERLINE_DASHED = 5,
+};
+
+#define COLOR_NONE (-1)
+
+struct style {
+    uint8_t attr;
+    uint8_t underline;
+    int16_t fg, bg, underline_color; /* 0–255, or COLOR_NONE. */
+};
+
+/* One character cell or a wide pair, with its combining marks. A glyph
+   with no bytes and link GLYPH_BREAK is a hard line break. */
+#define GLYPH_BREAK (-2)
+struct glyph {
+    uint32_t offset; /* Into page.text. */
+    uint8_t length;
+    uint8_t width;
+    uint16_t style;
+    int32_t link;    /* Into page.links, or -1. */
+};
+
+struct line {
+    size_t first, count; /* Into page.glyphs. */
+    int width;
+    int pad_to;          /* Fill the line to this width with pad_style. */
+    uint16_t pad_style;
+};
+
+/* The document laid out for one width. */
+struct page {
+    struct buf text;
+    struct glyph *glyphs;
+    size_t glyph_count, glyph_cap;
+    struct line *lines;
+    size_t line_count, line_cap;
+    struct style *styles;
+    size_t style_count, style_cap;
+    char **links;
+    size_t link_count, link_cap;
+};
+
+struct options {
+    int width;           /* 0: pick from the terminal. */
+    bool styled;         /* Escape sequences at all (off with --plain). */
+    bool color;          /* Colors (off with NO_COLOR). */
+    const char *path;    /* NULL for standard input. */
+    char *file_url;      /* file://host/dir/name.md, or NULL for stdin. */
+    char *dir_url;       /* file://host/dir/ */
+#ifdef MARK_TEST
+    bool html;
+#endif
+};
+
+#endif

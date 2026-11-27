@@ -18,6 +18,7 @@ builds generate bindings with `wayland-scanner`.
 | [deal](deal/README.md) | Native Wayland terminal emulator | `make -C deal` | Wayland client and EGL libraries, wayland-protocols, EGL, desktop OpenGL, xkbcommon, FreeType, Fontconfig, libutil. `tic` and `xdg-open` are optional. |
 | [lead](lead/README.md) | Modal terminal text editor installed as `editor` | `make -C lead` | C11 compiler and the system C library. |
 | [view](view/README.md) | Wayland image viewer for PNG, JPEG, GIF and WebP | `make -C view` | Wayland client, wayland-protocols, xkbcommon, libpng, libjpeg, libwebp. |
+| [mark](mark/README.md) | Markdown viewer for the terminal | `make -C mark` | C11 compiler and the system C library. `make check` uses `python3`. |
 
 `dwl`, `bar`, `run`, `wall`, and `net` install under `/usr/local` by default.
 `deal` and `lead` use `$HOME/.local`. Pass `PREFIX="$HOME/.local"` to install any
