@@ -163,7 +163,7 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 - [x] Open a second tab and check the bar appears, `stty size` loses one row in both tabs, and closing back to one tab hides the bar and restores the row.
 - [x] Check titles update when a shell or Neovim changes them, including in background tabs, and long titles end with an ellipsis.
 - [x] Left-click tabs to switch and middle-click to close, including the active tab and the last one.
-- [ ] With two, three and many tabs, check the bar is split equally across the full width. Close tabs with the × button, including the active and the last one.
+- [x] With two, three and many tabs, check the bar is split equally across the full width. Close tabs with the × button, including the active and the last one.
 - [x] Run `sleep 2; printf '\a'` and switch tabs. The background tab's title turns the cursor color until you open it.
 - [x] Check the bar with opacity below 1, after zooming and after a wallpaper change. Mouse selection and clicks in the grid still land on the right cells.
 
