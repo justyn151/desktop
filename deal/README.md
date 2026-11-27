@@ -1,8 +1,8 @@
-# deal 0.13.0
+# deal 0.13.1
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.13.0 adds tabs. Version 0.12.1 gave explicit backgrounds that match the default background the window's opacity. Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.13.1 adds the tab bar. Version 0.13.0 added tabs. Version 0.12.1 gave explicit backgrounds that match the default background the window's opacity. Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 
@@ -87,7 +87,7 @@ With `mouse.reporting` enabled, applications can request button, motion and whee
 
 Each tab has its own shell, screens, scrollback, selection and title. Background tabs keep running and receive their output. Only the active tab is drawn and receives keyboard and mouse input, and the window title follows it. A new tab runs your shell, not the `-e` command, in the current tab's directory. A tab closes when its shell exits, and closing the last tab closes the window. A window holds up to 16 tabs. Resizes, zoom and configuration reloads apply to every tab. The switching shortcuts only act with two or more tabs, so with one tab Ctrl+Tab and Alt+digits still reach the application. Set any tab shortcut to `false` under `[keybinds]` to disable it.
 
-There's no tab bar yet. It comes next, with click to switch and a marker for background tabs that rang the bell.
+With two or more tabs, a tab bar one text row high appears above the grid and takes its space from every tab. Each tab shows its number and title. The active tab uses the selection colors, a background tab that rang the bell shows its title in the cursor color until you visit it, and other tabs use the foreground color. Tabs share the width, up to 32 cells each, and long titles end with an ellipsis. Left-click a tab to switch to it and middle-click to close it. The bar background follows `opacity`.
 
 ## Wallpaper theme
 
@@ -157,6 +157,14 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 - A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
 
 ## Manual verification on dwl
+
+### 0.13.1 Tab bar
+
+- [ ] Open a second tab and check the bar appears, `stty size` loses one row in both tabs, and closing back to one tab hides the bar and restores the row.
+- [ ] Check titles update when a shell or Neovim changes them, including in background tabs, and long titles end with an ellipsis.
+- [ ] Left-click tabs to switch and middle-click to close, including the active tab and the last one.
+- [ ] Run `sleep 2; printf '\a'` and switch tabs. The background tab's title turns the cursor color until you open it.
+- [ ] Check the bar with opacity below 1, after zooming and after a wallpaper change. Mouse selection and clicks in the grid still land on the right cells.
 
 ### 0.13.0 Tabs
 

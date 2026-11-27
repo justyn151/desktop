@@ -62,7 +62,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.13.0";
+static const char deal_version[] = "0.13.1";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -5768,11 +5768,12 @@ typedef struct {
     int font_size;
     bool reload;
     bool *redraw;
-    int tab_action; /* TabAction requested by a shortcut, handled by the run loop. */
+    int tab_action; /* TabAction requested by a shortcut or click, handled by the run loop. */
     size_t tab_target, tab_count;
+    int bar; /* Height of the tab bar above the grid, zero when hidden. */
 } Interaction;
 
-typedef enum { TAB_NONE, TAB_NEW, TAB_CLOSE, TAB_NEXT, TAB_PREVIOUS, TAB_GOTO } TabAction;
+typedef enum { TAB_NONE, TAB_NEW, TAB_CLOSE, TAB_NEXT, TAB_PREVIOUS, TAB_GOTO, TAB_CLOSE_AT } TabAction;
 
 static bool shortcut_matches(Shortcut shortcut, unsigned int modifiers, xkb_keysym_t key,
                              xkb_keysym_t unshifted)
@@ -5898,8 +5899,21 @@ static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint3
 
 static Padding input_padding(const Interaction *input)
 {
-    return grid_padding(input->config->padding, input->platform->width, input->platform->height,
+    return grid_padding(input->config->padding, input->platform->width, input->platform->height - input->bar,
                         &input->renderer->metrics, &terminal_buffer(input->terminal)->screen);
+}
+
+/* Tabs share the bar equally, up to 32 cells each. */
+static int tab_width(int width, size_t count, int cell_width)
+{
+    int each = count != 0 ? width / (int)count : width;
+    return each < 32 * cell_width ? each : 32 * cell_width;
+}
+
+static size_t tab_at(const Interaction *input, double x)
+{
+    int each = tab_width(input->platform->width, input->tab_count, input->renderer->metrics.width);
+    return x < 0 || each <= 0 ? SIZE_MAX : (size_t)(x / each);
 }
 
 static bool mouse_cell(const Interaction *input, unsigned int *column, unsigned int *row)
@@ -5908,11 +5922,11 @@ static bool mouse_cell(const Interaction *input, unsigned int *column, unsigned 
     const TerminalScreen *screen = &terminal_buffer(input->terminal)->screen;
     Padding padding = input_padding(input);
     double x = input->platform->pointer_x - padding.horizontal;
-    double y = input->platform->pointer_y - padding.vertical;
+    double y = input->platform->pointer_y - input->bar - padding.vertical;
     if (x < 0 || y < 0 || x / metrics->width >= (double)screen->columns ||
         y / metrics->height >= (double)screen->rows ||
         x >= grid_extent(input->platform->width, padding.horizontal) ||
-        y >= grid_extent(input->platform->height, padding.vertical)) return false;
+        y >= grid_extent(input->platform->height - input->bar, padding.vertical)) return false;
     *column = (unsigned int)(x / metrics->width) + 1;
     *row = (unsigned int)(y / metrics->height) + 1;
     return true;
@@ -6073,7 +6087,7 @@ static SelectionPoint mouse_selection_point(const Interaction *input)
 {
     TerminalView view = terminal_view(input->terminal);
     return selection_point(&view, &input->renderer->metrics, input_padding(input),
-                           (int)input->platform->pointer_x, (int)input->platform->pointer_y);
+                           (int)input->platform->pointer_x, (int)input->platform->pointer_y - input->bar);
 }
 
 static void mouse_extend(Interaction *input)
@@ -6141,6 +6155,15 @@ static void pointer_button_event(void *data, uint32_t button, bool pressed, uint
     case BTN_MIDDLE: code = 1; break;
     case BTN_RIGHT: code = 2; break;
     default: return;
+    }
+    /* Left click switches to a tab and middle click closes it. */
+    if (input->bar > 0 && input->platform->pointer_y < input->bar && !terminal->selection.dragging) {
+        size_t index = tab_at(input, input->platform->pointer_x);
+        if (pressed && index < input->tab_count && code != 2) {
+            input->tab_action = code == 0 ? TAB_GOTO : TAB_CLOSE_AT;
+            input->tab_target = index;
+        }
+        return;
     }
     unsigned int bit = 1u << code;
     mouse_sync(input);
@@ -6238,7 +6261,7 @@ static int mouse_tick(Interaction *input, int64_t now)
     const FontMetrics *metrics = &input->renderer->metrics;
     int top = input_padding(input).vertical;
     int bottom = top + (int)terminal->primary.screen.rows * metrics->height;
-    double y = input->platform->pointer_y;
+    double y = input->platform->pointer_y - input->bar;
     bool up = y < top && terminal->history.offset < terminal->history.count;
     bool down = y >= bottom && terminal->history.offset > 0;
     if (!terminal->selection.dragging || terminal->using_alternate || (!up && !down) || now < 0) {
@@ -6518,7 +6541,7 @@ static void tab_remove(Tabs *tabs, size_t index)
 
 /* Open a shell in the active tab's directory, after the active tab. */
 static const char *tab_open(Tabs *tabs, const Interaction *input, const Config *config,
-                            const FontRenderer *renderer, int display_fd)
+                            const FontRenderer *renderer, int display_fd, int grid_height)
 {
     if (tabs->count == TAB_LIMIT) return "the window already has the maximum number of tabs";
     char directory[PATH_MAX];
@@ -6543,7 +6566,7 @@ static const char *tab_open(Tabs *tabs, const Interaction *input, const Config *
         if (terminal->history.lines == NULL) error = "could not allocate the scrollback ring";
         else terminal->history.capacity = (size_t)config->history_capacity;
     }
-    if (error == NULL && !terminal_resize_window(terminal, platform->width, platform->height,
+    if (error == NULL && !terminal_resize_window(terminal, platform->width, grid_height,
                                                  config->padding, &renderer->metrics))
         error = "could not allocate the screen buffers";
     /* A tab runs the shell, not the -e command, in the current directory. */
@@ -6554,7 +6577,7 @@ static const char *tab_open(Tabs *tabs, const Interaction *input, const Config *
     tab_config.options = &options;
     if (error == NULL) {
         error = session_open(session, session_size(&terminal->primary.screen, platform->width,
-                                                   platform->height, config->padding),
+                                                   grid_height, config->padding),
                              display_fd, &tab_config);
     }
     if (error == NULL) error = session_launch(session);
@@ -6587,6 +6610,75 @@ static void tab_reconfigure(Terminal *terminal, const Config *config)
     terminal_configure(terminal, config);
 }
 
+static int tab_bar_height(const FontRenderer *renderer, size_t count)
+{
+    return count > 1 ? renderer->metrics.height + 4 : 0;
+}
+
+/* Draw the tab bar in the top bar pixels: the active tab in the selection
+   colors, a tab that rang its bell in the cursor color, others in the
+   foreground color. */
+static void render_tabs(FontRenderer *renderer, const Tabs *tabs, const Config *config,
+                        int width, int height, int bar)
+{
+    glViewport(0, height - bar, width, bar);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, width, bar, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    const FontMetrics *metrics = &renderer->metrics;
+    int each = tab_width(width, tabs->count, metrics->width);
+    glBegin(GL_QUADS);
+    for (size_t i = 0; i < tabs->count; ++i) {
+        int x = (int)i * each;
+        if (i == tabs->active) {
+            render_color(config->selection_background);
+            render_rectangle(x, 0, each, bar);
+        } else if (i + 1 != tabs->active) {
+            render_color(config->palette[8]);
+            render_rectangle(x + each - 1, bar / 4, 1, bar / 2);
+        }
+    }
+    render_color(config->palette[8]);
+    render_rectangle(0, bar - 1, width, 1);
+    glEnd();
+
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glBindTexture(GL_TEXTURE_2D, renderer->atlas);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    int text_y = (bar - metrics->height) / 2;
+    for (size_t i = 0; i < tabs->count; ++i) {
+        const Tab *tab = &tabs->tabs[i];
+        const char *title = tab->terminal->dynamic_title[0] != 0 ? tab->terminal->dynamic_title
+                            : config->title != NULL ? config->title : default_title;
+        char label[TITLE_LIMIT + 8];
+        snprintf(label, sizeof label, "%zu %s", i + 1, title);
+        TerminalColor color = i == tabs->active ? config->selection_foreground
+                              : tab->bell ? config->cursor : config->foreground;
+        int x = (int)i * each + metrics->width, limit = (int)i * each + each - metrics->width;
+        /* Decode the UTF-8 label and stop with an ellipsis when it doesn't fit. */
+        for (const unsigned char *p = (const unsigned char *)label; *p != 0;) {
+            uint32_t cp = *p++;
+            int extra = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
+            if (extra) cp &= 0x3fu >> extra;
+            while (extra-- > 0 && (*p & 0xc0) == 0x80) cp = (cp << 6) | (*p++ & 0x3f);
+            if (x + 2 * metrics->width > limit && *p != 0) {
+                render_glyph(renderer, 0x2026, 1, 0, false, color, x, text_y);
+                break;
+            }
+            if (x + metrics->width > limit) break;
+            if (cp != ' ') render_glyph(renderer, cp, 1, 0, false, color, x, text_y);
+            x += metrics->width;
+        }
+    }
+    glyph_flush(renderer);
+    glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+}
+
 /* Point input at the active tab. Return true when it changed. */
 static bool tab_select(Tabs *tabs, Interaction *input, Clipboard *clipboard, bool focused)
 {
@@ -6617,6 +6709,7 @@ static const char *run_loop(Platform *platform, Tabs *tabs, Config *config, Font
     bool redraw = true;
     bool focused = false;
     int64_t link_deadline = 0, zoom_deadline = 0, sync_since = 0;
+    int bar = 0;
     CursorBlink blink = {0};
     Bell bell = {0};
     Interaction input = {.platform = platform, .terminal = terminal, .session = session,
@@ -6646,10 +6739,15 @@ static const char *run_loop(Platform *platform, Tabs *tabs, Config *config, Font
         if (input.tab_action != TAB_NONE) {
             int action = input.tab_action;
             input.tab_action = TAB_NONE;
-            if (action != TAB_CLOSE && focused && terminal->focus_reporting && !tab->closed)
+            /* Tell the program in a tab it loses focus only when another tab
+               becomes active. tab_select reports focus to the new one. */
+            bool switching = action == TAB_NEW || ((action == TAB_NEXT || action == TAB_PREVIOUS) && tabs->count > 1) ||
+                             (action == TAB_GOTO && input.tab_target < tabs->count && input.tab_target != tabs->active);
+            if (switching && focused && terminal->focus_reporting && !tab->closed)
                 terminal_reply(terminal, "\033[O");
             if (action == TAB_NEW) {
-                const char *error = tab_open(tabs, &input, config, renderer, display_fd);
+                const char *error = tab_open(tabs, &input, config, renderer, display_fd,
+                                             height - tab_bar_height(renderer, tabs->count + 1));
                 if (error != NULL) fprintf(stderr, "deal: could not open a tab: %s\n", error);
             } else if (action == TAB_CLOSE) {
                 tab_remove(tabs, tabs->active);
@@ -6660,6 +6758,9 @@ static const char *run_loop(Platform *platform, Tabs *tabs, Config *config, Font
                 tabs->active = (tabs->active + tabs->count - 1) % tabs->count;
             } else if (action == TAB_GOTO && input.tab_target < tabs->count) {
                 tabs->active = input.tab_target;
+            } else if (action == TAB_CLOSE_AT && input.tab_target < tabs->count) {
+                tab_remove(tabs, input.tab_target);
+                if (tabs->count == 0) return NULL;
             }
         }
         if (tab_select(tabs, &input, clipboard, focused)) {
@@ -6698,23 +6799,22 @@ static const char *run_loop(Platform *platform, Tabs *tabs, Config *config, Font
         if (resized) {
             width = platform->width;
             height = platform->height;
-            if (!reloaded && !zoomed && !terminal_resize_window(terminal, width, height, config->padding,
-                                                                &renderer->metrics))
-                return "could not resize the screen buffers";
             wl_egl_window_resize(platform->window, width, height, 0, 0);
         }
-        if (resized || reloaded || zoomed) {
+        /* The bar appears with the second tab and takes rows from every grid. */
+        int previous_bar = bar;
+        bar = tab_bar_height(renderer, tabs->count);
+        input.bar = bar;
+        if (resized || reloaded || zoomed || bar != previous_bar) {
             redraw = true;
             for (size_t i = 0; i < tabs->count; ++i) {
                 Tab *other = &tabs->tabs[i];
-                if (i != tabs->active) {
-                    if (reloaded) tab_reconfigure(other->terminal, config);
-                    if (!terminal_resize_window(other->terminal, width, height, config->padding, &renderer->metrics))
-                        return "could not resize the screen buffers";
-                }
+                if (reloaded && i != tabs->active) tab_reconfigure(other->terminal, config);
+                if (!terminal_resize_window(other->terminal, width, height - bar, config->padding, &renderer->metrics))
+                    return "could not resize the screen buffers";
                 if (other->closed) continue;
                 PtyResult result = session_resize(other->session, session_size(&other->terminal->primary.screen,
-                                                                              width, height, config->padding));
+                                                                              width, height - bar, config->padding));
                 if (result == PTY_FAILED) return "could not resize the pseudoterminal";
                 if (result == PTY_CLOSED) other->hangup = true;
             }
@@ -6727,10 +6827,15 @@ static const char *run_loop(Platform *platform, Tabs *tabs, Config *config, Font
         for (size_t i = 0; i < tabs->count; ++i) {
             Tab *other = &tabs->tabs[i];
             clipboard_remote_write(clipboard, platform, other->terminal);
-            /* Step 2 shows this on the tab bar. */
-            if (i != tabs->active && other->terminal->bell_pending) {
+            if (i == tabs->active) continue;
+            if (other->terminal->bell_pending) {
+                redraw |= !other->bell;
                 other->bell = true;
                 other->terminal->bell_pending = false;
+            }
+            if (other->terminal->title_dirty) {
+                other->terminal->title_dirty = false;
+                redraw = true;
             }
         }
         int64_t now = monotonic_milliseconds();
@@ -6767,10 +6872,11 @@ static const char *run_loop(Platform *platform, Tabs *tabs, Config *config, Font
         /* Answer a new size at once, so the compositor's border doesn't run
            ahead of the content during an interactive resize. */
         if (redraw && !hold && (platform->frame == NULL || resized)) {
-            render_screen(renderer, &view, width, height, buffer->cursor.column, buffer->cursor.row,
+            render_screen(renderer, &view, width, height - bar, buffer->cursor.column, buffer->cursor.row,
                           buffer->cursor_visible && blink.visible, buffer->cursor_style, config,
                           config->opacity);
-            if (bell.flash_end) render_bell(width, height, config->cursor);
+            if (bell.flash_end) render_bell(width, height - bar, config->cursor);
+            if (bar > 0) render_tabs(renderer, tabs, config, width, height, bar);
             const char *error = platform_swap(platform);
             if (error != NULL) return error;
             redraw = false;

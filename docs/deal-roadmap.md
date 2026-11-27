@@ -221,7 +221,7 @@ Goal: under 1% idle CPU with blink off (already zero frames when idle), and thro
 
 ---
 
-## 0.13.0: Tabs (step 1 done, step 2 next)
+## 0.13.0: Tabs (both steps done in 0.13.0 and 0.13.1)
 
 Requested ahead of optimization. Built in two steps, each tested on its own.
 
@@ -271,6 +271,6 @@ Release work:
 | Deferred | Scrollback search and prompt marks | Skipped for now |
 | (Phase 1.4) | deal becomes the default, foot removed | Planned |
 | 0.12.0 | Palette from desk, OSC color queries | Code done, checklist pending |
-| 0.13.0 | Tabs | Step 1 code done, tab bar next |
+| 0.13.0 / 0.13.1 | Tabs, tab bar | Tabs verified, tab bar checklist pending |
 | 0.14.0 | Renderer, damage and parser optimization | After Phase 3 |
 | 1.0.0 | vttest, fuzzing, terminfo, docs | Final |
