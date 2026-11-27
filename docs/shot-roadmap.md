@@ -161,7 +161,7 @@ Manual checks: a partially covered window comes out whole; floating and fullscre
 
 ## 0.5: Config, key bindings and default directory
 
-The config file, its parser and the `~/Pictures/Screenshots` default landed early, in 0.2: shot writes the sample `shot.conf` when the user's file is missing. Shared `desktop.conf` precedence still waits for Phase 3 step 3. What's left here is the dwl bindings and install.
+The config file, its parser and the `~/Pictures/Screenshots` default landed early, in 0.2: shot writes the sample `shot.conf` when the user's file is missing. Shared `desktop.conf` precedence still waits for Phase 3 step 3. What's left here is the dwl binding and install.
 
 - Config through desk's INI parser (Phase 3 step 2 must exist by now, or shot adds it). Precedence: command line, `~/.config/shot/shot.conf`, `~/.config/desktop/desktop.conf`, built-in defaults.
 
@@ -182,12 +182,11 @@ The config file, its parser and the `~/Pictures/Screenshots` default landed earl
   ```
 
 - The default directory is created with `mkdir -p` semantics on first use. `XDG_PICTURES_DIR` from `user-dirs.dirs` replaces `~/Pictures` when it's set.
-- dwl bindings in `config.def.h`:
+- dwl binding in `config.def.h`:
 
   | Key | Command |
   |---|---|
-  | Print | `shot -r` (region) |
-  | Shift+Print | `shot` (focused monitor) |
+  | Super+Shift+S | `shot -r`: drag a region, save it to `~/Pictures/Screenshots` and copy it (`clipboard = true` is the default) |
 
 - `make install` installs `shot` and a sample `shot.conf`, following bar's `PREFIX`/`BINDIR`/`DESTDIR` conventions. Add `!/shot/shot.conf` and `/shot/shot` to `.gitignore`.
 
@@ -218,5 +217,5 @@ Manual checks: each binding saves into `~/Pictures/Screenshots` with the configu
 | 0.2 | Region: freeze, layer-shell overlay, crop. Config file (pulled forward from 0.5) | Done (cancel, edge and scale checks pending) |
 | 0.3 | Clipboard through `ext-data-control-v1`, background server | Done |
 | 0.4 | Focused window: dwl IPC identifier, toplevel capture source | Skipped (needs a dwl change) |
-| 0.5 | Print bindings in dwl, install the sample config | Planned (config itself landed in 0.2) |
+| 0.5 | Print bindings in dwl, install the sample config | Binding added (Super+Shift+S), pending a dwl restart |
 | 1.0 | Checklists, exit codes, README | Final |

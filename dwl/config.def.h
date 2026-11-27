@@ -122,11 +122,13 @@ static const enum libinput_config_tap_button_map button_map = LIBINPUT_CONFIG_TA
 /* commands */
 static const char *termcmd[] = { "deal", NULL };
 static const char *menucmd[] = { "run", NULL };
+static const char *shotcmd[] = { "shot", "-r", NULL };
 
 static const Key keys[] = {
 	/* modifier                  key                  function          argument */
 	{ WLR_MODIFIER_LOGO,         XKB_KEY_d,           spawn,            {.v = menucmd} },
 	{ WLR_MODIFIER_LOGO,         XKB_KEY_w,           spawnwallbrowser, {0} },
+	{ WLR_MODIFIER_LOGO|WLR_MODIFIER_SHIFT, XKB_KEY_s,  spawn,            {.v = shotcmd} },
 	{ MODKEY,                    XKB_KEY_p,           spawn,            {.v = menucmd} },
 	{ WLR_MODIFIER_LOGO,         XKB_KEY_Return,      spawn,            {.v = termcmd} },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Return,      spawn,            {.v = termcmd} },

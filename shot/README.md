@@ -1,6 +1,6 @@
 # shot
 
-`shot` takes screenshots on dwl. Version 0.3 captures a whole output or a dragged region to a PNG file, the clipboard, or both. Key bindings follow in the milestones in [docs/shot-roadmap.md](../docs/shot-roadmap.md).
+`shot` takes screenshots on dwl. Version 0.3 captures a whole output or a dragged region to a PNG file, the clipboard, or both. dwl binds Super+Shift+S to `shot -r`, which saves the region and copies it. What's left is in [docs/shot-roadmap.md](../docs/shot-roadmap.md).
 
 It uses `ext-image-copy-capture-v1` with `ext-output-image-capture-source-v1`, dwl IPC to find the focused monitor, and a `wlr-layer-shell` overlay with `wp-viewporter` and `cursor-shape-v1` for region selection, and `ext-data-control-v1` for the clipboard. It's built on [desk](../desk/README.md): atomic file writes, shm buffers, config paths and the INI parser.
 
@@ -60,7 +60,7 @@ shot reads `~/.config/shot/shot.conf` (or `$XDG_CONFIG_HOME/shot/shot.conf`). Wh
 |---|---|---|---|
 | `[save]` | `directory` | `~/Pictures/Screenshots` | Where captures go without a `FILE`. A leading `~/` means `HOME`. |
 | | `name` | `%Y-%m-%d_%H-%M-%S.png` | `strftime` format. No `/`. |
-| | `clipboard` | `false` | Also copy every saved capture to the clipboard. |
+| | `clipboard` | `true` | Also copy every saved capture to the clipboard. |
 | `[capture]` | `cursor` | `false` | Always paint the cursor. `-c` does it for one capture. |
 | `[png]` | `compression` | `6` | zlib level 0–9. |
 | `[region]` | `dim` | `0.5` | Darkening outside the selection, 0–1. |
@@ -87,6 +87,7 @@ shot reads `~/.config/shot/shot.conf` (or `$XDG_CONFIG_HOME/shot/shot.conf`). Wh
 - [x] The background process has its own session, no terminal, stdio on `/dev/null`, cwd `/`, and exits when a new `shot -C` takes the clipboard
 - [x] `[save] clipboard = true` copies every saved capture
 - [x] Paste a `shot -r -C` capture into an application that accepts images
+- [ ] Super+Shift+S (after a dwl restart) saves a region to `~/Pictures/Screenshots` and copies it
 - [ ] Copying text elsewhere makes the background process exit
 - [ ] `shot -r`: Escape, right-click and a plain click each cancel with status 1 and save nothing
 - [ ] `shot -r`: dragging past the output's edge stops at the edge
