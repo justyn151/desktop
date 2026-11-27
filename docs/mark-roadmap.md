@@ -73,7 +73,7 @@ Text width is `min(terminal width, [layout] width)`, 80 by default, so long line
 | Block quote | A `│` bar in muted color per level, text italic |
 | Lists | `•` `◦` `▪` by depth; ordered lists keep their numbers, right-aligned to the widest |
 | Task list | `☐` / `☑`, checked items muted and struck through |
-| Fenced or indented code | Shaded block the full text width, no wrapping (long lines cut with `…`, scroll right with `→`), language name top-right in muted text |
+| Fenced or indented code | Shaded band the full text width, two columns of padding on each side and a shaded row above and below. Long lines wrap: at the last space, else at the cell, continuing under the line's indentation. No language label |
 | Table | Box drawing in the border color, header bold, columns aligned as written (`:--`, `:-:`, `--:`) |
 | Thematic break | `─` across the text width, muted |
 | HTML block or inline HTML | Shown as-is in muted color. No HTML rendering |
@@ -127,6 +127,7 @@ No argument with stdin on a terminal prints usage and exits 2. A file that can't
 - Inline rendering walks the tree without recursion, since emphasis and image alt text can nest as deep as a line is long. Block nesting stops at 32 levels, as planned.
 - Until 0.5 brings the palette, colors are ANSI indices: accent 4, inline code 3, muted 8, code shading 0. deal derives all sixteen from the wallpaper (8 is the muted role, 0 the background lifted a little), so in deal they follow it already. The underline color is sent as `58:5:N` and underline styles as `4:2`, colon forms that terminals without them read as one unknown parameter.
 - Code blocks have no padding rows. The language label sits on a shaded row of its own above the code, and only when there is one. So the plain text and the styled text are the same lines, apart from the spaces that fill shaded code lines in styled output.
+- Changed after 0.2: the label is gone, the band has a shaded row above and below and two columns of padding on the right as well as the left, and long code lines wrap instead of being cut with `…`. Plain output has no padding rows, so it still matches the styled text line for line apart from those two rows.
 - Piped output keeps its escapes; only `--plain` removes them. That's what makes `mark file | cat` show links, as the "What deal gives it" table says.
 - desk isn't linked yet: 0.1 uses nothing from it. It joins in 0.5 with the config file, palette and file watch.
 - `-v` works as well as `--version`, like view.
@@ -142,11 +143,11 @@ No argument with stdin on a terminal prints usage and exits 2. A file that can't
 
 ## 0.2: GitHub extensions
 
-- **Tables:** parse the delimiter row and alignment, cell inlines, escaped pipes (`\|`). Column widths are the widest cell; when the table is wider than the text width, shrink the widest columns first and wrap their cells inside the box. Tables wider than the screen even after shrinking (many narrow columns) keep a minimum of 6 cells per column and scroll sideways like code blocks.
+- **Tables:** parse the delimiter row and alignment, cell inlines, escaped pipes (`\|`). Column widths are the widest cell; when the table is wider than the text width, shrink the widest columns first and wrap their cells inside the box. Tables wider than the screen even after shrinking (many narrow columns) keep a minimum of 6 cells per column and scroll sideways in the pager.
 - **Strikethrough:** `~~text~~` (and single `~`, as GitHub accepts it).
 - **Task lists:** `- [ ]` and `- [x]` at the start of a list item.
 - **Extended autolinks:** bare `https://`, `http://` and `www.` URLs and email addresses, with GitHub's trailing punctuation rules.
-- **Fenced code info strings:** the first word is shown as the language label.
+- **Fenced code info strings:** the first word was shown as a language label; dropped after 0.2 as noise. It returns only as the key for syntax highlighting, if that lands.
 
 ### As built
 
@@ -179,7 +180,7 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 | Space / PageDown / `f`, `b` / PageUp | Scroll one screen |
 | `d`, `u` | Scroll half a screen |
 | `g` / Home, Shift+`g` / End | Top, bottom |
-| `→` / `l`, `←` / `h` | Scroll a code block or table that is wider than the screen (the one at the top of the screen) |
+| `→` / `l`, `←` / `h` | Scroll a table that is wider than the screen (the one at the top of the screen); code wraps instead |
 | Mouse wheel | Scroll three lines per notch |
 | `q`, Escape, Ctrl+C | Quit |
 | `r`, Ctrl+L | Redraw |
@@ -244,7 +245,6 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
   [layout]
   width = 80                      ; maximum text width; 0 = the terminal's
   margin = 2                      ; blank columns on the left
-  code_wrap = false               ; wrap code blocks instead of scrolling them
 
   [colors]
   source = palette                ; palette | ansi

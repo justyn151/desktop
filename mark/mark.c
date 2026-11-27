@@ -2584,8 +2584,9 @@ static void emit_line(struct layout *L, const struct glyph *glyphs, size_t count
         p->used = true;
     }
     for (size_t i = 0; i < count; ++i) push_glyph(&line, glyphs[i]);
-    /* Blank lines don't keep trailing prefix spaces. */
-    if (count == 0) {
+    /* Blank lines don't keep trailing prefix spaces, unless they're padded
+       (a code block's shaded rows). */
+    if (count == 0 && pad_to == 0) {
         while (line.count > 0 && pg->text.data[line.items[line.count - 1].offset] == ' ' &&
                line.items[line.count - 1].length == 1) {
             --line.count;
@@ -2869,6 +2870,10 @@ static void cut_line(struct layout *L, struct glyphs *g, size_t from, int max, s
     push_string(L, g, "…", ellipsis);
 }
 
+/* Code sits on a shaded band with two columns of padding on each side and
+   a shaded row above and below. Lines too long for the band wrap: at the
+   last space when there is one, otherwise at the cell, and the rest
+   continues under the line's own indentation. */
 static void layout_code(struct layout *L, const struct block *b)
 {
     struct page *pg = L->page;
@@ -2877,43 +2882,56 @@ static void layout_code(struct layout *L, const struct block *b)
     code.attr &= (uint8_t)~ATTR_ITALIC;
     code.bg = COLOR_SHADE;
     uint16_t code_style = intern_style(pg, code);
-    struct style muted = with_color(code, COLOR_MUTED);
     bool shade = L->opt->styled && L->opt->color;
     int pad = shade ? avail : 0;
+    int inner = avail - (shade ? 4 : 2);
+    if (inner < 1) inner = 1;
 
-    if (b->info && b->info[0]) {
-        size_t word = strcspn(b->info, " \t");
-        char *label = strndup(b->info, word);
-        if (!label) out_of_memory();
-        L->tmp.count = 0;
-        struct glyphs name = {0};
-        push_string(L, &name, label, muted);
-        int name_width = 0;
-        for (size_t i = 0; i < name.count; ++i) name_width += name.items[i].width;
-        for (int i = 0; i < avail - name_width - 1; ++i) push_text(pg, &L->tmp, " ", 1, code_style, -1, NULL);
-        for (size_t i = 0; i < name.count; ++i) push_glyph(&L->tmp, name.items[i]);
-        free(name.items);
-        free(label);
-        cut_line(L, &L->tmp, 0, avail, muted);
-        emit_line(L, L->tmp.items, L->tmp.count, pad, code_style);
-    }
+    if (shade) emit_line(L, NULL, 0, pad, code_style);
     const char *s = b->content.data ? b->content.data : "";
     size_t n = b->content.len;
-    if (n == 0) {
-        emit_line(L, NULL, 0, pad, code_style);
-        return;
-    }
+    struct glyphs out = {0};
     for (size_t start = 0; start < n;) {
         const char *newline = memchr(s + start, '\n', n - start);
         size_t end = newline ? (size_t)(newline - s) : n;
         L->tmp.count = 0;
-        push_text(pg, &L->tmp, "  ", 2, code_style, -1, NULL);
         int column = 0;
         push_text(pg, &L->tmp, s + start, end - start, code_style, -1, &column);
-        cut_line(L, &L->tmp, 0, avail - 1, muted);
-        emit_line(L, L->tmp.items, L->tmp.count, pad, code_style);
+        const struct glyph *g = L->tmp.items;
+        size_t count = L->tmp.count;
+        size_t lead = 0;
+        int indent = 0;
+        while (lead < count && is_space_glyph(pg, &g[lead])) indent += g[lead++].width;
+        if (indent > inner / 2) indent = 0;
+        size_t pos = 0;
+        do {
+            bool first = pos == 0;
+            int room = inner - (first ? 0 : indent);
+            size_t stop = pos;
+            int width = 0;
+            while (stop < count && (width + g[stop].width <= room || stop == pos)) width += g[stop++].width;
+            /* Combining marks stay with their base. */
+            while (stop < count && g[stop].width == 0) ++stop;
+            if (stop < count) {
+                size_t space = stop;
+                while (space > pos + 1 && space > lead && !is_space_glyph(pg, &g[space - 1])) --space;
+                if (space > pos + 1 && space > lead && is_space_glyph(pg, &g[space - 1])) stop = space;
+            }
+            out.count = 0;
+            push_text(pg, &out, "  ", 2, code_style, -1, NULL);
+            for (int i = 0; !first && i < indent; ++i) push_text(pg, &out, " ", 1, code_style, -1, NULL);
+            size_t shown = stop;
+            while (stop < count && shown > pos && is_space_glyph(pg, &g[shown - 1])) --shown;
+            for (size_t i = pos; i < shown; ++i) push_glyph(&out, g[i]);
+            emit_line(L, out.items, out.count, pad, code_style);
+            pos = stop;
+            while (pos < count && is_space_glyph(pg, &g[pos])) ++pos;
+        } while (pos < count);
         start = end + 1;
     }
+    free(out.items);
+    if (n == 0 && !shade) emit_line(L, NULL, 0, 0, 0);
+    if (shade) emit_line(L, NULL, 0, pad, code_style);
 }
 
 static void layout_html(struct layout *L, const struct block *b)

@@ -46,7 +46,7 @@ mark prints the document and exits. The output keeps its escape sequences when p
 | `![alt](src)` | `[image: alt]` in muted italics, linked to the image |
 | `> quote` | A muted `│` bar per level, text in italics |
 | Lists | `•` `◦` `▪` by depth; ordered lists keep their numbers, right-aligned |
-| Code blocks | Indented two columns on a shaded band the width of the text; the language, when given, top right. Long lines are cut with `…`. Tabs expand to 4 columns |
+| Code blocks | A shaded band the width of the text, with two columns of padding on each side and a shaded row above and below. Long lines wrap at the last space (or at the cell) and continue under their indentation. Tabs expand to 4 columns |
 | `---` | A muted rule across the text width |
 | Tables | Box drawn in a muted color, header bold, columns aligned as the delimiter row says (`:--`, `:-:`, `--:`) |
 | `~~struck~~` | Strikethrough (one or two tildes) |

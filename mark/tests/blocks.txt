@@ -31,12 +31,12 @@ has something to do with it.
 
 ────────────────────────────────────────────────────────────────────────────────
 
-                                                                             sh
   echo "fenced"   # with a tab
 
   indented code
 
-  a line that is far too long to fit inside the text width, so it gets cut wit…
+  a line that is far too long to fit inside the text width, so it gets cut with
+  an ellipsis at the end
 
 <div>
   raw HTML block
