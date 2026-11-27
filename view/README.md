@@ -59,12 +59,12 @@ Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 si
 
 Checked offline by calling the renderer directly: 100% and fit are pixel-exact, 800% draws exact squares, four rotations and two flips return the original, and panning (which only renders the strip that scrolls in) matches a full redraw at 37%, 50%, 100%, 170% and 600%. On a 50 MP image a pan step takes about 1 ms and a zoom change about 30 ms.
 
-- [ ] Scrolling zooms around the pointer, and the point under it stays still.
-- [ ] Keys: zoom, `0`, `1`, pan, Shift+pan to the edge, `r`/`R`/`f`/`F`, and repeat while held.
-- [ ] Dragging pans, with a grabbing cursor.
-- [ ] A one-pixel checker at 100% shows no blur, and at 800% shows sharp squares.
-- [ ] A large photo at fit shows no shimmer on fine detail.
-- [ ] `r` on a landscape photo refits it as portrait.
+- [x] Scrolling zooms around the pointer, and the point under it stays still.
+- [x] Keys: zoom, `0`, `1`, pan, Shift+pan to the edge, `r`/`R`/`f`/`F`, and repeat while held.
+- [x] Dragging pans, with a grabbing cursor.
+- [x] A one-pixel checker at 100% shows no blur, and at 800% shows sharp squares.
+- [x] A large photo at fit shows no shimmer on fine detail.
+- [x] `r` on a landscape photo refits it as portrait.
 
 ## Manual checks (0.1)
 
