@@ -62,7 +62,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.13.1";
+static const char deal_version[] = "0.13.2";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -5903,17 +5903,28 @@ static Padding input_padding(const Interaction *input)
                         &input->renderer->metrics, &terminal_buffer(input->terminal)->screen);
 }
 
-/* Tabs share the bar equally, up to 32 cells each. */
-static int tab_width(int width, size_t count, int cell_width)
+/* Tabs split the whole bar equally. Tab i spans [tab_edge(i), tab_edge(i + 1)). */
+static int tab_edge(int width, size_t count, size_t index)
 {
-    int each = count != 0 ? width / (int)count : width;
-    return each < 32 * cell_width ? each : 32 * cell_width;
+    return count != 0 ? (int)((int64_t)width * (int64_t)index / (int64_t)count) : 0;
 }
 
-static size_t tab_at(const Interaction *input, double x)
+/* The close button fills the last two cells of a tab at least four cells wide. */
+static bool tab_close_hit(int left, int right, int cell_width, double x)
 {
-    int each = tab_width(input->platform->width, input->tab_count, input->renderer->metrics.width);
-    return x < 0 || each <= 0 ? SIZE_MAX : (size_t)(x / each);
+    return right - left >= 4 * cell_width && x >= right - 2 * cell_width;
+}
+
+static size_t tab_at(const Interaction *input, double x, bool *close)
+{
+    int width = input->platform->width;
+    size_t count = input->tab_count;
+    if (x < 0 || x >= width || count == 0) return SIZE_MAX;
+    size_t index = (size_t)(x * (double)count / width);
+    if (index >= count) index = count - 1;
+    *close = tab_close_hit(tab_edge(width, count, index), tab_edge(width, count, index + 1),
+                           input->renderer->metrics.width, x);
+    return index;
 }
 
 static bool mouse_cell(const Interaction *input, unsigned int *column, unsigned int *row)
@@ -6156,11 +6167,13 @@ static void pointer_button_event(void *data, uint32_t button, bool pressed, uint
     case BTN_RIGHT: code = 2; break;
     default: return;
     }
-    /* Left click switches to a tab and middle click closes it. */
+    /* Left click switches to a tab or presses its close button, and middle
+       click closes it. */
     if (input->bar > 0 && input->platform->pointer_y < input->bar && !terminal->selection.dragging) {
-        size_t index = tab_at(input, input->platform->pointer_x);
+        bool close = false;
+        size_t index = tab_at(input, input->platform->pointer_x, &close);
         if (pressed && index < input->tab_count && code != 2) {
-            input->tab_action = code == 0 ? TAB_GOTO : TAB_CLOSE_AT;
+            input->tab_action = code == 1 || close ? TAB_CLOSE_AT : TAB_GOTO;
             input->tab_target = index;
         }
         return;
@@ -6628,16 +6641,15 @@ static void render_tabs(FontRenderer *renderer, const Tabs *tabs, const Config *
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     const FontMetrics *metrics = &renderer->metrics;
-    int each = tab_width(width, tabs->count, metrics->width);
     glBegin(GL_QUADS);
     for (size_t i = 0; i < tabs->count; ++i) {
-        int x = (int)i * each;
+        int left = tab_edge(width, tabs->count, i), right = tab_edge(width, tabs->count, i + 1);
         if (i == tabs->active) {
             render_color(config->selection_background);
-            render_rectangle(x, 0, each, bar);
-        } else if (i + 1 != tabs->active) {
+            render_rectangle(left, 0, right - left, bar);
+        } else if (i + 1 != tabs->active && i + 1 != tabs->count) {
             render_color(config->palette[8]);
-            render_rectangle(x + each - 1, bar / 4, 1, bar / 2);
+            render_rectangle(right - 1, bar / 4, 1, bar / 2);
         }
     }
     render_color(config->palette[8]);
@@ -6658,7 +6670,13 @@ static void render_tabs(FontRenderer *renderer, const Tabs *tabs, const Config *
         snprintf(label, sizeof label, "%zu %s", i + 1, title);
         TerminalColor color = i == tabs->active ? config->selection_foreground
                               : tab->bell ? config->cursor : config->foreground;
-        int x = (int)i * each + metrics->width, limit = (int)i * each + each - metrics->width;
+        int left = tab_edge(width, tabs->count, i), right = tab_edge(width, tabs->count, i + 1);
+        /* The title stops a cell before the close button. */
+        int x = left + metrics->width, limit = right - 3 * metrics->width;
+        if (right - left >= 4 * metrics->width) {
+            TerminalColor button = i == tabs->active ? config->selection_foreground : config->palette[8];
+            render_glyph(renderer, 0x00d7, 1, 0, false, button, right - 2 * metrics->width, text_y);
+        }
         /* Decode the UTF-8 label and stop with an ellipsis when it doesn't fit. */
         for (const unsigned char *p = (const unsigned char *)label; *p != 0;) {
             uint32_t cp = *p++;
