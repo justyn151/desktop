@@ -1,8 +1,8 @@
-# deal 0.12.0
+# deal 0.12.1
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.12.1 gives explicit backgrounds that match the default background the window's opacity. Version 0.12.0 takes its colors from the wallpaper and answers OSC 4 color queries. Version 0.11.2 kept the window margins even and answers resizes without waiting for the next frame. Version 0.11.1 added OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 

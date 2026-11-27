@@ -62,7 +62,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.12.0";
+static const char deal_version[] = "0.12.1";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -1826,8 +1826,12 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
             bool selected = column >= selected_first && column < selected_end;
             TerminalColor bg = selected ? config->selection_background : cell_color(config, cell->background_source, cell->background);
             if (under_block) bg = config->cursor;
+            /* With opacity, colored backgrounds stay opaque so highlights remain
+               readable. A background that only repeats the default color, as
+               TUIs that paint every cell do, shares the window's opacity. */
             bool solid = opacity < 1.0f
-                ? selected || under_block || cell->background_source != SOURCE_BG
+                ? selected || under_block ||
+                  (cell->background_source != SOURCE_BG && !color_equal(bg, background))
                 : !color_equal(bg, background);
             if (solid != solid_run || (solid && !color_equal(bg, run))) {
                 if (solid_run) {
