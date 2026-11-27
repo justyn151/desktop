@@ -12,6 +12,7 @@
 #include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 /* Palette */
@@ -440,6 +441,73 @@ bool desk_parse_bool(const char *text, bool *value)
 bool desk_parse_rgb(const char *text, uint32_t *rgb)
 {
     return parse_rgb(text, rgb);
+}
+
+/* Key repeat */
+
+static void repeat_arm(DeskRepeat *repeat, long first_ms, long interval_ms)
+{
+    struct itimerspec spec = {
+        .it_value = {first_ms / 1000, first_ms % 1000 * 1000000L},
+        .it_interval = {interval_ms / 1000, interval_ms % 1000 * 1000000L},
+    };
+    if (repeat->fd >= 0)
+        timerfd_settime(repeat->fd, 0, &spec, NULL);
+}
+
+int desk_repeat_open(DeskRepeat *repeat)
+{
+    *repeat = (DeskRepeat){ .fd = -1, .rate = 25, .delay = 600 };
+    repeat->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    return repeat->fd < 0 ? errno : 0;
+}
+
+void desk_repeat_info(DeskRepeat *repeat, int32_t rate, int32_t delay)
+{
+    repeat->rate = rate > 0 ? rate : 0;
+    repeat->delay = delay > 0 ? delay : 0;
+    if (!repeat->rate)
+        desk_repeat_cancel(repeat);
+}
+
+void desk_repeat_start(DeskRepeat *repeat, uint32_t key)
+{
+    if (!repeat->rate) {
+        desk_repeat_cancel(repeat);
+        return;
+    }
+    repeat->key = key;
+    repeat->active = true;
+    long interval = 1000 / repeat->rate;
+    /* A zero it_value would disarm the timer. */
+    repeat_arm(repeat, repeat->delay > 0 ? repeat->delay : 1, interval > 0 ? interval : 1);
+}
+
+void desk_repeat_release(DeskRepeat *repeat, uint32_t key)
+{
+    if (repeat->active && repeat->key == key)
+        desk_repeat_cancel(repeat);
+}
+
+void desk_repeat_cancel(DeskRepeat *repeat)
+{
+    repeat->active = false;
+    repeat_arm(repeat, 0, 0);
+}
+
+unsigned desk_repeat_fired(DeskRepeat *repeat)
+{
+    uint64_t count = 0;
+    if (repeat->fd < 0 || read(repeat->fd, &count, sizeof count) != sizeof count || !repeat->active)
+        return 0;
+    return count > UINT32_MAX ? UINT32_MAX : (unsigned)count;
+}
+
+void desk_repeat_close(DeskRepeat *repeat)
+{
+    if (repeat->fd >= 0)
+        close(repeat->fd);
+    *repeat = (DeskRepeat){ .fd = -1 };
 }
 
 #ifdef DESK_WAYLAND

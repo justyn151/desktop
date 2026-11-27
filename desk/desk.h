@@ -126,6 +126,39 @@ bool desk_parse_bool(const char *text, bool *value);
 /* Parse #RRGGBB into 0xRRGGBB. */
 bool desk_parse_rgb(const char *text, uint32_t *rgb);
 
+/* Key repeat */
+
+/* A timerfd that fires while a key is held, at the compositor's repeat rate.
+   It knows nothing about keymaps: the caller decides which keys repeat. */
+typedef struct {
+    int fd;         /* Poll for POLLIN. -1 when unavailable. */
+    uint32_t key;   /* The held key, valid while active. */
+    bool active;
+    int32_t rate;   /* Repeats per second; 0 disables repeat. */
+    int32_t delay;  /* Milliseconds before the first repeat. */
+} DeskRepeat;
+
+/* Create the timer with 25 per second after 600 ms until desk_repeat_info.
+   Return 0 or an errno value. */
+int desk_repeat_open(DeskRepeat *repeat);
+
+/* Store wl_keyboard.repeat_info. */
+void desk_repeat_info(DeskRepeat *repeat, int32_t rate, int32_t delay);
+
+/* Start repeating key after the delay, replacing any held key. */
+void desk_repeat_start(DeskRepeat *repeat, uint32_t key);
+
+/* Stop if key is the one repeating. */
+void desk_repeat_release(DeskRepeat *repeat, uint32_t key);
+
+/* Stop whatever is repeating, such as on keyboard focus loss. */
+void desk_repeat_cancel(DeskRepeat *repeat);
+
+/* After POLLIN: drain the timer and return how many repeats are due. */
+unsigned desk_repeat_fired(DeskRepeat *repeat);
+
+void desk_repeat_close(DeskRepeat *repeat);
+
 #ifdef DESK_WAYLAND
 /* Layer 1: needs wayland-client. */
 #include <wayland-client.h>

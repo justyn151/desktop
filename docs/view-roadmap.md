@@ -114,6 +114,16 @@ Rotation and flips are view-only and never written to the file.
 - Title shows the zoom: `<basename> — W×H — 50%`.
 - Performance: render only the visible rectangle. A 50 MP photo at 100% must pan at the frame rate on this laptop. If area averaging is too slow when zoom changes, build a mip chain (halved copies) once at load and sample the nearest larger level.
 
+### As built
+
+- Rotation and flips are applied to the pixels (a tiled copy for rotation, in place for flips), not kept as a `wl_output_transform` for the sampler. Everything after works on an upright image, and the mip levels are rebuilt. On 50 MP that takes about 0.25 s, which is fine for a key press.
+- Mip levels are built once at load: each halves the last by 2×2 averaging. Shrinking picks the level just above the zoom and area-averages from it, at most 3×3 source pixels per screen pixel.
+- The last frame is kept. When only the position changed, it's shifted and only the strip that scrolled in is rendered, so panning costs about 1 ms on 50 MP at any zoom. A zoom change redraws the window in about 30 ms. The offline test checks that a shifted frame matches a full redraw exactly.
+- Panning doesn't clear fit: while fitted, the image is never larger than the window, so there's nothing to pan.
+- Zoom steps stop at 100% when they cross it, so `+` and `-` from fit can always reach a pixel-exact view.
+- Key repeat went into desk as `DeskRepeat`, a timerfd with no xkbcommon dependency, so it's Layer 0. The keymap itself still lives in view.
+- Scrolling: wheel notches use `axis_value120` (`wl_seat` version 8), one √2 step per notch. Touchpad scrolling zooms smoothly, ×2 per 200 logical pixels.
+
 ### Manual checks
 
 - Zoom around the pointer keeps the point under it still.
@@ -233,8 +243,8 @@ view [FILE|DIR]...
 
 | Version | Theme | Status |
 |---|---|---|
-| 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (fractional scale check pending, needs `wlr-randr`) |
-| 0.2 | Zoom, pan, rotate, filters, key repeat | Planned |
+| 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (fractional scale check skipped: 1× only for now) |
+| 0.2 | Zoom, pan, rotate, filters, key repeat | Code done, checklist pending |
 | 0.3 | Directory browsing, preloading, reload on change | Planned |
 | 0.4 | EXIF orientation, transparency, format decision | Planned |
 | 0.5 | Config, palette, dwl rule, desktop entry, install | Planned |

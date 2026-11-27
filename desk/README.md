@@ -40,6 +40,10 @@ wall publishes the wallpaper palette in `$XDG_CACHE_HOME/wall/colors.conf`, or `
 
 This is Phase 3 step 2's parser. The other apps still have their own.
 
+## Key repeat
+
+`DeskRepeat` is a timerfd that fires while a key is held. `desk_repeat_open` creates it (25 per second after 600 ms until told otherwise), `desk_repeat_info` takes `wl_keyboard.repeat_info`, `desk_repeat_start(key)` arms it after the delay, and `desk_repeat_release(key)` or `desk_repeat_cancel` stops it. Poll `repeat.fd`, then `desk_repeat_fired` returns how many repeats are due. It knows nothing about keymaps: the caller decides which keys repeat and what they do. This is part of Phase 3 step 6; compose stays in the apps for now.
+
 ## shm buffers (`-DDESK_WAYLAND`)
 
 `DeskBufferPool` holds two `wl_shm` buffers. `desk_buffer_get(&pool, shm, width, height, format)` returns one the compositor has released, reallocating it when the size changed, and marks it busy. Attach and commit it. It returns NULL when both are busy. `desk_buffer_pool_finish` frees both. Compiling with `-DDESK_WAYLAND` needs `wayland-client`.
@@ -55,5 +59,6 @@ This is Phase 3 step 2's parser. The other apps still have their own.
 | deal | Palette and watch, since 0.12.0 |
 | shot | Atomic files and shared memory since 0.1; config, INI and shm buffers since 0.2 |
 | wall | Image decoding (its own decoders moved here for view) |
+| view | Image decoding and shm buffers since 0.1; key repeat since 0.2 |
 
 net, dwl, bar, run and wall still have their own palette parsers. Moving them is Phase 3 step 1.
