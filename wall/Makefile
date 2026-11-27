@@ -10,7 +10,8 @@ PACKAGES = wayland-client wayland-cursor libpng libjpeg freetype2 fontconfig xkb
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PKG_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 CFLAGS ?= -O2
-WALL_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic
+WALL_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -DDESK_IMAGE -I$(DESK)
+DESK = ../desk
 
 LAYER_XML = $(WLR_PROTOCOLS_DIR)/unstable/wlr-layer-shell-unstable-v1.xml
 XDG_XML = $(WAYLAND_PROTOCOLS_DIR)/stable/xdg-shell/xdg-shell.xml
@@ -18,14 +19,17 @@ FRACTIONAL_XML = $(WAYLAND_PROTOCOLS_DIR)/staging/fractional-scale/fractional-sc
 VIEWPORTER_XML = $(WAYLAND_PROTOCOLS_DIR)/stable/viewporter/viewporter.xml
 PROTOCOLS = layer-shell-protocol.c xdg-shell-protocol.c fractional-scale-protocol.c viewporter-protocol.c
 HEADERS = layer-shell-client-protocol.h xdg-shell-client-protocol.h fractional-scale-client-protocol.h viewporter-client-protocol.h
-OBJECTS = wall.o $(PROTOCOLS:.c=.o)
+OBJECTS = wall.o desk.o $(PROTOCOLS:.c=.o)
 
 all: wall
 
 wall: $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PKG_LIBS) -lm $(LDLIBS)
 
-wall.o: wall.c wall.h $(HEADERS) default-config.h
+wall.o: wall.c wall.h $(HEADERS) default-config.h $(DESK)/desk.h
+
+desk.o: $(DESK)/desk.c $(DESK)/desk.h
+	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(WALL_CFLAGS) -c -o $@ $(DESK)/desk.c
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(WALL_CFLAGS) -c -o $@ $<

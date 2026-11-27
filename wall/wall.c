@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "wall.h"
+#include "desk.h"
 
 #include "fractional-scale-client-protocol.h"
 #include "layer-shell-client-protocol.h"
@@ -14,14 +15,12 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <getopt.h>
-#include <jpeglib.h>
 #include <limits.h>
 #include <linux/input-event-codes.h>
 #include <locale.h>
 #include <math.h>
 #include <png.h>
 #include <poll.h>
-#include <setjmp.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -530,188 +529,17 @@ static bool apply_options(struct config *config, const struct options *options)
     return true;
 }
 
-static bool allocate_image(struct image *image, uint32_t width, uint32_t height)
-{
-    if (!width || !height || width > MAX_IMAGE_BYTES / 4 ||
-        height > MAX_IMAGE_BYTES / ((size_t)width * 4)) {
-        errno = EFBIG;
-        return false;
-    }
-    image->pixels = malloc((size_t)width * height * 4);
-    if (!image->pixels)
-        return false;
-    image->width = width;
-    image->height = height;
-    return true;
-}
-
-static void png_fail(png_structp png, png_const_charp message)
-{
-    const char **path = png_get_error_ptr(png);
-    fprintf(stderr, "wall: %s: PNG: %s\n", *path, message);
-    png_longjmp(png, 1);
-}
-
-static bool decode_png(FILE *file, struct image *image, const char *path)
-{
-    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, &path, png_fail, png_fail);
-    png_infop info = png ? png_create_info_struct(png) : NULL;
-    if (!info) {
-        if (png)
-            png_destroy_read_struct(&png, NULL, NULL);
-        fprintf(stderr, "wall: %s: could not initialize the PNG decoder\n", path);
-        return false;
-    }
-
-    if (setjmp(png_jmpbuf(png))) {
-        png_destroy_read_struct(&png, &info, NULL);
-        return false;
-    }
-    png_init_io(png, file);
-    png_read_info(png, info);
-    if (!allocate_image(image, png_get_image_width(png, info), png_get_image_height(png, info)))
-        png_error(png, strerror(errno));
-
-    int color = png_get_color_type(png, info);
-    png_set_expand(png);
-    if (png_get_bit_depth(png, info) == 16)
-        png_set_scale_16(png);
-    if (color == PNG_COLOR_TYPE_GRAY || color == PNG_COLOR_TYPE_GRAY_ALPHA)
-        png_set_gray_to_rgb(png);
-    if (!(color & PNG_COLOR_MASK_ALPHA) && !png_get_valid(png, info, PNG_INFO_tRNS))
-        png_set_add_alpha(png, 255, PNG_FILLER_AFTER);
-    png_set_alpha_mode(png, PNG_ALPHA_PNG, PNG_DEFAULT_sRGB);
-    int passes = png_set_interlace_handling(png);
-    png_read_update_info(png, info);
-
-    size_t stride = (size_t)image->width * 4;
-    size_t bytes = stride * image->height;
-    if (png_get_rowbytes(png, info) != stride)
-        png_error(png, "unexpected RGBA row size");
-    if (passes > 1)
-        memset(image->pixels, 0, bytes);
-    for (int pass = 0; pass < passes; ++pass) {
-        for (uint32_t y = 0; y < image->height; ++y)
-            png_read_row(png, image->pixels + y * stride, NULL);
-    }
-    png_read_end(png, NULL);
-    png_destroy_read_struct(&png, &info, NULL);
-
-    for (size_t i = 0; i < bytes; i += 4) {
-        unsigned alpha = image->pixels[i + 3];
-        for (size_t channel = 0; channel < 3; ++channel) {
-            unsigned value = image->pixels[i + channel] * alpha;
-            image->pixels[i + channel] = (unsigned char)((value + 127) / 255);
-        }
-    }
-    return true;
-}
-
-struct jpeg_decoder {
-    struct jpeg_error_mgr errors;
-    struct jpeg_decompress_struct info;
-    jmp_buf failure;
-    char message[JMSG_LENGTH_MAX];
-};
-
-static void jpeg_fail(j_common_ptr info)
-{
-    struct jpeg_decoder *decoder = (struct jpeg_decoder *)info->err;
-    info->err->format_message(info, decoder->message);
-    longjmp(decoder->failure, 1);
-}
-
-static void jpeg_message(j_common_ptr info, int level)
-{
-    /* libjpeg otherwise recovers some damaged files, including truncated ones. */
-    if (level < 0)
-        jpeg_fail(info);
-}
-
-static bool decode_jpeg(FILE *file, struct image *image, const char *path)
-{
-    /* Keep the decoder state outside automatic storage across longjmp. */
-    struct jpeg_decoder *decoder = calloc(1, sizeof *decoder);
-    if (!decoder) {
-        fprintf(stderr, "wall: %s: JPEG decoder: %s\n", path, strerror(errno));
-        return false;
-    }
-    struct jpeg_decompress_struct *info = &decoder->info;
-    info->err = jpeg_std_error(&decoder->errors);
-    decoder->errors.error_exit = jpeg_fail;
-    decoder->errors.emit_message = jpeg_message;
-
-    if (setjmp(decoder->failure)) {
-        fprintf(stderr, "wall: %s: JPEG: %s\n", path, decoder->message);
-        jpeg_destroy_decompress(info);
-        free(decoder);
-        return false;
-    }
-
-    jpeg_create_decompress(info);
-    jpeg_stdio_src(info, file);
-    jpeg_read_header(info, TRUE);
-    bool cmyk = info->jpeg_color_space == JCS_CMYK || info->jpeg_color_space == JCS_YCCK;
-    info->out_color_space = cmyk ? JCS_CMYK : JCS_EXT_RGBA;
-    jpeg_calc_output_dimensions(info);
-
-    if (!allocate_image(image, info->output_width, info->output_height)) {
-        fprintf(stderr, "wall: %s: JPEG pixel storage: %s\n", path, strerror(errno));
-        jpeg_destroy_decompress(info);
-        free(decoder);
-        return false;
-    }
-
-    jpeg_start_decompress(info);
-    while (info->output_scanline < info->output_height) {
-        JSAMPROW row = image->pixels + (size_t)info->output_scanline * image->width * 4;
-        jpeg_read_scanlines(info, &row, 1);
-        if (cmyk) {
-            for (uint32_t x = 0; x < image->width; ++x) {
-                unsigned char *pixel = row + (size_t)x * 4;
-                unsigned black = info->saw_Adobe_marker ? pixel[3] : 255 - pixel[3];
-                for (size_t channel = 0; channel < 3; ++channel) {
-                    unsigned ink = info->saw_Adobe_marker ? pixel[channel] : 255 - pixel[channel];
-                    pixel[channel] = (unsigned char)((ink * black + 127) / 255);
-                }
-                pixel[3] = 255;
-            }
-        }
-    }
-    jpeg_finish_decompress(info);
-    jpeg_destroy_decompress(info);
-    free(decoder);
-    return true;
-}
-
 static bool decode_image(FILE *file, struct image *image, const char *path)
 {
-    unsigned char signature[8];
-    clearerr(file);
-    if (fseek(file, 0, SEEK_SET) != 0) {
-        fprintf(stderr, "wall: %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    size_t length = fread(signature, 1, sizeof signature, file);
-    if (ferror(file) || fseek(file, 0, SEEK_SET) != 0) {
-        fprintf(stderr, "wall: %s: %s\n", path, strerror(errno));
-        return false;
-    }
-
-    bool ok;
-    if (length == sizeof signature && png_sig_cmp(signature, 0, sizeof signature) == 0) {
-        ok = decode_png(file, image, path);
-    } else if (length >= 2 && signature[0] == 0xff && signature[1] == 0xd8) {
-        ok = decode_jpeg(file, image, path);
-    } else {
-        fprintf(stderr, "wall: %s: expected a PNG or JPEG image\n", path);
-        return false;
-    }
-    if (!ok) {
-        free(image->pixels);
+    DeskImage decoded;
+    char error[256];
+    if (!desk_image_load(file, &decoded, MAX_IMAGE_BYTES, 0, error, sizeof error)) {
+        fprintf(stderr, "wall: %s: %s\n", path, error);
         *image = (struct image){0};
+        return false;
     }
-    return ok;
+    *image = (struct image){ decoded.width, decoded.height, decoded.pixels };
+    return true;
 }
 
 static FILE *snapshot_image(const char *path)

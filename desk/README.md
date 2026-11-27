@@ -44,11 +44,16 @@ This is Phase 3 step 2's parser. The other apps still have their own.
 
 `DeskBufferPool` holds two `wl_shm` buffers. `desk_buffer_get(&pool, shm, width, height, format)` returns one the compositor has released, reallocating it when the size changed, and marks it busy. Attach and commit it. It returns NULL when both are busy. `desk_buffer_pool_finish` frees both. Compiling with `-DDESK_WAYLAND` needs `wayland-client`.
 
+## Images (`-DDESK_IMAGE`)
+
+`desk_image_load(file, &image, max_bytes, flags, error, size)` decodes a PNG or JPEG, detected by content, from a seekable `FILE` into premultiplied RGBA8 (`DeskImage`, stride `width * 4`, freed with `free(image.pixels)`). 16-bit, palette, grayscale and interlaced PNGs, progressive JPEGs and CMYK JPEGs are converted. Warnings and recoverable damage, such as a truncated JPEG, count as failures. An image whose pixels would exceed `max_bytes` fails with `File too large`, unless `DESK_IMAGE_SHRINK` is set and it's a JPEG, which is then decoded at 1/2, 1/4 or 1/8 size. On failure it returns false and writes a message such as `PNG: CRC error` to `error`. Compiling with `-DDESK_IMAGE` needs `libpng` and `libjpeg`.
+
 ## Users
 
 | Application | Uses |
 |---|---|
 | deal | Palette and watch, since 0.12.0 |
 | shot | Atomic files and shared memory since 0.1; config, INI and shm buffers since 0.2 |
+| wall | Image decoding (its own decoders moved here for view) |
 
 net, dwl, bar, run and wall still have their own palette parsers. Moving them is Phase 3 step 1.

@@ -151,4 +151,25 @@ DeskBuffer *desk_buffer_get(DeskBufferPool *pool, struct wl_shm *shm, int width,
 void desk_buffer_pool_finish(DeskBufferPool *pool);
 #endif
 
+#ifdef DESK_IMAGE
+/* Image decoding: needs libpng and libjpeg. */
+
+typedef struct {
+    uint32_t width, height;
+    unsigned char *pixels; /* Premultiplied RGBA8, stride width * 4. free() it. */
+} DeskImage;
+
+enum {
+    /* Decode a JPEG larger than max_bytes at 1/2, 1/4 or 1/8 size instead of
+       failing. PNGs over the limit still fail. */
+    DESK_IMAGE_SHRINK = 1 << 0,
+};
+
+/* Decode a PNG or JPEG, detected by content, from a seekable file. The decoded
+   image may use at most max_bytes. Return true, or false with image zeroed
+   and a message such as "PNG: CRC error" in error. */
+bool desk_image_load(FILE *file, DeskImage *image, size_t max_bytes, unsigned flags,
+                     char *error, size_t error_size);
+#endif
+
 #endif
