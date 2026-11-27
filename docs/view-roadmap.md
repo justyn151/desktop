@@ -77,6 +77,12 @@ No argument prints usage and exits 2. A file that fails to decode prints the dec
 - Resizing the window (tile ↔ float, `Super+Space`) refits immediately without stretching.
 - `view broken.png` and `view notes.txt` exit 1 with a message. `cat a.png | view -` works.
 
+### As built
+
+- The xkb keymap handling and fractional scale tracking stayed in view for now. Each is about forty lines, and neither is shared yet: they move to desk with key repeat in 0.2 (keyboard) and in Phase 3 step 4 (scale), when deal 0.10.4 shows what both need. The `-DDESK_WAYLAND` layer would otherwise pull xkbcommon into shot.
+- `desk_image_load` takes a byte limit and a `DESK_IMAGE_SHRINK` flag. wall passes its own 256 MiB limit without the flag, so its behavior is unchanged; view passes 1 GiB with it.
+- A window the compositor sizes (tiled) uses that size. When it leaves the size to view (0×0 configure, as for floating), view asks for the image size limited to 80% of `configure_bounds`, or of 1600×1000 when the compositor doesn't send bounds.
+
 ---
 
 ## 0.2: Zoom, pan and rotate
@@ -227,7 +233,7 @@ view [FILE|DIR]...
 
 | Version | Theme | Status |
 |---|---|---|
-| 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Planned |
+| 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (key, resize, floating and scale checks pending) |
 | 0.2 | Zoom, pan, rotate, filters, key repeat | Planned |
 | 0.3 | Directory browsing, preloading, reload on change | Planned |
 | 0.4 | EXIF orientation, transparency, format decision | Planned |

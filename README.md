@@ -17,6 +17,7 @@ builds generate bindings with `wayland-scanner`.
 | [net](net/README.md) | Terminal interface for Wi-Fi and network management | `make -C net` | libsystemd. NetworkManager must be running for network operations. |
 | [deal](deal/README.md) | Native Wayland terminal emulator | `make -C deal` | Wayland client and EGL libraries, wayland-protocols, EGL, desktop OpenGL, xkbcommon, FreeType, Fontconfig, libutil. `tic` and `xdg-open` are optional. |
 | [lead](lead/README.md) | Modal terminal text editor installed as `editor` | `make -C lead` | C11 compiler and the system C library. |
+| [view](view/README.md) | Wayland image viewer for PNG and JPEG | `make -C view` | Wayland client, wayland-protocols, xkbcommon, libpng, libjpeg. |
 
 `dwl`, `bar`, `run`, `wall`, and `net` install under `/usr/local` by default.
 `deal` and `lead` use `$HOME/.local`. Pass `PREFIX="$HOME/.local"` to install any
