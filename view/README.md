@@ -1,8 +1,8 @@
 # view
 
-`view` is an image viewer for dwl. Version 0.2 opens one PNG or JPEG fitted to the window, then zooms, pans, rotates and flips it. What's left is in [docs/view-roadmap.md](../docs/view-roadmap.md).
+`view` is an image viewer for dwl. Version 0.3 browses PNG and JPEG images: a file and the images beside it, a directory, or a list. It zooms, pans, rotates and flips them, and reloads an image when its file is replaced. What's left is in [docs/view-roadmap.md](../docs/view-roadmap.md).
 
-It's a normal xdg-shell window with app ID `view`, so dwl tiles or floats it like any other client. It renders at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so images stay sharp at fractional scales, and uses `cursor-shape-v1` for the drag cursor. It's built on [desk](../desk/README.md): image decoding, shm buffers and key repeat.
+It's a normal xdg-shell window with app ID `view`, so dwl tiles or floats it like any other client. It renders at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so images stay sharp at fractional scales, and uses `cursor-shape-v1` for the drag cursor. It's built on [desk](../desk/README.md): image decoding, shm buffers, key repeat and the file watch.
 
 ## Build
 
@@ -16,7 +16,7 @@ make install      # /usr/local/bin/view; honors PREFIX, BINDIR and DESTDIR
 ## Usage
 
 ```text
-view FILE
+view [FILE | DIRECTORY]...
 ```
 
 | Option | Meaning |
@@ -24,24 +24,38 @@ view FILE
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show the version |
 
-`FILE` is a PNG or JPEG, detected by content, not by its name. `-` reads the image from standard input (`shot - | view -`), and view refuses when standard input is a terminal.
+| Arguments | Browses |
+|---|---|
+| One `FILE` | The images in its directory, starting at it |
+| One `DIRECTORY` | Its images, starting at the first |
+| Several | Exactly those, in order, with directories expanded in place |
+
+A directory's images are the `.png`, `.jpg` and `.jpeg` files (any case), without hidden ones, in natural order: `img2` before `img10`. A file named explicitly is included whatever its name, because the decoder is chosen by content. `-` reads one image from standard input (`shot - | view -`), and view refuses when standard input is a terminal.
+
+The list wraps around. Each image opens fitted and upright. While one image is on screen, its neighbours are decoded in the background between events, so stepping is instant; the one in the direction of travel goes first. An image that can't be decoded shows the background and the error in the title, and browsing carries on. A single `FILE` that can't be decoded is still an error, exiting 1.
+
+view watches the file on screen. When it's replaced or rewritten (by shot, wall or an editor), the new version is shown, keeping the zoom and position when the size is unchanged. If the new version doesn't decode, the old one stays.
 
 The image opens fitted to the window and centred on a dark background, never enlarged: an image smaller than the window shows one image pixel per screen pixel. While fitted, it refits when the window changes size. Transparent images are composited over the background. When the compositor leaves the window size to view, as for a floating window, the window starts at the image's size, limited to 80% of the output.
 
 | Key | Action |
 |---|---|
+| `n`, Space, Page Down | Next image |
+| `p`, Backspace, Page Up | Previous image |
+| Right, Left | Next or previous image when the image fits across the window; otherwise pan |
+| `g` or Home, `G` or End | First, last image |
 | `+` or `=`, `-` | Zoom in or out by √2 around the window centre. Zooming stops at 100% on the way through it |
 | Scroll | Zoom around the pointer: one step per wheel notch, smoothly on a touchpad |
 | `0` | Fit to the window |
 | `1` | 100%: one image pixel per screen pixel |
-| `h` `j` `k` `l`, arrows | Pan by a tenth of the window |
+| `h` `j` `k` `l`, arrows | Pan by a tenth of the window (see Right and Left above) |
 | `H` `J` `K` `L` | Pan to that edge |
 | Left-button drag | Pan |
 | `r`, `R` | Rotate clockwise, counter-clockwise |
 | `f`, `F` | Flip horizontally, vertically |
 | `q`, Escape | Close |
 
-Zoom and pan keys repeat while held, at the compositor's rate. Zoom ranges from 10% (or less, when fitting needs it) to 3200%, and the title shows the name, size and zoom. Rotation and flips change only what's shown; the file is never written.
+Zoom and pan keys repeat while held, at the compositor's rate. Zoom ranges from 10% (or less, when fitting needs it) to 3200%, and the title shows the name, the position in the list, the size and the zoom: `img2.png — 3/42 — 1920×1080 — 50%`. Rotation and flips change only what's shown; the file is never written.
 
 Shrinking averages the area each screen pixel covers, using halved copies of the image prepared when it opens, so fine detail doesn't shimmer. Enlarging is smooth below 400% and draws sharp square pixels from 400% up.
 
@@ -52,8 +66,17 @@ Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 si
 | Status | Meaning |
 |---|---|
 | 0 | The window was closed |
-| 1 | The image couldn't be opened or decoded, or the Wayland connection failed |
+| 1 | A single `FILE` couldn't be decoded, a directory had no images or couldn't be read, or the Wayland connection failed |
 | 2 | Usage error |
+
+## Manual checks (0.3)
+
+Checked offline under ASan and UBSan, by calling the browsing code directly: natural order without hidden files, a `FILE` starting at itself, an explicit non-image name included, several arguments in order with directories expanded in place; preloading forward then backward, a broken neighbour cached as failed, stepping onto a preloaded image without decoding it again, wrapping both ways, a rotated image not kept, reload of a replaced file (keeping the zoom at the same size), no decode for an unchanged file, and a broken replacement keeping the old image. Live on dwl, replacing the open file with `shot` showed the new capture.
+
+- [ ] `view ~/Pictures/Screenshots` steps through every screenshot in name order, and wraps.
+- [ ] Stepping forward through photos shows no decode delay after the first.
+- [ ] A corrupt file in the middle of a directory shows its error in the title and doesn't stop browsing.
+- [ ] Right and Left change images at fit and pan when zoomed in.
 
 ## Manual checks (0.2)
 

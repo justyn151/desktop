@@ -156,6 +156,16 @@ view [FILE|DIR]...
 - An image that fails to decode shows the background and the error in the title, and navigation still works.
 - `desk_watch` on the current file: when it's replaced (shot, wall, an editor), reload it and keep the zoom and pan if the size is unchanged.
 
+### As built
+
+- Natural order is glibc's `strverscmp` on the file name, so it's case-sensitive (`B.png` before `a.png`). Fine for camera and screenshot names; revisit if mixed-case folders get annoying.
+- Right and Left change images whenever the image fits across the window, not only in fit mode, and pan otherwise. `h` and `l` always pan.
+- Preloading runs in the event loop, not a thread: once the current frame has been shown and no events are waiting, one neighbour is decoded. A large JPEG blocks input for the length of its decode (about 0.1 s), which is acceptable.
+- Image generations are unique across pictures, so the kept frame from 0.2 is never reused for a different image.
+- A rotated or flipped image isn't kept in the cache, so it comes back upright, as "rotation resets per image" asks.
+- Reload compares device, inode, size and modification time before decoding, so unrelated events in the directory cost nothing. A new version that fails to decode keeps the old one shown.
+- A single `FILE` argument that fails to decode still exits 1, as in 0.1, even though the directory around it may have other images.
+
 ### Manual checks
 
 - `view ~/Pictures/Screenshots` steps through every screenshot in name order, and wraps.
@@ -245,7 +255,7 @@ view [FILE|DIR]...
 |---|---|---|
 | 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (fractional scale check skipped: 1× only for now) |
 | 0.2 | Zoom, pan, rotate, filters, key repeat | Done |
-| 0.3 | Directory browsing, preloading, reload on change | Planned |
+| 0.3 | Directory browsing, preloading, reload on change | Code done, checklist pending |
 | 0.4 | EXIF orientation, transparency, format decision | Planned |
 | 0.5 | Config, palette, dwl rule, desktop entry, install | Planned |
 | 1.0 | Checklists, fuzzing, README | Final |

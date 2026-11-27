@@ -10,7 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <strings.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* 256 megapixels as ARGB8888. */
@@ -130,16 +133,20 @@ static void levels_build(struct picture *picture)
             break;
         ++picture->level_count;
     }
-    ++picture->generation;
+    /* Unique across pictures, so a kept frame is never mistaken for another image's. */
+    static unsigned generations;
+    picture->generation = ++generations;
 }
 
-static bool load_picture(struct picture *picture, const char *path, const char *name)
+/* Decode path ("-" for stdin). On failure, return false with a message in error. */
+static bool load_picture(struct picture *picture, const char *path, char *error, size_t error_size)
 {
+    *picture = (struct picture){ .level_count = 0 };
     char *data = NULL;
     FILE *file;
     if (strcmp(path, "-") == 0) {
         if (isatty(STDIN_FILENO)) {
-            fprintf(stderr, "view: refusing to read an image from a terminal\n");
+            snprintf(error, error_size, "refusing to read an image from a terminal");
             return false;
         }
         file = read_stdin(&data);
@@ -147,19 +154,16 @@ static bool load_picture(struct picture *picture, const char *path, const char *
         file = fopen(path, "rb");
     }
     if (!file) {
-        fprintf(stderr, "view: %s: %s\n", name, errno ? strerror(errno) : "empty input");
+        snprintf(error, error_size, "%s", errno ? strerror(errno) : "empty input");
         return false;
     }
 
     DeskImage image;
-    char error[256];
-    bool ok = desk_image_load(file, &image, MAX_IMAGE_BYTES, DESK_IMAGE_SHRINK, error, sizeof error);
+    bool ok = desk_image_load(file, &image, MAX_IMAGE_BYTES, DESK_IMAGE_SHRINK, error, error_size);
     fclose(file);
     free(data);
-    if (!ok) {
-        fprintf(stderr, "view: %s: %s\n", name, error);
+    if (!ok)
         return false;
-    }
 
     /* Premultiplied RGBA bytes to ARGB8888 words, in place. */
     size_t count = (size_t)image.width * image.height;
@@ -248,9 +252,16 @@ static bool orient_pixels(struct level *image, enum orientation change)
 
 /* Layout */
 
+static bool has_image(const struct view *view)
+{
+    return view->current.picture.level_count > 0;
+}
+
 static double fit_zoom(const struct view *view, int width, int height)
 {
-    const struct level *image = &view->picture.levels[0];
+    const struct level *image = &view->current.picture.levels[0];
+    if (!has_image(view))
+        return 1;
     /* Never enlarged: a small image shows one image pixel per buffer pixel. */
     return fmin(1.0, fmin((double)width / image->width, (double)height / image->height));
 }
@@ -267,7 +278,9 @@ static double clamp_axis(double center, double extent, double window, double zoo
    while fitting, otherwise keep the image covering the window where it can. */
 static void layout(struct view *view, int width, int height)
 {
-    const struct level *image = &view->picture.levels[0];
+    const struct level *image = &view->current.picture.levels[0];
+    if (!has_image(view))
+        return;
     if (view->fit) {
         view->zoom = fit_zoom(view, width, height);
         view->center_x = image->width / 2.0;
@@ -479,8 +492,13 @@ static void fill_background(uint32_t *pixels, int width, int height)
    rendered, so panning costs what scrolls in, not the whole window. */
 static void paint(struct view *view, uint32_t *pixels, int width, int height)
 {
-    struct picture *picture = &view->picture;
+    struct picture *picture = &view->current.picture;
     struct frame *frame = &view->frame;
+    if (!has_image(view)) {
+        frame->valid = false;
+        fill_background(pixels, width, height);
+        return;
+    }
     layout(view, width, height);
     double zoom = view->zoom;
     const struct level *image = &picture->levels[0];
@@ -540,12 +558,28 @@ static void paint(struct view *view, uint32_t *pixels, int width, int height)
 
 /* Drawing */
 
+static const char *base_name(const char *path)
+{
+    if (strcmp(path, "-") == 0)
+        return "stdin";
+    const char *slash = strrchr(path, '/');
+    return slash && slash[1] ? slash + 1 : path;
+}
+
+/* "name — 3/42 — W×H — 50%", without the position for a single image and
+   with the error in place of the size when it failed. */
 static void update_title(struct view *view)
 {
-    const struct level *image = &view->picture.levels[0];
-    char title[sizeof view->title];
-    snprintf(title, sizeof title, "%s — %" PRIu32 "×%" PRIu32 " — %.0f%%", view->name, image->width,
-             image->height, view->zoom * 100);
+    const struct level *image = &view->current.picture.levels[0];
+    char title[sizeof view->title], position[32] = "";
+    if (view->count > 1)
+        snprintf(position, sizeof position, " — %d/%d", view->current.index + 1, view->count);
+    const char *name = base_name(view->paths[view->current.index]);
+    if (has_image(view))
+        snprintf(title, sizeof title, "%s%s — %" PRIu32 "×%" PRIu32 " — %.0f%%", name, position, image->width,
+                 image->height, view->zoom * 100);
+    else
+        snprintf(title, sizeof title, "%s%s — %s", name, position, view->current.error);
     if (strcmp(title, view->title) != 0) {
         memcpy(view->title, title, sizeof title);
         xdg_toplevel_set_title(view->toplevel, title);
@@ -602,6 +636,8 @@ static void mark_dirty(struct view *view)
 /* Zoom to `zoom`, keeping the image point under buffer pixel (x, y) still. */
 static void zoom_at(struct view *view, double zoom, double x, double y)
 {
+    if (!has_image(view))
+        return;
     int width, height, scale;
     physical_size(view, &width, &height, &scale);
     layout(view, width, height);
@@ -633,6 +669,8 @@ static void zoom_centered(struct view *view, double zoom)
 /* Move the view by (dx, dy) buffer pixels. Infinite values go to the edge. */
 static void pan(struct view *view, double dx, double dy)
 {
+    if (!has_image(view))
+        return;
     int width, height, scale;
     physical_size(view, &width, &height, &scale);
     layout(view, width, height);
@@ -653,8 +691,10 @@ static void pan_step(struct view *view, int columns, int rows)
 
 static void orient(struct view *view, enum orientation change)
 {
-    struct picture *picture = &view->picture;
+    struct picture *picture = &view->current.picture;
     struct level *image = &picture->levels[0];
+    if (!has_image(view))
+        return;
     double x = view->center_x, y = view->center_y;
     double width = image->width, height = image->height;
     if (!orient_pixels(image, change)) {
@@ -678,7 +718,191 @@ static void orient(struct view *view, enum orientation change)
         break;
     }
     levels_build(picture);
+    picture->oriented = true;
     mark_dirty(view);
+}
+
+/* Browsing */
+
+static int wrap(const struct view *view, int index)
+{
+    return (index % view->count + view->count) % view->count;
+}
+
+/* Whether b is next to a, going either way round the list. */
+static bool is_neighbor(const struct view *view, int a, int b)
+{
+    return a != b && (wrap(view, a + 1) == b || wrap(view, a - 1) == b);
+}
+
+static const char *display_path(const char *path)
+{
+    return strcmp(path, "-") == 0 ? "stdin" : path;
+}
+
+static void slot_free(struct slot *slot)
+{
+    picture_free(&slot->picture);
+    *slot = (struct slot){ .used = false };
+}
+
+static void slot_load(struct view *view, struct slot *slot, int index)
+{
+    *slot = (struct slot){ .used = true, .index = index };
+    const char *path = view->paths[index];
+    if (!load_picture(&slot->picture, path, slot->error, sizeof slot->error))
+        fprintf(stderr, "view: %s: %s\n", display_path(path), slot->error);
+}
+
+static bool file_signature(const char *path, struct signature *signature)
+{
+    struct stat st;
+    *signature = (struct signature){ .size = 0 };
+    if (strcmp(path, "-") == 0 || stat(path, &st) != 0)
+        return false;
+    *signature = (struct signature){ st.st_dev, st.st_ino, st.st_size, st.st_mtim };
+    return true;
+}
+
+static bool same_signature(const struct signature *a, const struct signature *b)
+{
+    return a->device == b->device && a->inode == b->inode && a->size == b->size &&
+           a->modified.tv_sec == b->modified.tv_sec && a->modified.tv_nsec == b->modified.tv_nsec;
+}
+
+/* Watch the current file, so a replaced file (shot, wall, an editor) reloads. */
+static void watch_current(struct view *view)
+{
+    desk_watch_close(&view->watch);
+    const char *path = view->paths[view->current.index];
+    file_signature(path, &view->signature);
+    if (strcmp(path, "-") == 0)
+        return;
+    char *absolute = realpath(path, NULL);
+    if (absolute)
+        desk_watch_open(&view->watch, absolute);
+    free(absolute);
+}
+
+/* Free cached images that aren't next to the current one, and return a free slot. */
+static struct slot *cache_trim(struct view *view)
+{
+    struct slot *free_slot = NULL;
+    for (int i = 0; i < 2; ++i) {
+        struct slot *slot = &view->cache[i];
+        if (slot->used && !is_neighbor(view, view->current.index, slot->index))
+            slot_free(slot);
+        if (!slot->used && !free_slot)
+            free_slot = slot;
+    }
+    return free_slot;
+}
+
+/* Show image index, from the cache when it was preloaded. Each image starts
+   fitted and upright. The one left behind is kept if it's a neighbour. */
+static void show(struct view *view, int index)
+{
+    index = wrap(view, index);
+    if (index == view->current.index)
+        return;
+    struct slot left = view->current;
+    view->current = (struct slot){ .used = false };
+    for (int i = 0; i < 2; ++i) {
+        if (view->cache[i].used && view->cache[i].index == index) {
+            view->current = view->cache[i];
+            view->cache[i] = (struct slot){ .used = false };
+        }
+    }
+    if (!view->current.used)
+        slot_load(view, &view->current, index);
+
+    struct slot *free_slot = cache_trim(view);
+    if (free_slot && !left.picture.oriented && is_neighbor(view, index, left.index))
+        *free_slot = left;
+    else
+        slot_free(&left);
+
+    view->fit = true;
+    view->frame.valid = false;
+    watch_current(view);
+    mark_dirty(view);
+}
+
+static void step(struct view *view, int direction)
+{
+    if (view->count < 2)
+        return;
+    view->direction = direction;
+    show(view, view->current.index + direction);
+}
+
+/* The neighbour to decode next, ahead in the direction of travel first.
+   Return false when both are decoded (or failed). */
+static bool preload_wanted(const struct view *view, int *index)
+{
+    if (view->count < 2)
+        return false;
+    int order[2] = { view->direction, -view->direction };
+    for (int k = 0; k < 2; ++k) {
+        int candidate = wrap(view, view->current.index + order[k]);
+        bool cached = candidate == view->current.index;
+        for (int i = 0; i < 2; ++i)
+            cached |= view->cache[i].used && view->cache[i].index == candidate;
+        if (!cached) {
+            *index = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void preload(struct view *view)
+{
+    int index;
+    if (!preload_wanted(view, &index))
+        return;
+    struct slot *slot = cache_trim(view);
+    if (slot)
+        slot_load(view, slot, index);
+}
+
+/* The current file changed on disk: decode it again. If the new version
+   fails while the old one showed, keep the old one; a later write retries.
+   Zoom and position stay when the size is unchanged. */
+static void reload_current(struct view *view)
+{
+    struct signature now;
+    const char *path = view->paths[view->current.index];
+    if (!file_signature(path, &now) || same_signature(&now, &view->signature))
+        return;
+    struct slot fresh;
+    slot_load(view, &fresh, view->current.index);
+    if (fresh.picture.level_count == 0 && has_image(view)) {
+        slot_free(&fresh);
+        return;
+    }
+    view->signature = now;
+    const struct level *old = &view->current.picture.levels[0], *new = &fresh.picture.levels[0];
+    bool same_size = has_image(view) && !view->current.picture.oriented && fresh.picture.level_count &&
+                     old->width == new->width && old->height == new->height;
+    slot_free(&view->current);
+    view->current = fresh;
+    if (!same_size)
+        view->fit = true;
+    view->frame.valid = false;
+    mark_dirty(view);
+}
+
+/* Whether the image is wider than the window, so Left and Right pan rather
+   than change images. */
+static bool can_pan_across(struct view *view)
+{
+    if (!has_image(view))
+        return false;
+    int width, height, scale;
+    physical_size(view, &width, &height, &scale);
+    layout(view, width, height);
+    return view->current.picture.levels[0].width * view->zoom > width + 0.5;
 }
 
 /* Run the action for a key. Return whether it repeats while held. */
@@ -708,12 +932,44 @@ static bool key_action(struct view *view, xkb_keysym_t sym)
     case XKB_KEY_KP_1:
         zoom_centered(view, 1);
         return false;
-    case XKB_KEY_h:
+    case XKB_KEY_n:
+    case XKB_KEY_space:
+    case XKB_KEY_Page_Down:
+        step(view, 1);
+        return false;
+    case XKB_KEY_p:
+    case XKB_KEY_BackSpace:
+    case XKB_KEY_Page_Up:
+        step(view, -1);
+        return false;
+    case XKB_KEY_g:
+    case XKB_KEY_Home:
+        view->direction = 1;
+        show(view, 0);
+        return false;
+    case XKB_KEY_G:
+    case XKB_KEY_End:
+        view->direction = -1;
+        show(view, view->count - 1);
+        return false;
     case XKB_KEY_Left:
+        if (!can_pan_across(view)) {
+            step(view, -1);
+            return false;
+        }
+        pan_step(view, -1, 0);
+        return true;
+    case XKB_KEY_Right:
+        if (!can_pan_across(view)) {
+            step(view, 1);
+            return false;
+        }
+        pan_step(view, 1, 0);
+        return true;
+    case XKB_KEY_h:
         pan_step(view, -1, 0);
         return true;
     case XKB_KEY_l:
-    case XKB_KEY_Right:
         pan_step(view, 1, 0);
         return true;
     case XKB_KEY_k:
@@ -759,11 +1015,12 @@ static bool key_action(struct view *view, xkb_keysym_t sym)
    pixel per logical pixel, shrunk to fit a share of the output. */
 static void initial_size(const struct view *view, int *width, int *height)
 {
-    const struct level *image = &view->picture.levels[0];
+    const struct level *image = &view->current.picture.levels[0];
     double bound_width = view->bounds_width > 0 ? view->bounds_width : FALLBACK_WIDTH / INITIAL_SHARE;
     double bound_height = view->bounds_height > 0 ? view->bounds_height : FALLBACK_HEIGHT / INITIAL_SHARE;
     double scale = view->fraction ? view->fraction / 120.0 : view->buffer_scale;
-    double image_width = image->width / scale, image_height = image->height / scale;
+    double image_width = has_image(view) ? image->width / scale : FALLBACK_WIDTH;
+    double image_height = has_image(view) ? image->height / scale : FALLBACK_HEIGHT;
     double fit = fmin(1.0, fmin(bound_width * INITIAL_SHARE / image_width,
                                 bound_height * INITIAL_SHARE / image_height));
     *width = (int)lround(image_width * fit);
@@ -1324,11 +1581,16 @@ static bool run(struct view *view)
             wl_display_cancel_read(display);
             return false;
         }
-        struct pollfd fds[2] = {
+        /* Preload a neighbour once the current image is on screen and nothing else is waiting. */
+        int next;
+        bool idle_work = view->configured && !view->dirty && !view->frame_callback && preload_wanted(view, &next);
+        struct pollfd fds[3] = {
             { .fd = wl_display_get_fd(display), .events = POLLIN },
             { .fd = view->repeat.fd, .events = POLLIN },
+            { .fd = view->watch.fd, .events = POLLIN },
         };
-        if (poll(fds, view->repeat.fd >= 0 ? 2 : 1, -1) < 0) {
+        int ready = poll(fds, 3, idle_work ? 0 : -1);
+        if (ready < 0) {
             wl_display_cancel_read(display);
             if (errno == EINTR)
                 continue;
@@ -1352,6 +1614,10 @@ static bool run(struct view *view)
             for (unsigned i = 0; i < count && view->repeat.active && view->keys; ++i)
                 key_action(view, xkb_state_key_get_one_sym(view->keys, view->repeat.key + 8));
         }
+        if (view->watch.fd >= 0 && fds[2].revents && desk_watch_changed(&view->watch, fds[2].revents))
+            reload_current(view);
+        if (ready == 0 && idle_work)
+            preload(view);
         /* A buffer may have been released since a skipped draw. */
         if (view->dirty && view->configured && !view->frame_callback)
             draw(view);
@@ -1361,23 +1627,161 @@ static bool run(struct view *view)
 
 /* Main */
 
-static const char *base_name(const char *path)
+/* The list of images to browse */
+
+struct list {
+    char **paths;
+    int count, capacity;
+};
+
+static bool list_add(struct list *list, char *path)
 {
-    if (strcmp(path, "-") == 0)
-        return "stdin";
-    const char *slash = strrchr(path, '/');
-    return slash && slash[1] ? slash + 1 : path;
+    if (!path)
+        return false;
+    if (list->count == list->capacity) {
+        int capacity = list->capacity ? list->capacity * 2 : 64;
+        char **grown = realloc(list->paths, (size_t)capacity * sizeof *grown);
+        if (!grown) {
+            free(path);
+            return false;
+        }
+        list->paths = grown;
+        list->capacity = capacity;
+    }
+    list->paths[list->count++] = path;
+    return true;
+}
+
+static void list_free(struct list *list)
+{
+    for (int i = 0; i < list->count; ++i)
+        free(list->paths[i]);
+    free(list->paths);
+    *list = (struct list){ .count = 0 };
+}
+
+static bool has_image_extension(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    return dot && (strcasecmp(dot, ".png") == 0 || strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0);
+}
+
+/* Natural order on the file name, so img2 comes before img10. */
+static int compare_paths(const void *a, const void *b)
+{
+    const char *x = *(char *const *)a, *y = *(char *const *)b;
+    int order = strverscmp(base_name(x), base_name(y));
+    return order ? order : strcmp(x, y);
+}
+
+/* Append the PNG and JPEG files in directory, sorted, skipping hidden ones.
+   With prefix, each path starts with the directory; otherwise it's the bare
+   name, for the working directory. Return false with errno set when the
+   directory can't be read. */
+static bool list_directory(struct list *list, const char *directory, bool prefix)
+{
+    DIR *dir = opendir(directory);
+    if (!dir)
+        return false;
+    int start = list->count;
+    size_t length = strlen(directory);
+    bool slash = length > 0 && directory[length - 1] == '/';
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (entry->d_name[0] == '.' || !has_image_extension(entry->d_name))
+            continue;
+        char *path = NULL;
+        if (!prefix)
+            path = strdup(entry->d_name);
+        else if (asprintf(&path, "%s%s%s", directory, slash ? "" : "/", entry->d_name) < 0)
+            path = NULL;
+        if (!list_add(list, path)) {
+            closedir(dir);
+            errno = ENOMEM;
+            return false;
+        }
+    }
+    closedir(dir);
+    qsort(list->paths + start, (size_t)(list->count - start), sizeof *list->paths, compare_paths);
+    return true;
+}
+
+static bool is_directory(const char *path)
+{
+    struct stat st;
+    return strcmp(path, "-") != 0 && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* One FILE: the images beside it, starting at it. It's included even when
+   its name doesn't look like an image, since content decides. */
+static bool list_around(struct list *list, const char *file, int *start)
+{
+    const char *slash = strrchr(file, '/');
+    char *directory = slash ? strndup(file, slash == file ? 1 : (size_t)(slash - file)) : strdup(".");
+    if (!directory)
+        return false;
+    list_directory(list, directory, slash != NULL); /* Unreadable: just the file. */
+    free(directory);
+
+    const char *name = base_name(file);
+    for (int i = 0; i < list->count; ++i) {
+        if (strcmp(base_name(list->paths[i]), name) == 0) {
+            *start = i;
+            return true;
+        }
+    }
+    if (!list_add(list, strdup(file)))
+        return false;
+    qsort(list->paths, (size_t)list->count, sizeof *list->paths, compare_paths);
+    for (int i = 0; i < list->count; ++i) {
+        if (strcmp(list->paths[i], file) == 0)
+            *start = i;
+    }
+    return true;
+}
+
+/* Build the list from the arguments. Return 0 or an exit status. */
+static int build_list(struct list *list, int argc, char **argv, int *start)
+{
+    *start = 0;
+    if (argc == 1 && !is_directory(argv[0])) {
+        bool ok = strcmp(argv[0], "-") == 0 ? list_add(list, strdup("-")) : list_around(list, argv[0], start);
+        if (!ok)
+            fprintf(stderr, "view: %s\n", strerror(ENOMEM));
+        return ok ? 0 : EXIT_FAILED;
+    }
+    for (int i = 0; i < argc; ++i) {
+        if (!is_directory(argv[i])) {
+            if (!list_add(list, strdup(argv[i]))) {
+                fprintf(stderr, "view: %s\n", strerror(ENOMEM));
+                return EXIT_FAILED;
+            }
+        } else if (!list_directory(list, argv[i], true)) {
+            fprintf(stderr, "view: %s: %s\n", argv[i], strerror(errno));
+            return EXIT_FAILED;
+        }
+    }
+    if (list->count == 0) {
+        fprintf(stderr, "view: no PNG or JPEG images in %s\n", argc == 1 ? argv[0] : "the arguments");
+        return EXIT_FAILED;
+    }
+    return 0;
 }
 
 static void usage(FILE *stream)
 {
-    fputs("Usage: view [FILE]\n"
-          "Show a PNG or JPEG image. FILE \"-\" reads standard input.\n"
+    fputs("Usage: view [FILE | DIRECTORY]...\n"
+          "Show PNG and JPEG images. One FILE browses the images beside it, a DIRECTORY\n"
+          "browses its images, and several arguments browse exactly those. FILE \"-\"\n"
+          "reads standard input.\n"
           "\n"
           "  -h, --help     Show this help\n"
           "  -v, --version  Show the version\n"
           "\n"
           "Keys:\n"
+          "  n, Space       Next image (also Right when there's nothing to pan)\n"
+          "  p, Backspace   Previous image (also Left)\n"
+          "  g, G           First, last image\n"
           "  + = -          Zoom in or out (also scrolling, around the pointer)\n"
           "  0, 1           Fit to the window, 100%\n"
           "  h j k l        Pan (also the arrows and dragging); Shift pans to the edge\n"
@@ -1402,20 +1806,35 @@ int main(int argc, char **argv)
         default: usage(stderr); return EXIT_USAGE;
         }
     }
-    if (argc - optind != 1) {
+    if (argc - optind < 1) {
         usage(stderr);
         return EXIT_USAGE;
     }
 
-    const char *path = argv[optind];
-    struct view view = { .name = base_name(path), .buffer_scale = 1, .running = true, .fit = true, .zoom = 1 };
-    if (!load_picture(&view.picture, path, strcmp(path, "-") == 0 ? "stdin" : path))
+    struct list list = { .count = 0 };
+    int start;
+    int status = build_list(&list, argc - optind, argv + optind, &start);
+    if (status) {
+        list_free(&list);
+        return status;
+    }
+
+    struct view view = {
+        .paths = list.paths, .count = list.count, .direction = 1, .watch = { .fd = -1 },
+        .buffer_scale = 1, .running = true, .fit = true, .zoom = 1,
+    };
+    slot_load(&view, &view.current, start);
+    /* A single FILE that can't be shown is an error, as before browsing existed. */
+    bool single_file = argc - optind == 1 && !is_directory(argv[optind]);
+    if (!has_image(&view) && (single_file || view.count == 1)) {
+        list_free(&list);
         return EXIT_FAILED;
+    }
+    watch_current(&view);
     int error = desk_repeat_open(&view.repeat);
     if (error)
         fprintf(stderr, "view: no key repeat: %s\n", strerror(error));
 
-    int status = EXIT_CLOSED;
     if (!open_window(&view)) {
         status = EXIT_FAILED;
     } else if (!run(&view)) {
@@ -1424,7 +1843,11 @@ int main(int argc, char **argv)
     }
     close_window(&view);
     desk_repeat_close(&view.repeat);
+    desk_watch_close(&view.watch);
     free(view.frame.pixels);
-    picture_free(&view.picture);
+    slot_free(&view.current);
+    for (int i = 0; i < 2; ++i)
+        slot_free(&view.cache[i]);
+    list_free(&list);
     return status;
 }

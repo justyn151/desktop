@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
+#include <time.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -13,7 +15,7 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-#define VIEW_VERSION "0.2.0"
+#define VIEW_VERSION "0.3.0"
 
 /* Exit statuses. */
 enum {
@@ -37,6 +39,23 @@ struct picture {
     int level_count;
     bool opaque;
     unsigned generation; /* Changes whenever the pixels do. */
+    bool oriented;       /* Rotated or flipped, so not worth keeping for later. */
+};
+
+/* One image of the list, decoded or failed. */
+struct slot {
+    bool used;
+    int index;           /* In view.paths. */
+    struct picture picture; /* level_count 0 when it failed. */
+    char error[256];
+};
+
+/* What identifies a version of a file, to tell a real change from noise. */
+struct signature {
+    dev_t device;
+    ino_t inode;
+    off_t size;
+    struct timespec modified;
 };
 
 /* The last frame drawn, kept so panning only renders what scrolled in. */
@@ -50,9 +69,15 @@ struct frame {
 };
 
 struct view {
-    struct picture picture;
+    /* The images to browse, as given or found in a directory. "-" is stdin. */
+    char **paths;
+    int count;
+    struct slot current;
+    struct slot cache[2]; /* Decoded neighbours of current. */
+    int direction;        /* Last step, +1 or −1, so preloading looks ahead. */
+    DeskWatch watch;      /* The current file, to reload it when replaced. */
+    struct signature signature;
     struct frame frame;
-    const char *name; /* Shown in the title. */
     char title[512];
 
     /* What's shown. zoom is buffer pixels per image pixel; the centre is in

@@ -59,6 +59,6 @@ This is Phase 3 step 2's parser. The other apps still have their own.
 | deal | Palette and watch, since 0.12.0 |
 | shot | Atomic files and shared memory since 0.1; config, INI and shm buffers since 0.2 |
 | wall | Image decoding (its own decoders moved here for view) |
-| view | Image decoding and shm buffers since 0.1; key repeat since 0.2 |
+| view | Image decoding and shm buffers since 0.1; key repeat since 0.2; file watch since 0.3 |
 
 net, dwl, bar, run and wall still have their own palette parsers. Moving them is Phase 3 step 1.
