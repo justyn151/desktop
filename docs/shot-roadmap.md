@@ -110,6 +110,7 @@ Freeze first, then select, so menus, tooltips and the cursor don't change while 
 - **v1 rule (from PLAN.md):** the region is limited to the output where the drag started. Motion is clamped to that output's edges. Other outputs' overlays stay dimmed.
 - Crop: map the logical rectangle to physical pixels with `floor` for the start and `ceil` for the end, then crop the upright frozen frame. No resampling.
 - Rendering: redraw only on motion, at most once per `wl_surface.frame` callback. Keep two shm buffers per output, with busy tracking from `wl_buffer.release`. This is where the desk shm pool comes from.
+- As built: layer-surface setup stayed in shot. It's about fifteen lines and only shot uses it so far, so it moves to desk in Phase 3 step 4, when bar, run and wall show what they have in common. `wp_fractional_scale_v1` isn't needed: the buffer is the frame's physical size and the viewport maps it, so the scale is `frame width / logical width`.
 
 ### Edge cases
 
@@ -156,6 +157,8 @@ Manual checks: a partially covered window comes out whole; floating and fullscre
 ---
 
 ## 0.5: Config, key bindings and default directory
+
+The config file, its parser and the `~/Pictures/Screenshots` default landed early, in 0.2: shot writes the sample `shot.conf` when the user's file is missing. Shared `desktop.conf` precedence still waits for Phase 3 step 3. What's left here is the dwl bindings and install.
 
 - Config through desk's INI parser (Phase 3 step 2 must exist by now, or shot adds it). Precedence: command line, `~/.config/shot/shot.conf`, `~/.config/desktop/desktop.conf`, built-in defaults.
 
@@ -210,8 +213,8 @@ Manual checks: each binding saves into `~/Pictures/Screenshots` with the configu
 | Version | Theme | Status |
 |---|---|---|
 | 0.1 | Full-monitor capture to PNG, desk atomic write and shm | Done (multi-monitor and rotation untested) |
-| 0.2 | Region: freeze, layer-shell overlay, crop | Planned |
+| 0.2 | Region: freeze, layer-shell overlay, crop. Config file (pulled forward from 0.5) | Code done, drag checklist pending |
 | 0.3 | Clipboard through `ext-data-control-v1`, background server | Planned |
 | 0.4 | Focused window: dwl IPC identifier, toplevel capture source | Planned (needs a dwl change) |
-| 0.5 | Config, Print bindings in dwl, `~/Pictures/Screenshots` | Planned (needs desk INI parser) |
+| 0.5 | Print bindings in dwl, install the sample config | Planned (config itself landed in 0.2) |
 | 1.0 | Checklists, exit codes, README | Final |

@@ -26,11 +26,29 @@ wall publishes the wallpaper palette in `$XDG_CACHE_HOME/wall/colors.conf`, or `
 
 `desk_shm_open(size)` returns a sealed `memfd` of `size` bytes for a `wl_shm` pool, or -1 with `errno` set.
 
+## Config and paths
+
+| Function | Purpose |
+|---|---|
+| `desk_config_path(app)` | `$XDG_CONFIG_HOME/<app>/<app>.conf`, or `~/.config/<app>/<app>.conf` |
+| `desk_expand_home(path)` | Expand a leading `~/` with `HOME` |
+| `desk_mkdirs(path, mode)` | `mkdir -p` |
+| `desk_write_default(path, data, length)` | Write a sample file, creating parent directories, unless it already exists (`EEXIST`) |
+| `desk_ini_parse(text, length, handler, data)` | Call `handler(data, section, key, value, line)` per `key = value`. Values are trimmed and one pair of surrounding quotes is removed. Comments are whole lines starting with `#` or `;`. Malformed lines reach the handler with `key` and `value` NULL, so the app reports them with the line number. |
+| `desk_ini_load(path, handler, data)` | Read a file of up to 1 MiB and parse it |
+| `desk_parse_bool`, `desk_parse_rgb` | `true`/`false` (also yes/no, on/off, 1/0) and `#RRGGBB` |
+
+This is Phase 3 step 2's parser. The other apps still have their own.
+
+## shm buffers (`-DDESK_WAYLAND`)
+
+`DeskBufferPool` holds two `wl_shm` buffers. `desk_buffer_get(&pool, shm, width, height, format)` returns one the compositor has released, reallocating it when the size changed, and marks it busy. Attach and commit it. It returns NULL when both are busy. `desk_buffer_pool_finish` frees both. Compiling with `-DDESK_WAYLAND` needs `wayland-client`.
+
 ## Users
 
 | Application | Uses |
 |---|---|
 | deal | Palette and watch, since 0.12.0 |
-| shot | Atomic files and shared memory, since 0.1 |
+| shot | Atomic files and shared memory since 0.1; config, INI and shm buffers since 0.2 |
 
 net, dwl, bar, run and wall still have their own palette parsers. Moving them is Phase 3 step 1.

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -288,3 +289,214 @@ int desk_shm_open(size_t size)
     fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
     return fd;
 }
+
+/* Paths */
+
+char *desk_config_path(const char *app)
+{
+    const char *config = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    char *path = NULL;
+    int length;
+    if (config != NULL && config[0] == '/') length = asprintf(&path, "%s/%s/%s.conf", config, app, app);
+    else if (home != NULL && home[0] != 0) length = asprintf(&path, "%s/.config/%s/%s.conf", home, app, app);
+    else return NULL;
+    return length < 0 ? NULL : path;
+}
+
+char *desk_expand_home(const char *path)
+{
+    if (path[0] != '~' || (path[1] != '/' && path[1] != 0)) return strdup(path);
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] == 0) return NULL;
+    char *expanded;
+    return asprintf(&expanded, "%s%s", home, path + 1) < 0 ? NULL : expanded;
+}
+
+int desk_mkdirs(const char *path, mode_t mode)
+{
+    char *copy = strdup(path);
+    if (copy == NULL) return ENOMEM;
+    int error = 0;
+    for (char *at = copy + 1;; ++at) {
+        if (*at != '/' && *at != 0) continue;
+        char saved = *at;
+        *at = 0;
+        if (mkdir(copy, mode) < 0 && errno != EEXIST) {
+            error = errno;
+            break;
+        }
+        *at = saved;
+        if (saved == 0) break;
+    }
+    struct stat info;
+    if (error == 0 && (stat(path, &info) < 0 || !S_ISDIR(info.st_mode))) error = errno ? errno : ENOTDIR;
+    free(copy);
+    return error;
+}
+
+int desk_write_default(const char *path, const void *data, size_t length)
+{
+    if (access(path, F_OK) == 0) return EEXIST;
+    const char *slash = strrchr(path, '/');
+    if (slash != NULL && slash != path) {
+        char *directory = strndup(path, (size_t)(slash - path));
+        if (directory == NULL) return ENOMEM;
+        int error = desk_mkdirs(directory, 0755);
+        free(directory);
+        if (error != 0) return error;
+    }
+    DeskAtomic atomic;
+    int error = desk_atomic_open(&atomic, path, 0644);
+    if (error != 0) return error;
+    if (length != 0 && fwrite(data, 1, length, atomic.file) != length) {
+        error = errno ? errno : EIO;
+        desk_atomic_abort(&atomic);
+        return error;
+    }
+    error = desk_atomic_commit(&atomic, false);
+    desk_atomic_abort(&atomic);
+    return error;
+}
+
+/* INI */
+
+void desk_ini_parse(const char *text, size_t length, DeskIniHandler handler, void *data)
+{
+    char section[128] = "";
+    char *line = NULL;
+    size_t capacity = 0;
+    int number = 0;
+    for (size_t start = 0; start < length;) {
+        const char *end = memchr(text + start, '\n', length - start);
+        size_t size = end != NULL ? (size_t)(end - (text + start)) : length - start;
+        ++number;
+        if (size + 1 > capacity) {
+            char *grown = realloc(line, size + 1);
+            if (grown == NULL) break;
+            line = grown;
+            capacity = size + 1;
+        }
+        memcpy(line, text + start, size);
+        line[size] = 0;
+        start += size + 1;
+
+        char *trimmed = trim(line);
+        if (*trimmed == 0 || *trimmed == '#' || *trimmed == ';') continue;
+        size_t trimmed_length = strlen(trimmed);
+        if (*trimmed == '[') {
+            if (trimmed[trimmed_length - 1] != ']' || trimmed_length - 2 >= sizeof section) {
+                handler(data, section, NULL, NULL, number);
+                continue;
+            }
+            trimmed[trimmed_length - 1] = 0;
+            snprintf(section, sizeof section, "%s", trim(trimmed + 1));
+            continue;
+        }
+        char *equals = strchr(trimmed, '=');
+        if (equals == NULL) {
+            handler(data, section, NULL, NULL, number);
+            continue;
+        }
+        *equals = 0;
+        char *key = trim(trimmed), *value = trim(equals + 1);
+        size_t value_length = strlen(value);
+        if (value_length >= 2 && value[0] == '"' && value[value_length - 1] == '"') {
+            value[value_length - 1] = 0;
+            ++value;
+        }
+        handler(data, section, key, value, number);
+    }
+    free(line);
+}
+
+int desk_ini_load(const char *path, DeskIniHandler handler, void *data)
+{
+    FILE *file = fopen(path, "re");
+    if (file == NULL) return errno;
+    size_t limit = 1 << 20, length = 0;
+    char *text = malloc(limit);
+    if (text == NULL) {
+        fclose(file);
+        return ENOMEM;
+    }
+    length = fread(text, 1, limit, file);
+    int error = ferror(file) ? EIO : (length == limit ? EFBIG : 0);
+    fclose(file);
+    if (error == 0) desk_ini_parse(text, length, handler, data);
+    free(text);
+    return error;
+}
+
+bool desk_parse_bool(const char *text, bool *value)
+{
+    static const char *const yes[] = {"true", "yes", "on", "1"}, *const no[] = {"false", "no", "off", "0"};
+    for (size_t i = 0; i < sizeof yes / sizeof *yes; ++i) {
+        if (strcasecmp(text, yes[i]) == 0) return *value = true, true;
+        if (strcasecmp(text, no[i]) == 0) return *value = false, true;
+    }
+    return false;
+}
+
+bool desk_parse_rgb(const char *text, uint32_t *rgb)
+{
+    return parse_rgb(text, rgb);
+}
+
+#ifdef DESK_WAYLAND
+/* shm buffers */
+
+static void buffer_release(void *data, struct wl_buffer *buffer)
+{
+    (void)buffer;
+    DeskBuffer *slot = data;
+    slot->busy = false;
+}
+
+static const struct wl_buffer_listener buffer_listener = {.release = buffer_release};
+
+static void buffer_slot_free(DeskBuffer *slot)
+{
+    if (slot->buffer != NULL) wl_buffer_destroy(slot->buffer);
+    if (slot->pixels != NULL) munmap(slot->pixels, slot->size);
+    *slot = (DeskBuffer){0};
+}
+
+DeskBuffer *desk_buffer_get(DeskBufferPool *pool, struct wl_shm *shm, int width, int height, uint32_t format)
+{
+    DeskBuffer *slot = NULL;
+    for (int i = 0; i < 2 && slot == NULL; ++i) {
+        if (!pool->slots[i].busy) slot = &pool->slots[i];
+    }
+    if (slot == NULL) return NULL;
+    if (slot->buffer != NULL && slot->width == width && slot->height == height) {
+        slot->busy = true;
+        return slot;
+    }
+    buffer_slot_free(slot);
+    if (width <= 0 || height <= 0 || width > INT32_MAX / 4 / height) return NULL;
+    size_t size = (size_t)width * 4 * (size_t)height;
+    int fd = desk_shm_open(size);
+    if (fd < 0) return NULL;
+    void *pixels = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pixels == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+    struct wl_shm_pool *shm_pool = wl_shm_create_pool(shm, fd, (int32_t)size);
+    slot->buffer = wl_shm_pool_create_buffer(shm_pool, 0, width, height, width * 4, format);
+    wl_shm_pool_destroy(shm_pool);
+    close(fd);
+    wl_buffer_add_listener(slot->buffer, &buffer_listener, slot);
+    slot->pixels = pixels;
+    slot->size = size;
+    slot->width = width;
+    slot->height = height;
+    slot->busy = true;
+    return slot;
+}
+
+void desk_buffer_pool_finish(DeskBufferPool *pool)
+{
+    for (int i = 0; i < 2; ++i) buffer_slot_free(&pool->slots[i]);
+}
+#endif

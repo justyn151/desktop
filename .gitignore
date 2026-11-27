@@ -30,6 +30,7 @@ build/
 !/wall/wall.conf
 !/net/net.conf
 !/deal/deal.conf
+!/shot/shot.conf
 *.local
 *.local.*
 

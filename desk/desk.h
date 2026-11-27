@@ -88,4 +88,67 @@ void desk_atomic_abort(DeskAtomic *atomic);
    file descriptor, or -1 with errno set. */
 int desk_shm_open(size_t size);
 
+/* Paths */
+
+/* $XDG_CONFIG_HOME/<app>/<app>.conf, or ~/.config/<app>/<app>.conf. Return a
+   new string, or NULL when neither variable is usable or memory runs out. */
+char *desk_config_path(const char *app);
+
+/* Expand a leading "~/" (or a bare "~") with HOME. Return a new string, or
+   NULL when HOME is needed but unset, or memory runs out. */
+char *desk_expand_home(const char *path);
+
+/* Create a directory and its missing parents, like mkdir -p. Return 0 or an
+   errno value. */
+int desk_mkdirs(const char *path, mode_t mode);
+
+/* Write data to path, creating parent directories, unless path already
+   exists. Return 0 when written, EEXIST when it existed, or an errno value. */
+int desk_write_default(const char *path, const void *data, size_t length);
+
+/* INI */
+
+/* Called for each "key = value" line. Surrounding spaces are trimmed and one
+   pair of double quotes around the value is removed. section is "" before the
+   first [section]. For a line that is neither a key, a section, a comment
+   nor blank, key and value are NULL. line counts from 1. */
+typedef void (*DeskIniHandler)(void *data, const char *section, const char *key, const char *value, int line);
+
+/* Parse text of the given length. Comments are whole lines starting with # or ;. */
+void desk_ini_parse(const char *text, size_t length, DeskIniHandler handler, void *data);
+
+/* Read and parse a file of at most 1 MiB. Return 0 or an errno value. */
+int desk_ini_load(const char *path, DeskIniHandler handler, void *data);
+
+/* Parse "true"/"false" (also yes/no, on/off, 1/0). */
+bool desk_parse_bool(const char *text, bool *value);
+
+/* Parse #RRGGBB into 0xRRGGBB. */
+bool desk_parse_rgb(const char *text, uint32_t *rgb);
+
+#ifdef DESK_WAYLAND
+/* Layer 1: needs wayland-client. */
+#include <wayland-client.h>
+
+typedef struct {
+    struct wl_buffer *buffer;
+    uint32_t *pixels;
+    int width, height; /* Stride is width * 4. */
+    size_t size;
+    bool busy; /* Attached and not yet released by the compositor. */
+} DeskBuffer;
+
+/* Two shm buffers, so one can be drawn while the compositor reads the other. */
+typedef struct {
+    DeskBuffer slots[2];
+} DeskBufferPool;
+
+/* Return a buffer that the compositor isn't using, of the given size and
+   32-bit shm format, reallocating when the size changed. It is marked busy:
+   attach and commit it. Return NULL when both are busy or allocation fails. */
+DeskBuffer *desk_buffer_get(DeskBufferPool *pool, struct wl_shm *shm, int width, int height, uint32_t format);
+
+void desk_buffer_pool_finish(DeskBufferPool *pool);
+#endif
+
 #endif
