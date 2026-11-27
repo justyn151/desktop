@@ -19,6 +19,7 @@ COPY_XML = $(P)/staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml
 SOURCE_XML = $(P)/staging/ext-image-capture-source/ext-image-capture-source-v1.xml
 # The capture source protocol references ext_foreign_toplevel_handle_v1.
 TOPLEVEL_XML = $(P)/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml
+DATA_CONTROL_XML = $(P)/staging/ext-data-control/ext-data-control-v1.xml
 VIEWPORTER_XML = $(P)/stable/viewporter/viewporter.xml
 CURSOR_SHAPE_XML = $(P)/staging/cursor-shape/cursor-shape-v1.xml
 # cursor-shape references zwp_tablet_tool_v2, and layer-shell references xdg_popup.
@@ -27,7 +28,7 @@ XDG_SHELL_XML = $(P)/stable/xdg-shell/xdg-shell.xml
 LAYER_SHELL_XML = $(WLR_PROTOCOLS_DIR)/unstable/wlr-layer-shell-unstable-v1.xml
 IPC_XML = ../dwl/protocols/dwl-ipc-unstable-v2.xml
 
-NAMES = ext-image-copy-capture-v1 ext-image-capture-source-v1 ext-foreign-toplevel-list-v1 viewporter \
+NAMES = ext-image-copy-capture-v1 ext-image-capture-source-v1 ext-foreign-toplevel-list-v1 ext-data-control-v1 viewporter \
         cursor-shape-v1 tablet-v2 xdg-shell wlr-layer-shell-unstable-v1 dwl-ipc-unstable-v2
 HEADERS = $(NAMES:%=$(BUILD)/%-client-protocol.h)
 PROTOCOLS = $(NAMES:%=$(BUILD)/%-protocol.c)
@@ -58,6 +59,7 @@ $(BUILD)/default-config.h: shot.conf | $(BUILD)
 $(BUILD)/ext-image-copy-capture-v1-client-protocol.h $(BUILD)/ext-image-copy-capture-v1-protocol.c: $(COPY_XML)
 $(BUILD)/ext-image-capture-source-v1-client-protocol.h $(BUILD)/ext-image-capture-source-v1-protocol.c: $(SOURCE_XML)
 $(BUILD)/ext-foreign-toplevel-list-v1-client-protocol.h $(BUILD)/ext-foreign-toplevel-list-v1-protocol.c: $(TOPLEVEL_XML)
+$(BUILD)/ext-data-control-v1-client-protocol.h $(BUILD)/ext-data-control-v1-protocol.c: $(DATA_CONTROL_XML)
 $(BUILD)/viewporter-client-protocol.h $(BUILD)/viewporter-protocol.c: $(VIEWPORTER_XML)
 $(BUILD)/cursor-shape-v1-client-protocol.h $(BUILD)/cursor-shape-v1-protocol.c: $(CURSOR_SHAPE_XML)
 $(BUILD)/tablet-v2-client-protocol.h $(BUILD)/tablet-v2-protocol.c: $(TABLET_XML)

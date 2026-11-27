@@ -1,8 +1,8 @@
 # shot
 
-`shot` takes screenshots on dwl. Version 0.2 captures a whole output or a dragged region to a PNG file. Clipboard, window capture and key bindings follow in the milestones in [docs/shot-roadmap.md](../docs/shot-roadmap.md).
+`shot` takes screenshots on dwl. Version 0.3 captures a whole output or a dragged region to a PNG file, the clipboard, or both. Window capture and key bindings follow in the milestones in [docs/shot-roadmap.md](../docs/shot-roadmap.md).
 
-It uses `ext-image-copy-capture-v1` with `ext-output-image-capture-source-v1`, dwl IPC to find the focused monitor, and a `wlr-layer-shell` overlay with `wp-viewporter` and `cursor-shape-v1` for region selection. It's built on [desk](../desk/README.md): atomic file writes, shm buffers, config paths and the INI parser.
+It uses `ext-image-copy-capture-v1` with `ext-output-image-capture-source-v1`, dwl IPC to find the focused monitor, and a `wlr-layer-shell` overlay with `wp-viewporter` and `cursor-shape-v1` for region selection, and `ext-data-control-v1` for the clipboard. It's built on [desk](../desk/README.md): atomic file writes, shm buffers, config paths and the INI parser.
 
 ## Build
 
@@ -16,7 +16,7 @@ make install      # /usr/local/bin/shot; honors PREFIX, BINDIR and DESTDIR
 ## Usage
 
 ```text
-shot [-r | -o OUTPUT] [-c] [FILE]
+shot [-r | -o OUTPUT] [-c] [-C] [FILE]
 shot -l
 ```
 
@@ -25,6 +25,7 @@ shot -l
 | `-r`, `--region` | Drag a rectangle to capture (see below) |
 | `-o`, `--output NAME` | Capture this output, by its name from `shot -l` (such as `eDP-1`) |
 | `-c`, `--cursor` | Paint the cursor into the image |
+| `-C`, `--clipboard` | Copy the PNG to the clipboard. Without `FILE` it only copies; with `FILE` (or `-`) it saves and copies |
 | `-l`, `--list` | Print each output's name, size and description, marking the focused one, and exit |
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show the version |
@@ -45,6 +46,12 @@ Exit status: 0 saved, 1 failed or cancelled, 2 usage error.
 
 The overlay buffer is the captured frame at full resolution, mapped onto the output with `wp-viewporter`, so what you select is exactly what's saved at any scale. Selection edges round outward to whole physical pixels.
 
+## Clipboard
+
+`-C`, or `[save] clipboard = true`, puts the PNG on the clipboard as `image/png` only, so pasting into a terminal does nothing instead of printing binary data. It works without a focused window, so monitor captures can be copied too.
+
+A clipboard needs a process to hand the data to whoever pastes, so shot forks a small background process that owns the selection. The command returns as soon as that process has the clipboard, so key bindings don't wait. The process detaches from the terminal, keeps only the encoded PNG, and exits when something else is copied. Copying again with shot replaces the previous one.
+
 ## Configuration
 
 shot reads `~/.config/shot/shot.conf` (or `$XDG_CONFIG_HOME/shot/shot.conf`). When the file is missing, shot writes the sample [`shot.conf`](shot.conf) there and says so on stderr. Delete the file to get the defaults back. Missing keys keep their built-in values, and a bad line is reported with its line number and ignored.
@@ -53,6 +60,7 @@ shot reads `~/.config/shot/shot.conf` (or `$XDG_CONFIG_HOME/shot/shot.conf`). Wh
 |---|---|---|---|
 | `[save]` | `directory` | `~/Pictures/Screenshots` | Where captures go without a `FILE`. A leading `~/` means `HOME`. |
 | | `name` | `%Y-%m-%d_%H-%M-%S.png` | `strftime` format. No `/`. |
+| | `clipboard` | `false` | Also copy every saved capture to the clipboard. |
 | `[capture]` | `cursor` | `false` | Always paint the cursor. `-c` does it for one capture. |
 | `[png]` | `compression` | `6` | zlib level 0–9. |
 | `[region]` | `dim` | `0.5` | Darkening outside the selection, 0–1. |
@@ -74,6 +82,12 @@ shot reads `~/.config/shot/shot.conf` (or `$XDG_CONFIG_HOME/shot/shot.conf`). Wh
 - [x] `shot -r -o X` is a usage error
 - [x] `shot -r` maps a dimmed frozen frame over the whole output, bar included
 - [x] `shot -r`: dragging shows the selection undimmed with an accent outline, and release saves exactly that area
+- [x] `shot -C` copies without saving; a data-control reader receives `image/png` that is a valid PNG
+- [x] `shot -C FILE` and `shot -C -` save and copy identical bytes, and `$(shot -C FILE)` returns at once
+- [x] The background process has its own session, no terminal, stdio on `/dev/null`, cwd `/`, and exits when a new `shot -C` takes the clipboard
+- [x] `[save] clipboard = true` copies every saved capture
+- [ ] Paste a `shot -r -C` capture into an application that accepts images
+- [ ] Copying text elsewhere makes the background process exit
 - [ ] `shot -r`: Escape, right-click and a plain click each cancel with status 1 and save nothing
 - [ ] `shot -r`: dragging past the output's edge stops at the edge
 - [ ] `shot -r` with a menu open: the menu is in the result

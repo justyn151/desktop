@@ -2,6 +2,7 @@
 #include "shot.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <getopt.h>
 #include <linux/input-event-codes.h>
@@ -9,10 +10,12 @@
 #include <png.h>
 #include <poll.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -81,6 +84,8 @@ static void config_entry(void *data, const char *section, const char *key, const
         valid = value[0] != 0 && set_string(&config->directory, value);
     } else if (strcmp(section, "save") == 0 && strcmp(key, "name") == 0) {
         valid = value[0] != 0 && strchr(value, '/') == NULL && set_string(&config->name, value);
+    } else if (strcmp(section, "save") == 0 && strcmp(key, "clipboard") == 0) {
+        valid = desk_parse_bool(value, &config->clipboard);
     } else if (strcmp(section, "capture") == 0 && strcmp(key, "cursor") == 0) {
         valid = desk_parse_bool(value, &config->cursor);
     } else if (strcmp(section, "png") == 0 && strcmp(key, "compression") == 0) {
@@ -1235,14 +1240,37 @@ static const char *png_write(FILE *file, const struct image *image, int compress
     return NULL;
 }
 
+/* Encode to memory once, so a file, stdout and the clipboard share the bytes. */
+static bool png_encode(const struct image *image, int compression, struct png_data *png)
+{
+    *png = (struct png_data){0};
+    FILE *stream = open_memstream(&png->data, &png->size);
+    if (stream == NULL) {
+        warn("can't encode the PNG: %s", strerror(errno));
+        return false;
+    }
+    const char *error = png_write(stream, image, compression);
+    if (fclose(stream) == EOF && error == NULL) error = strerror(errno);
+    if (error != NULL) {
+        warn("can't encode the PNG: %s", error);
+        free(png->data);
+        *png = (struct png_data){0};
+        return false;
+    }
+    return true;
+}
+
+static bool write_all(FILE *file, const struct png_data *png)
+{
+    return fwrite(png->data, 1, png->size, file) == png->size;
+}
+
 /* Output files */
 
-static int save_stdout(const struct image *image, int compression)
+static int save_stdout(const struct png_data *png)
 {
-    const char *error = png_write(stdout, image, compression);
-    if (error == NULL && fflush(stdout) == EOF) error = strerror(errno);
-    if (error != NULL) {
-        warn("can't write to stdout: %s", error);
+    if (!write_all(stdout, png) || fflush(stdout) == EOF) {
+        warn("can't write to stdout: %s", strerror(errno));
         return EXIT_FAILED;
     }
     return EXIT_SAVED;
@@ -1286,7 +1314,7 @@ static bool default_path(const struct config *config, char **stem, char extensio
 
 /* Write path, or a name built from the config when path is NULL. Configured
    names never replace a file: they get -1, -2... instead. */
-static int save_file(const struct config *config, const char *path, const struct image *image)
+static int save_file(const struct config *config, const char *path, const struct png_data *png)
 {
     char *stem = NULL, *target = NULL;
     char extension[5] = "";
@@ -1307,9 +1335,8 @@ static int save_file(const struct config *config, const char *path, const struct
         free(target);
         return EXIT_FAILED;
     }
-    const char *png_error = png_write(atomic.file, image, config->compression);
-    if (png_error != NULL) {
-        warn("can't write %s: %s", path, png_error);
+    if (!write_all(atomic.file, png)) {
+        warn("can't write %s: %s", path, strerror(errno ? errno : EIO));
         desk_atomic_abort(&atomic);
         free(stem);
         free(target);
@@ -1334,11 +1361,197 @@ static int save_file(const struct config *config, const char *path, const struct
     return error != 0 ? EXIT_FAILED : EXIT_SAVED;
 }
 
+/* Clipboard */
+
+struct clipboard {
+    const struct png_data *png;
+    struct wl_display *display;
+    struct wl_registry *registry;
+    struct wl_seat *seat;
+    struct ext_data_control_manager_v1 *manager;
+    struct ext_data_control_device_v1 *device;
+    struct ext_data_control_source_v1 *source;
+    bool cancelled;
+};
+
+static const char png_mime[] = "image/png";
+
+static void source_send(void *data, struct ext_data_control_source_v1 *source, const char *mime_type, int32_t fd)
+{
+    (void)source;
+    struct clipboard *clipboard = data;
+    /* One process per transfer: a reader that stalls can't hold up the others,
+       and the copy needs no event loop of its own. SIGCHLD is ignored, so
+       finished writers are reaped automatically. */
+    if (strcmp(mime_type, png_mime) == 0 && fork() == 0) {
+        const char *at = clipboard->png->data;
+        size_t left = clipboard->png->size;
+        while (left > 0) {
+            ssize_t written = write(fd, at, left);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) _exit(1);
+            at += written;
+            left -= (size_t)written;
+        }
+        _exit(0);
+    }
+    close(fd);
+}
+
+static void source_cancelled(void *data, struct ext_data_control_source_v1 *source)
+{
+    (void)source;
+    struct clipboard *clipboard = data;
+    clipboard->cancelled = true;
+}
+
+static const struct ext_data_control_source_v1_listener source_listener = {
+    .send = source_send,
+    .cancelled = source_cancelled,
+};
+
+static void device_data_offer(void *data, struct ext_data_control_device_v1 *device,
+                              struct ext_data_control_offer_v1 *offer)
+{
+    (void)data, (void)device, (void)offer; /* Destroyed when a selection event names it. */
+}
+
+static void device_selection(void *data, struct ext_data_control_device_v1 *device,
+                             struct ext_data_control_offer_v1 *offer)
+{
+    (void)data, (void)device;
+    if (offer != NULL) ext_data_control_offer_v1_destroy(offer);
+}
+
+static void device_finished(void *data, struct ext_data_control_device_v1 *device)
+{
+    (void)device;
+    struct clipboard *clipboard = data;
+    clipboard->cancelled = true;
+}
+
+static const struct ext_data_control_device_v1_listener device_listener = {
+    .data_offer = device_data_offer,
+    .selection = device_selection,
+    .finished = device_finished,
+    .primary_selection = device_selection,
+};
+
+static void clipboard_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface,
+                             uint32_t version)
+{
+    (void)version;
+    struct clipboard *clipboard = data;
+    if (strcmp(interface, wl_seat_interface.name) == 0 && clipboard->seat == NULL)
+        clipboard->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+    else if (strcmp(interface, ext_data_control_manager_v1_interface.name) == 0)
+        clipboard->manager = wl_registry_bind(registry, name, &ext_data_control_manager_v1_interface, 1);
+}
+
+static void clipboard_global_remove(void *data, struct wl_registry *registry, uint32_t name)
+{
+    (void)data, (void)registry, (void)name;
+}
+
+static const struct wl_registry_listener clipboard_registry_listener = {
+    .global = clipboard_global,
+    .global_remove = clipboard_global_remove,
+};
+
+/* Connect and take the clipboard. Return false after reporting why not. */
+static bool clipboard_take(struct clipboard *clipboard)
+{
+    clipboard->display = wl_display_connect(NULL);
+    if (clipboard->display == NULL) {
+        warn("can't connect to the Wayland display for the clipboard");
+        return false;
+    }
+    clipboard->registry = wl_display_get_registry(clipboard->display);
+    wl_registry_add_listener(clipboard->registry, &clipboard_registry_listener, clipboard);
+    if (wl_display_roundtrip(clipboard->display) < 0) {
+        warn("lost the Wayland connection");
+        return false;
+    }
+    if (clipboard->manager == NULL || clipboard->seat == NULL) {
+        warn("the compositor lacks %s, which the clipboard needs",
+             clipboard->manager == NULL ? "ext-data-control-v1" : "wl_seat");
+        return false;
+    }
+    clipboard->device = ext_data_control_manager_v1_get_data_device(clipboard->manager, clipboard->seat);
+    ext_data_control_device_v1_add_listener(clipboard->device, &device_listener, clipboard);
+    clipboard->source = ext_data_control_manager_v1_create_data_source(clipboard->manager);
+    ext_data_control_source_v1_add_listener(clipboard->source, &source_listener, clipboard);
+    ext_data_control_source_v1_offer(clipboard->source, png_mime);
+    ext_data_control_device_v1_set_selection(clipboard->device, clipboard->source);
+    if (wl_display_roundtrip(clipboard->display) < 0 || clipboard->cancelled) {
+        warn("the compositor refused the clipboard selection");
+        return false;
+    }
+    return true;
+}
+
+/* Put the PNG on the clipboard. A background child owns the selection until
+   another client replaces it; the parent returns once the child has it, so
+   key bindings don't wait. */
+static int clipboard_copy(const struct png_data *png)
+{
+    int ready[2];
+    if (pipe2(ready, O_CLOEXEC) < 0) {
+        warn("can't start the clipboard process: %s", strerror(errno));
+        return EXIT_FAILED;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        warn("can't start the clipboard process: %s", strerror(errno));
+        close(ready[0]);
+        close(ready[1]);
+        return EXIT_FAILED;
+    }
+    if (pid > 0) {
+        close(ready[1]);
+        char ok = 0;
+        ssize_t got;
+        do got = read(ready[0], &ok, 1);
+        while (got < 0 && errno == EINTR);
+        close(ready[0]);
+        if (got == 1 && ok == 1) return EXIT_SAVED;
+        waitpid(pid, NULL, 0); /* It reported its own error. */
+        return EXIT_FAILED;
+    }
+
+    close(ready[0]);
+    setsid();
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    struct clipboard clipboard = {.png = png};
+    char ok = clipboard_take(&clipboard);
+    if (ok) {
+        /* Let go of the terminal and of $(...) pipes before reporting success. */
+        int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (null >= 0) {
+            dup2(null, STDIN_FILENO);
+            dup2(null, STDOUT_FILENO);
+            dup2(null, STDERR_FILENO);
+            close(null);
+        }
+        if (chdir("/") < 0) { /* Only so the directory isn't kept busy. */ }
+    }
+    if (write(ready[1], &ok, 1) < 0) { /* The parent is gone; serve anyway. */ }
+    close(ready[1]);
+    while (ok && !clipboard.cancelled && wl_display_dispatch(clipboard.display) >= 0) {
+    }
+    if (clipboard.display != NULL) wl_display_disconnect(clipboard.display);
+    _exit(ok ? EXIT_SAVED : EXIT_FAILED);
+}
+
 /* Command line */
 
 static void usage(FILE *stream)
 {
-    fputs("Usage: shot [-r | -o OUTPUT] [-c] [FILE]\n"
+    fputs("Usage: shot [-r | -o OUTPUT] [-c] [-C] [FILE]\n"
           "       shot -l\n"
           "\n"
           "Capture an output, or a region of one, to a PNG file.\n"
@@ -1346,6 +1559,7 @@ static void usage(FILE *stream)
           "  -r, --region       drag a rectangle to capture (Escape or right-click cancels)\n"
           "  -o, --output NAME  capture this output (default: the focused one)\n"
           "  -c, --cursor       include the cursor\n"
+          "  -C, --clipboard    copy to the clipboard; without FILE, don't save a file\n"
           "  -l, --list         list outputs and exit\n"
           "  -h, --help         show this help\n"
           "  -v, --version      show the version\n"
@@ -1361,19 +1575,21 @@ int main(int argc, char **argv)
         {"region", no_argument, NULL, 'r'},
         {"output", required_argument, NULL, 'o'},
         {"cursor", no_argument, NULL, 'c'},
+        {"clipboard", no_argument, NULL, 'C'},
         {"list", no_argument, NULL, 'l'},
         {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'v'},
         {0},
     };
     const char *output_name_option = NULL;
-    bool cursor = false, list = false, region = false;
+    bool cursor = false, list = false, region = false, clipboard = false;
     int option;
-    while ((option = getopt_long(argc, argv, "ro:clhv", options, NULL)) != -1) {
+    while ((option = getopt_long(argc, argv, "ro:cClhv", options, NULL)) != -1) {
         switch (option) {
         case 'r': region = true; break;
         case 'o': output_name_option = optarg; break;
         case 'c': cursor = true; break;
+        case 'C': clipboard = true; break;
         case 'l': list = true; break;
         case 'h': usage(stdout); return EXIT_SAVED;
         case 'v': puts("shot " SHOT_VERSION); return EXIT_SAVED;
@@ -1419,7 +1635,17 @@ int main(int argc, char **argv)
     }
     /* The image is in memory: drop the overlays before the slow PNG encoding. */
     shot_disconnect(&shot);
-    status = to_stdout ? save_stdout(&image, shot.config.compression) : save_file(&shot.config, path, &image);
+    struct png_data png;
+    if (!png_encode(&image, shot.config.compression, &png)) goto done;
+    /* The clipboard process lives on: keep only the encoded bytes. */
+    free(image.rgb);
+    image.rgb = NULL;
+    /* -C alone only copies. A FILE, or no -C, saves; [save] clipboard adds a copy. */
+    status = EXIT_SAVED;
+    if (!clipboard || path != NULL)
+        status = to_stdout ? save_stdout(&png) : save_file(&shot.config, path, &png);
+    if (status == EXIT_SAVED && (clipboard || shot.config.clipboard)) status = clipboard_copy(&png);
+    free(png.data);
 
 done:
     shot_disconnect(&shot);

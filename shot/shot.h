@@ -9,12 +9,13 @@
 #include "desk.h"
 #include "cursor-shape-v1-client-protocol.h"
 #include "dwl-ipc-unstable-v2-client-protocol.h"
+#include "ext-data-control-v1-client-protocol.h"
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
-#define SHOT_VERSION "0.2.0"
+#define SHOT_VERSION "0.3.0"
 
 /* Exit statuses. Cancelling a region selection counts as failed. */
 enum {
@@ -26,12 +27,19 @@ enum {
 struct config {
     char *directory; /* Expanded, for captures without a FILE argument. */
     char *name;      /* strftime format. */
+    bool clipboard;  /* Also copy every saved capture. */
     bool cursor;
     int compression; /* zlib level 0–9. */
     double dim;      /* 0 (none) to 1 (black) outside the selection. */
     int border;      /* Selection outline width in logical pixels. */
     bool border_accent; /* Use the palette accent instead of border_rgb. */
     uint32_t border_rgb;
+};
+
+/* An encoded PNG. */
+struct png_data {
+    char *data;
+    size_t size;
 };
 
 /* 8-bit RGB, upright, rows packed. */

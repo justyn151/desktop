@@ -134,6 +134,7 @@ Freeze first, then select, so menus, tooltips and the cursor don't change while 
 - After the capture, shot forks. The parent exits 0 so key bindings return at once, and the child serves the selection until `ext_data_control_source_v1.cancelled` (another client took the clipboard). Then it exits.
 - Also offer `image/png` only. No text types, so pasting into a terminal does nothing instead of dumping binary data.
 - The child closes stdin, stdout and stderr and calls `setsid`, so it doesn't hold a terminal open.
+- As built: the child opens its own Wayland connection after the fork, and the parent waits on a pipe until the child holds the selection, so the exit status reports a refused clipboard. Each paste is written by a short-lived grandchild, so a stalled reader can't block the others. The PNG is encoded once in memory and shared by the file, stdout and clipboard paths. `[save] clipboard` arrived with it.
 
 Manual checks: `shot -r -C`, paste into a browser or image editor; `wl-paste -l` lists `image/png`; copy some text and confirm the background shot process exits.
 
@@ -214,7 +215,7 @@ Manual checks: each binding saves into `~/Pictures/Screenshots` with the configu
 |---|---|---|
 | 0.1 | Full-monitor capture to PNG, desk atomic write and shm | Done (multi-monitor and rotation untested) |
 | 0.2 | Region: freeze, layer-shell overlay, crop. Config file (pulled forward from 0.5) | Done (cancel, edge and scale checks pending) |
-| 0.3 | Clipboard through `ext-data-control-v1`, background server | Planned |
+| 0.3 | Clipboard through `ext-data-control-v1`, background server | Code done, paste into an app pending |
 | 0.4 | Focused window: dwl IPC identifier, toplevel capture source | Planned (needs a dwl change) |
 | 0.5 | Print bindings in dwl, install the sample config | Planned (config itself landed in 0.2) |
 | 1.0 | Checklists, exit codes, README | Final |
