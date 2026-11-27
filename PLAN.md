@@ -137,8 +137,8 @@ dwl already supports `ext-image-copy-capture-v1`, `ext-image-capture-source-v1` 
 | 0.1 | Full-monitor capture to PNG (libpng, already used by wall) |
 | 0.2 | Region capture: freeze all outputs first, select on a layer-shell overlay, crop from the frozen frame |
 | 0.3 | Clipboard (`image/png`). The process stays in the background until the selection is cancelled |
-| 0.4 | Focused-window capture. Add the focused toplevel's identifier to dwl IPC |
-| 0.5 | Config, Print key bindings in dwl, save to `~/Pictures/Screenshots/%Y-%m-%d_%H-%M-%S.png` |
+| 0.4 | Skipped: focused-window capture, not needed for now |
+| 0.5 | Config, Super+Shift+S for region capture, save to `~/Pictures/Screenshots/%Y-%m-%d_%H-%M-%S.png` and copy |
 
 Notes:
 - Handle XRGB8888 and XBGR8888 shm formats
