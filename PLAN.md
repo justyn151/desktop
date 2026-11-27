@@ -19,9 +19,9 @@ Goal: deal is the only terminal on the system.
 
 The code is already in the repo. What's left is the manual checklist in `deal/README.md`.
 
-- [ ] Work through every item in the "Manual verification on dwl" checklist
-- [ ] Fix whatever fails
-- [ ] Tick the checklist and tag 0.10.3
+- [x] Work through every item in the "Manual verification on dwl" checklist
+- [x] Fix whatever fails
+- [x] Tick the checklist and tag 0.10.3
 
 ### 1.2 0.10.4: Scaling and rendering polish
 

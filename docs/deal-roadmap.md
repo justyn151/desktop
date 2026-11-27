@@ -46,7 +46,7 @@ The code is already merged. This milestone is the manual checklist in [`deal/REA
 
 ### Done when
 
-Every checklist item is ticked on dwl and the tag is pushed.
+Every checklist item is ticked on dwl and the tag is pushed. **Done 2026-11-27.**
 
 ---
 
@@ -242,7 +242,7 @@ Release work:
 
 | Version | Theme | Status |
 |---|---|---|
-| 0.10.3 | Verify clipboard, selection, mouse | Code done, checklist pending |
+| 0.10.3 | Verify clipboard, selection, mouse | Done |
 | 0.10.4 | HiDPI and fractional scaling | Planned |
 | 0.10.5 | Text attributes, bold/italic faces, box drawing | **New** |
 | 0.11.0 | Compose, urgency, OSC 52, sync output, OSC 7 | Planned (extended) |

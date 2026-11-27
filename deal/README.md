@@ -100,23 +100,23 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 
 ## Manual verification on dwl
 
-- [ ] Build and check `./deal --version` reports 0.10.3. Inspect `readelf -d ./deal` for direct dependencies and launch with `env -u DISPLAY ./deal`.
-- [ ] Run diagnostics. Check xdg-shell configure, EGL vendor/version, desktop OpenGL, the expected renderer, and clipboard and primary-selection availability.
-- [ ] Verify an interactive prompt, UTF-8 and wide glyphs, ANSI and RGB colors, alternate-screen entry and exit, and a known `-e` exit status.
-- [ ] Hold a letter, Backspace, and an arrow. Check the compositor's delay and repeat rate, then release the key, change focus, and change Shift while holding a letter. Check modified arrows, Home, End, Page Up and Page Down, and F1–F12 with the fullscreen shortcut disabled.
-- [ ] Hold both zoom shortcuts and reset with Ctrl+Shift+0. Verify the configured step and limits and release Ctrl before the zoom key to check for stray shell input. Try customized zoom bindings.
-- [ ] Try Ctrl+wheel with a detented wheel, a high-resolution wheel, and a touchpad. Verify smaller movements accumulate and ordinary scrolling still works. In an application using mouse reporting, verify ordinary wheel reports and the Shift override. Check that Ctrl+wheel sends no wheel report to the application.
-- [ ] Single-drag across rows containing wide and combining characters. Double-click a word across a soft wrap and triple-click a wrapped logical line. Check the copied text for missing or extra line breaks. Drag above and below the grid while in scrollback.
-- [ ] Copy and paste in both directions between two deal windows and between deal and another Wayland application. Paste large multiline UTF-8 text, check that the UI stays responsive, and close the source or destination during a transfer.
-- [ ] Copy one string to the regular clipboard, select another, then use Ctrl+Shift+V and middle click to check that the two channels remain independent. Repeat with `primary = false` and on a compositor without the primary-selection protocol if available.
-- [ ] Check paste with bracketed mode enabled and disabled. In Neovim with mouse enabled, exercise press, drag, release and both wheel axes. Hold Shift for local selection and test release after pressing Shift partway through an application drag.
-- [ ] Change `scroll_lines`, selection colors and `click_interval` and reload. Verify one change per detent on a wheel emitting both distance and detent metadata.
-- [ ] Use Ctrl+left click on an HTTP or HTTPS OSC 8 link. Check that normal clicks start selection when mouse reporting is inactive and unsupported URL schemes do not open.
-- [ ] While zooming, verify the window stays the same size, `stty size` follows the grid, the shell stays running, and existing scrollback reflows. Reload with changed zoom limits and verify a reset uses the configured size.
-- [ ] Tile, float, resize and toggle fullscreen. Confirm the shell sees new dimensions with `stty size`. Generate scrollback and verify reflow and the scrollback shortcuts.
-- [ ] Set opacity below 1 and compare the background, padding, explicit cell backgrounds, and text edges. Leave a shell idle with cursor blink disabled and confirm frame submissions stop.
-- [ ] Change the font, opacity, palette and padding. Reload once through the shortcut and once with SIGHUP. Check that the shell PID and scrollback survive and that invalid input reports its line while preserving the active settings.
-- [ ] Verify compositor close, shell exit and compositor disconnection in a disposable session. Exercise the desktop entry, custom terminfo and uninstall if testing installation.
+- [x] Build and check `./deal --version` reports 0.10.3. Inspect `readelf -d ./deal` for direct dependencies and launch with `env -u DISPLAY ./deal`.
+- [x] Run diagnostics. Check xdg-shell configure, EGL vendor/version, desktop OpenGL, the expected renderer, and clipboard and primary-selection availability.
+- [x] Verify an interactive prompt, UTF-8 and wide glyphs, ANSI and RGB colors, alternate-screen entry and exit, and a known `-e` exit status.
+- [x] Hold a letter, Backspace, and an arrow. Check the compositor's delay and repeat rate, then release the key, change focus, and change Shift while holding a letter. Check modified arrows, Home, End, Page Up and Page Down, and F1–F12 with the fullscreen shortcut disabled.
+- [x] Hold both zoom shortcuts and reset with Ctrl+Shift+0. Verify the configured step and limits and release Ctrl before the zoom key to check for stray shell input. Try customized zoom bindings.
+- [x] Try Ctrl+wheel with a detented wheel, a high-resolution wheel, and a touchpad. Verify smaller movements accumulate and ordinary scrolling still works. In an application using mouse reporting, verify ordinary wheel reports and the Shift override. Check that Ctrl+wheel sends no wheel report to the application.
+- [x] Single-drag across rows containing wide and combining characters. Double-click a word across a soft wrap and triple-click a wrapped logical line. Check the copied text for missing or extra line breaks. Drag above and below the grid while in scrollback.
+- [x] Copy and paste in both directions between two deal windows and between deal and another Wayland application. Paste large multiline UTF-8 text, check that the UI stays responsive, and close the source or destination during a transfer.
+- [x] Copy one string to the regular clipboard, select another, then use Ctrl+Shift+V and middle click to check that the two channels remain independent. Repeat with `primary = false` and on a compositor without the primary-selection protocol if available.
+- [x] Check paste with bracketed mode enabled and disabled. In Neovim with mouse enabled, exercise press, drag, release and both wheel axes. Hold Shift for local selection and test release after pressing Shift partway through an application drag.
+- [x] Change `scroll_lines`, selection colors and `click_interval` and reload. Verify one change per detent on a wheel emitting both distance and detent metadata.
+- [x] Use Ctrl+left click on an HTTP or HTTPS OSC 8 link. Check that normal clicks start selection when mouse reporting is inactive and unsupported URL schemes do not open.
+- [x] While zooming, verify the window stays the same size, `stty size` follows the grid, the shell stays running, and existing scrollback reflows. Reload with changed zoom limits and verify a reset uses the configured size.
+- [x] Tile, float, resize and toggle fullscreen. Confirm the shell sees new dimensions with `stty size`. Generate scrollback and verify reflow and the scrollback shortcuts.
+- [x] Set opacity below 1 and compare the background, padding, explicit cell backgrounds, and text edges. Leave a shell idle with cursor blink disabled and confirm frame submissions stop.
+- [x] Change the font, opacity, palette and padding. Reload once through the shortcut and once with SIGHUP. Check that the shell PID and scrollback survive and that invalid input reports its line while preserving the active settings.
+- [x] Verify compositor close, shell exit and compositor disconnection in a disposable session. Exercise the desktop entry, custom terminfo and uninstall if testing installation.
 
 ## Recommended next work
 
