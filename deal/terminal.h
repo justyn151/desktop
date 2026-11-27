@@ -11,15 +11,27 @@ typedef struct {
     unsigned char blue;
 } TerminalColor;
 
+enum {
+    TERMINAL_UNDERLINE_NONE, TERMINAL_UNDERLINE_SINGLE, TERMINAL_UNDERLINE_DOUBLE,
+    TERMINAL_UNDERLINE_CURLY, TERMINAL_UNDERLINE_DOTTED, TERMINAL_UNDERLINE_DASHED
+};
+enum { TERMINAL_STYLE_BOLD = 1, TERMINAL_STYLE_ITALIC = 2 };
+
 typedef struct {
     uint32_t character;
     TerminalColor foreground;
     TerminalColor background;
+    TerminalColor underline_color; /* Used when underline_source selects RGB. */
     unsigned int width : 2; /* 0 for a wide character's trailing cell, 1 or 2 otherwise. */
-    bool underline : 1;
+    unsigned int underline : 3; /* TERMINAL_UNDERLINE_*, zero for none. */
+    unsigned int style : 2; /* TERMINAL_STYLE_BOLD and TERMINAL_STYLE_ITALIC font faces. */
+    bool strikethrough : 1;
+    bool overline : 1;
+    bool concealed : 1;
     bool written : 1;
     bool narrowed : 1; /* A wide glyph retained while the grid is one column wide. */
     uint8_t foreground_source, background_source; /* Zero for fixed RGB. */
+    uint8_t underline_source; /* Zero follows the foreground. */
     uint16_t hyperlink; /* Zero or an ID owned by the terminal. */
     uint32_t combining[2];
 } TerminalCell;

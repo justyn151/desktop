@@ -1,8 +1,8 @@
-# deal 0.10.3
+# deal 0.10.5
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.10.3 adds text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.10.5 adds bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 
@@ -79,6 +79,24 @@ Key repeat follows the compositor's rate and delay for XKB-repeatable keys. Relo
 
 With `mouse.reporting` enabled, applications can request button, motion and wheel reports in legacy or SGR format. Hold `mouse.selection_override` (Shift by default) for local selection, primary paste or scrollback. Set selection colors under `[selection]`. Set `click_interval` from 100 to 1000 milliseconds to change the double- and triple-click interval. Set `primary = false` to disable primary selection.
 
+## Text attributes
+
+deal asks Fontconfig for bold, italic and bold italic faces of the configured family. When the family has no matching face, FreeType synthesizes the style from the regular face. `--diagnostics` lists the face chosen for each style. Fallback fonts for missing glyphs are also synthesized. Box-drawing, block and Powerline glyphs ignore italic so lines still meet.
+
+| SGR | Effect |
+|---|---|
+| 1 / 22 | Bold face. With `[colors] bold_is_bright = true` (the default), bold also brightens the default and first eight colors. 22 also clears dim. |
+| 3 / 23 | Italic face. Italic glyphs may overhang half a cell. |
+| 4 / 24, 21 | Single underline / none, double underline |
+| 4:0 – 4:5 | No, single, double, curly, dotted and dashed underline |
+| 58 / 59 | Underline color as `58;5;N`, `58;2;R;G;B` or `58:2::R:G:B` / follow the foreground |
+| 9 / 29 | Strikethrough |
+| 53 / 55 | Overline |
+| 8 / 28 | Concealed text. It stays selectable and copyable. |
+| 5, 6 / 25 | Blink. It's accepted but not animated. |
+
+Set `[terminal] term = deal` so Neovim and other terminfo programs use italics, strikethrough (`smxx`), styled underlines (`Smulx`) and underline colors (`Setulc`). With `xterm-color` they fall back to plain underlines.
+
 ## Clipboard and primary selection
 
 The regular clipboard uses the core Wayland `wl_data_device_manager` protocol. Primary selection uses `zwp_primary_selection_device_manager_v1` when advertised by the compositor. Completing a selection publishes it to primary selection. Ctrl+Shift+C publishes it to the separate regular clipboard. Local selection and the regular clipboard remain available when the primary protocol is absent.
@@ -95,10 +113,24 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 - Clipboard transfers support plain text, with a 32 MiB limit and a ten-second inactivity timeout. Clipboard persistence after the source exits depends on the compositor or a clipboard manager. File drag and drop and rich clipboard formats are outside this milestone.
 - Local scrollback is vertical. Applications requesting mouse reports can receive wheel reports on both axes. Selection highlighting can clear during reflow. An already copied selection retains its text.
 - Visual bell is available. Audible and urgency bells are deferred. Decoration policy is left to the compositor. The corresponding legacy settings remain accepted.
+- Bold and italic come from the primary family or synthesis. Fallback fonts are not matched by style.
 - Rendering uses scale-1 buffers. HiDPI and fractional output scaling may appear soft. Font coverage depends on the installed fonts. Complex text shaping and terminal graphics protocols are outside this milestone.
 - A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
 
 ## Manual verification on dwl
+
+### 0.10.5 text attributes
+
+- [ ] Build and check `./deal --version` reports 0.10.5. Run diagnostics and check the bold, italic and bold italic faces it reports.
+- [ ] Print each SGR from the table above. Check that bold and italic use real faces and that `bold_is_bright = false` keeps bold text in its original color after reload.
+- [ ] Check every underline style at several zoom levels. Curly, dotted and dashed patterns continue across cells without gaps. Check underline colors in 256-color and RGB forms and that 59 resets them.
+- [ ] Check italic letters with descenders and overhangs (`gjyf`) are not clipped badly. Check box drawing under italic stays connected.
+- [ ] Combine attributes with selection, the block cursor, inverse, dim and opacity below 1. Erase a line with an attribute active (`printf '\e[9;4m'; tput el`) and check nothing is drawn on the erased cells.
+- [ ] With `term = deal` installed, check Neovim diagnostics show undercurls in their own color, and `:hi Comment gui=italic` renders italic.
+- [ ] Repeat the 0.10.3 rendering and selection checks for regressions.
+
+### 0.10.3 baseline
+
 
 - [x] Build and check `./deal --version` reports 0.10.3. Inspect `readelf -d ./deal` for direct dependencies and launch with `env -u DISPLAY ./deal`.
 - [x] Run diagnostics. Check xdg-shell configure, EGL vendor/version, desktop OpenGL, the expected renderer, and clipboard and primary-selection availability.

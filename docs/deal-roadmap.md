@@ -94,7 +94,7 @@ This one was missing from the plan. Neovim, git and most TUIs already send these
 - **SGR additions:** 3/23 italic, 9/29 strikethrough, 53/55 overline, 5/25 blink (render it, or ignore it deliberately), 8/28 conceal, `4:0`–`4:5` underline styles (single, double, curly, dotted, dashed), and 58/59 underline color.
 - **Cell storage:** `TerminalCell` already uses bitfields. Add an `attributes` byte (italic, strike, overline, conceal) plus `underline_style : 3`, and an underline color source/RGB. Check the scrollback budget: the cell grows by about 4 bytes, so recompute how many lines fit in 64 MiB.
 - **Glyph cache key** becomes `(codepoint, face_style)`.
-- **Box drawing and block elements** (U+2500–U+259F): draw them procedurally as rectangles, not from the font. This removes the most visible font-dependent seams and pairs with the 0.10.4 work.
+- ~~**Box drawing and block elements** drawn procedurally~~. Dropped: deal already scales these glyphs to the cell edges using the font's own full-length strokes. Revisit only if seams show up at fractional scales in 0.10.4.
 
 Manual checks: `printf '\e[3mitalic\e[0m \e[1mbold\e[0m \e[9mstrike\e[0m \e[4:3;58:2::255:0:0mcurl\e[0m\n'`, Neovim diagnostics (undercurl), and `git diff --color-words`.
 
@@ -244,7 +244,7 @@ Release work:
 |---|---|---|
 | 0.10.3 | Verify clipboard, selection, mouse | Done |
 | 0.10.4 | HiDPI and fractional scaling | Planned |
-| 0.10.5 | Text attributes, bold/italic faces, box drawing | **New** |
+| 0.10.5 | Text attributes, bold/italic faces | Code done, checklist pending |
 | 0.11.0 | Compose, urgency, OSC 52, sync output, OSC 7 | Planned (extended) |
 | 0.11.1 | Kitty keyboard protocol | **New** |
 | 0.11.2 | Scrollback search and prompt marks | **New** |

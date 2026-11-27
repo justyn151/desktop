@@ -14,12 +14,14 @@
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_SYNTHESIS_H
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/input-event-codes.h>
 #include <locale.h>
+#include <math.h>
 #include <poll.h>
 #include <pty.h>
 #include <signal.h>
@@ -57,7 +59,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.10.3";
+static const char deal_version[] = "0.10.5";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -159,7 +161,8 @@ static const TerminalColor ansi_colors[] = {
 };
 
 /* Color sources retained by screen and history cells. */
-enum { SOURCE_FG = 1, SOURCE_BG, SOURCE_ANSI, SOURCE_DIM = 128 };
+/* SOURCE_RGB only appears in underline_source, where zero follows the foreground. */
+enum { SOURCE_FG = 1, SOURCE_BG, SOURCE_ANSI, SOURCE_RGB = 127, SOURCE_DIM = 128 };
 enum { TITLE_LIMIT = 512, LINK_LIMIT = 2048, LINK_SLOTS = 512, OSC_LIMIT = 2304 };
 
 /* Startup configuration */
@@ -247,7 +250,7 @@ typedef struct {
     unsigned int mouse_override, link_modifier;
     CursorStyle cursor_style;
     bool blink, decorations;
-    bool scroll_on_input, primary_selection;
+    bool scroll_on_input, primary_selection, bold_bright;
     Shortcut zoom_in, zoom_out, zoom_reset, reload, fullscreen;
     bool dynamic_title, mouse_reporting, hyperlinks;
 } Config;
@@ -259,7 +262,7 @@ static Config config_defaults(void)
                     .columns = INITIAL_COLUMNS, .rows = INITIAL_ROWS, .decorations = true, .opacity = 1.0f,
                     .blink_interval = DEFAULT_BLINK_INTERVAL, .cursor_thickness = DEFAULT_CURSOR_THICKNESS,
                     .history_capacity = 10000, .scroll_on_input = true, .scroll_lines = 3,
-                    .click_interval = 350, .primary_selection = true,
+                    .click_interval = 350, .primary_selection = true, .bold_bright = true,
                     .foreground = blank_cell.foreground,
                     .background = blank_cell.background, .cursor = blank_cell.foreground,
                     .cursor_style = CURSOR_UNDERLINE, .selection_foreground = {16, 22, 30},
@@ -471,6 +474,7 @@ static const ConfigKey config_keys[] = {
     SETTING("colors", "foreground", CFG_COLOR, foreground),
     SETTING("colors", "background", CFG_COLOR, background),
     SETTING("colors", "cursor", CFG_COLOR, cursor),
+    SETTING("colors", "bold_is_bright", CFG_BOOL, bold_bright),
     SETTING("selection", "foreground", CFG_COLOR, selection_foreground),
     SETTING("selection", "background", CFG_COLOR, selection_background),
     SETTING("selection", "primary", CFG_BOOL, primary_selection),
@@ -809,6 +813,7 @@ static bool color_equal(TerminalColor a, TerminalColor b)
 static bool default_blank(const TerminalCell *cell, TerminalCell blank)
 {
     return !cell->written && cell->character == ' ' && cell->width == 1 && !cell->underline &&
+           !cell->strikethrough && !cell->overline &&
            !cell->combining[0] && !cell->combining[1] && !cell->hyperlink &&
            cell->foreground_source == blank.foreground_source &&
            cell->background_source == blank.background_source &&
@@ -940,10 +945,18 @@ typedef struct {
 typedef struct {
     uint64_t used;
     uint32_t codepoint;
-    unsigned char span;
+    unsigned char span, style;
     bool mark;
     int x, y, width, height;
 } CachedGlyph;
+
+/* A bold, italic or bold italic variant of the primary family. A missing face
+   draws the regular face with FreeType synthesis instead. */
+typedef struct {
+    FontFace font;
+    unsigned int synthesis;
+    bool attempted;
+} StyledFace;
 
 typedef struct {
     FT_Library library;
@@ -951,7 +964,8 @@ typedef struct {
     FcFontSet *matches;
     FontFace *faces;
     size_t primary;
-    int size;
+    StyledFace styled[4];
+    int size, x_height;
     FontMetrics metrics;
     GLuint atlas;
     int atlas_size, tile_columns;
@@ -974,10 +988,20 @@ static GlyphBounds bitmap_bounds(FT_GlyphSlot slot)
     return bounds;
 }
 
-static bool font_load_glyph(FT_Face face, uint32_t codepoint)
+static bool font_load_glyph(FT_Face face, uint32_t codepoint, unsigned int synthesis)
 {
     FT_UInt index = FT_Get_Char_Index(face, codepoint);
-    if (index == 0 || FT_Load_Glyph(face, index, FT_LOAD_RENDER) != 0) return false;
+    if (index == 0) return false;
+    if (synthesis == 0) {
+        if (FT_Load_Glyph(face, index, FT_LOAD_RENDER) != 0) return false;
+    } else {
+        if (FT_Load_Glyph(face, index, FT_LOAD_DEFAULT) != 0) return false;
+        if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+            if (synthesis & TERMINAL_STYLE_ITALIC) FT_GlyphSlot_Oblique(face->glyph);
+            if (synthesis & TERMINAL_STYLE_BOLD) FT_GlyphSlot_Embolden(face->glyph);
+        }
+        if (FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL) != 0) return false;
+    }
     const FT_Bitmap *bitmap = &face->glyph->bitmap;
     if (bitmap->width > 4096 || bitmap->rows > 4096 ||
         face->glyph->bitmap_left < -4096 || face->glyph->bitmap_left > 4096 ||
@@ -1030,17 +1054,17 @@ static GlyphBounds font_ink_bounds(FT_GlyphSlot slot)
 static void font_graphic_bounds(FontFace *font)
 {
     FT_Face face = font->face;
-    if (font_load_glyph(face, 0x2500)) {
+    if (font_load_glyph(face, 0x2500, 0)) {
         GlyphBounds line = font_ink_bounds(face->glyph);
         font->box.left = line.left;
         font->box.right = line.right;
     }
-    if (font_load_glyph(face, 0x2502)) {
+    if (font_load_glyph(face, 0x2502, 0)) {
         GlyphBounds line = font_ink_bounds(face->glyph);
         font->box.top = line.top;
         font->box.bottom = line.bottom;
     }
-    if (font_load_glyph(face, 0x2588)) font->block = font_ink_bounds(face->glyph);
+    if (font_load_glyph(face, 0x2588, 0)) font->block = font_ink_bounds(face->glyph);
 }
 
 static FontFace *font_open_face(FontRenderer *renderer, size_t index)
@@ -1131,6 +1155,13 @@ static const char *font_open(FontRenderer *renderer, const Config *config, FcCon
         FontFace *candidate = font_open_face(renderer, i);
         if (candidate != NULL && font_measure(candidate->face, &renderer->metrics)) {
             renderer->primary = i;
+            FT_Face face = candidate->face;
+            FT_UInt x = FT_Get_Char_Index(face, 'x');
+            renderer->x_height = x != 0 && FT_Load_Glyph(face, x, FT_LOAD_DEFAULT) == 0
+                ? (int)((face->glyph->metrics.horiBearingY + 32) / 64) : 0;
+            if (renderer->x_height <= 0 || renderer->x_height > renderer->metrics.baseline) {
+                renderer->x_height = renderer->metrics.baseline / 2;
+            }
             return font_apply_spacing(&renderer->metrics, config) ? NULL : font_spacing_error;
         }
     }
@@ -1173,24 +1204,107 @@ static void font_close(FontRenderer *renderer)
         }
     }
     free(renderer->faces);
+    for (size_t i = 1; i < sizeof renderer->styled / sizeof renderer->styled[0]; ++i) {
+        FontFace *styled = &renderer->styled[i].font;
+        if (styled->face != NULL) FT_Done_Face(styled->face);
+    }
     if (renderer->matches != NULL) FcFontSetDestroy(renderer->matches);
     if (renderer->config != NULL) FcConfigDestroy(renderer->config);
     if (renderer->library != NULL) FT_Done_FreeType(renderer->library);
 }
 
-static FontFace *font_find_glyph(FontRenderer *renderer, uint32_t codepoint)
+static FontFace *font_find_glyph(FontRenderer *renderer, uint32_t codepoint, unsigned int synthesis)
 {
     FontFace *primary = &renderer->faces[renderer->primary];
-    if (font_load_glyph(primary->face, codepoint)) return primary;
+    if (font_load_glyph(primary->face, codepoint, synthesis)) return primary;
     for (size_t i = 0; i < (size_t)renderer->matches->nfont; ++i) {
         if (i == renderer->primary) continue;
         FcCharSet *charset;
         if (FcPatternGetCharSet(renderer->matches->fonts[i], FC_CHARSET, 0, &charset) == FcResultMatch &&
             !FcCharSetHasChar(charset, codepoint)) continue;
         FontFace *font = font_open_face(renderer, i);
-        if (font != NULL && font_load_glyph(font->face, codepoint)) return font;
+        if (font != NULL && font_load_glyph(font->face, codepoint, synthesis)) return font;
     }
     return NULL;
+}
+
+static bool font_same_file(FcPattern *a, FcPattern *b)
+{
+    FcChar8 *first, *second;
+    int first_index = 0, second_index = 0;
+    if (FcPatternGetString(a, FC_FILE, 0, &first) != FcResultMatch ||
+        FcPatternGetString(b, FC_FILE, 0, &second) != FcResultMatch) return false;
+    FcPatternGetInteger(a, FC_INDEX, 0, &first_index);
+    FcPatternGetInteger(b, FC_INDEX, 0, &second_index);
+    return first_index == second_index && strcmp((const char *)first, (const char *)second) == 0;
+}
+
+/* Match a styled face from the primary family. Fontconfig substitutes the
+   nearest face, so a different family, the regular file, or a weight or
+   slant that falls short of the request selects synthesis instead. */
+static StyledFace *font_styled(FontRenderer *renderer, unsigned int style)
+{
+    StyledFace *styled = &renderer->styled[style];
+    if (styled->attempted) return styled;
+    styled->attempted = true;
+    styled->synthesis = style;
+    FcPattern *primary = renderer->matches->fonts[renderer->primary];
+    FcChar8 *family;
+    if (FcPatternGetString(primary, FC_FAMILY, 0, &family) != FcResultMatch) return styled;
+    FcPattern *pattern = FcPatternCreate();
+    if (pattern == NULL) return styled;
+    bool bold = style & TERMINAL_STYLE_BOLD, italic = style & TERMINAL_STYLE_ITALIC;
+    FcPattern *match = NULL;
+    FcResult result;
+    if (FcPatternAddString(pattern, FC_FAMILY, family) &&
+        FcPatternAddDouble(pattern, FC_PIXEL_SIZE, renderer->size) &&
+        FcPatternAddInteger(pattern, FC_WEIGHT, bold ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR) &&
+        FcPatternAddInteger(pattern, FC_SLANT, italic ? FC_SLANT_ITALIC : FC_SLANT_ROMAN) &&
+        FcPatternAddBool(pattern, FC_SCALABLE, FcTrue) &&
+        FcConfigSubstitute(renderer->config, pattern, FcMatchPattern)) {
+        FcDefaultSubstitute(pattern);
+        match = FcFontMatch(renderer->config, pattern, &result);
+    }
+    FcPatternDestroy(pattern);
+    if (match == NULL) return styled;
+    FcChar8 *matched_family, *path;
+    int weight = FC_WEIGHT_REGULAR, slant = FC_SLANT_ROMAN, index = 0;
+    bool usable = FcPatternGetString(match, FC_FAMILY, 0, &matched_family) == FcResultMatch &&
+                  strcmp((const char *)matched_family, (const char *)family) == 0 &&
+                  !font_same_file(match, primary) &&
+                  FcPatternGetString(match, FC_FILE, 0, &path) == FcResultMatch;
+    if (usable) {
+        FcPatternGetInteger(match, FC_WEIGHT, 0, &weight);
+        FcPatternGetInteger(match, FC_SLANT, 0, &slant);
+        FcPatternGetInteger(match, FC_INDEX, 0, &index);
+        bool real_bold = weight >= FC_WEIGHT_DEMIBOLD, real_italic = slant != FC_SLANT_ROMAN;
+        /* A face that supplies neither requested property adds nothing. */
+        if ((bold && real_bold) || (italic && real_italic)) {
+            FT_Face face;
+            if (FT_New_Face(renderer->library, (const char *)path, index, &face) == 0) {
+                if (FT_Select_Charmap(face, FT_ENCODING_UNICODE) == 0 &&
+                    FT_Set_Pixel_Sizes(face, 0, (FT_UInt)renderer->size) == 0) {
+                    styled->font.face = face;
+                    font_graphic_bounds(&styled->font);
+                    styled->synthesis = (bold && !real_bold ? TERMINAL_STYLE_BOLD : 0) |
+                                        (italic && !real_italic ? TERMINAL_STYLE_ITALIC : 0);
+                } else FT_Done_Face(face);
+            }
+        }
+    }
+    FcPatternDestroy(match);
+    return styled;
+}
+
+static FontFace *font_find_styled(FontRenderer *renderer, uint32_t codepoint, unsigned int style)
+{
+    if (style != 0) {
+        StyledFace *styled = font_styled(renderer, style);
+        if (styled->font.face != NULL && font_load_glyph(styled->font.face, codepoint, styled->synthesis)) {
+            return &styled->font;
+        }
+    }
+    return font_find_glyph(renderer, codepoint, style);
 }
 
 static int scale_edge(int coordinate, int start, int end, int pixels)
@@ -1244,13 +1358,13 @@ static void glyph_tile(const FontRenderer *renderer, size_t slot, int *x, int *y
 static void glyph_upload(FontRenderer *renderer, CachedGlyph *glyph, size_t slot)
 {
     uint32_t codepoint = glyph->codepoint;
-    FontFace *font = font_find_glyph(renderer, codepoint);
+    FontFace *font = font_find_styled(renderer, codepoint, glyph->style);
     if (font == NULL && !glyph->mark) {
         codepoint = 0xfffd;
-        font = font_find_glyph(renderer, codepoint);
+        font = font_find_styled(renderer, codepoint, glyph->style);
         if (font == NULL) {
             codepoint = '?';
-            font = font_find_glyph(renderer, codepoint);
+            font = font_find_styled(renderer, codepoint, glyph->style);
         }
     }
     if (font == NULL) return;
@@ -1259,9 +1373,16 @@ static void glyph_upload(FontRenderer *renderer, CachedGlyph *glyph, size_t slot
     GlyphBounds target = glyph_placement(renderer, font, codepoint, glyph->span, glyph->mark);
     int cell_width = renderer->metrics.width * glyph->span;
     int cell_height = renderer->metrics.height;
-    int left = target.left > 0 ? target.left : 0;
+    /* Italic glyphs lean past a narrow cell. The tile holds two cell widths,
+       so let them overhang half a cell on each side. */
+    int first = 0, last = cell_width;
+    if ((glyph->style & TERMINAL_STYLE_ITALIC) && glyph->span == 1) {
+        first = -(renderer->metrics.width / 2);
+        last = 2 * renderer->metrics.width + first;
+    }
+    int left = target.left > first ? target.left : first;
     int top = target.top > 0 ? target.top : 0;
-    int right = target.right < cell_width ? target.right : cell_width;
+    int right = target.right < last ? target.right : last;
     int bottom = target.bottom < cell_height ? target.bottom : cell_height;
     if (right <= left || bottom <= top) return;
     glyph->x = left;
@@ -1291,16 +1412,18 @@ static void glyph_flush(FontRenderer *renderer)
     }
 }
 
-static size_t glyph_cached(FontRenderer *renderer, uint32_t codepoint, unsigned char span, bool mark)
+static size_t glyph_cached(FontRenderer *renderer, uint32_t codepoint, unsigned char span,
+                           unsigned char style, bool mark)
 {
-    uint32_t hash = (codepoint << 2) | (span == 2 ? 2u : 0u) | mark;
+    uint32_t hash = (codepoint << 4) | ((uint32_t)style << 2) | (span == 2 ? 2u : 0u) | mark;
     hash = (hash ^ (hash >> 16)) * UINT32_C(0x7feb352d);
     hash ^= hash >> 15;
     size_t bucket = (hash % (renderer->cache_size / GLYPH_CACHE_WAYS)) * GLYPH_CACHE_WAYS;
     size_t target = bucket;
     for (size_t slot = bucket; slot < bucket + GLYPH_CACHE_WAYS; ++slot) {
         CachedGlyph *glyph = &renderer->cache[slot];
-        if (glyph->used != 0 && glyph->codepoint == codepoint && glyph->span == span && glyph->mark == mark) {
+        if (glyph->used != 0 && glyph->codepoint == codepoint && glyph->span == span &&
+            glyph->style == style && glyph->mark == mark) {
             glyph->used = ++renderer->access;
             return slot;
         }
@@ -1309,7 +1432,8 @@ static size_t glyph_cached(FontRenderer *renderer, uint32_t codepoint, unsigned 
     /* Previously submitted quads must finish using this tile before it changes. */
     glyph_flush(renderer);
     CachedGlyph *entry = &renderer->cache[target];
-    *entry = (CachedGlyph){.used = ++renderer->access, .codepoint = codepoint, .span = span, .mark = mark};
+    *entry = (CachedGlyph){.used = ++renderer->access, .codepoint = codepoint, .span = span,
+                           .style = style, .mark = mark};
     glyph_upload(renderer, entry, target);
     return target;
 }
@@ -1332,10 +1456,14 @@ static int grid_extent(int pixels, int padding)
     return pixels > 2 * padding ? pixels - 2 * padding : 0;
 }
 
-static void render_glyph(FontRenderer *renderer, uint32_t codepoint, unsigned char span, bool mark,
-                         TerminalColor foreground, int x, int y)
+static void render_glyph(FontRenderer *renderer, uint32_t codepoint, unsigned char span,
+                         unsigned char style, bool mark, TerminalColor foreground, int x, int y)
 {
-    size_t slot = glyph_cached(renderer, codepoint, span, mark);
+    /* Slanted grid graphics would no longer meet their neighbours. */
+    if ((codepoint >= 0x2500 && codepoint <= 0x259f) || (codepoint >= 0xe0b0 && codepoint <= 0xe0bf)) {
+        style &= ~TERMINAL_STYLE_ITALIC;
+    }
+    size_t slot = glyph_cached(renderer, codepoint, span, style, mark);
     const CachedGlyph *glyph = &renderer->cache[slot];
     if (glyph->width == 0) return;
     if (!renderer->drawing) {
@@ -1355,6 +1483,61 @@ static void render_glyph(FontRenderer *renderer, uint32_t codepoint, unsigned ch
     glTexCoord2f(u1, v0); glVertex2i(x + glyph->width, y);
     glTexCoord2f(u1, v1); glVertex2i(x + glyph->width, y + glyph->height);
     glTexCoord2f(u0, v1); glVertex2i(x, y + glyph->height);
+}
+
+static int decoration_thickness(int cell_height)
+{
+    int thickness = (cell_height + 8) / 18;
+    return thickness > 0 ? thickness : 1;
+}
+
+/* Draw one cell's underline inside a GL_QUADS batch. Patterns use the
+   absolute x position so they continue across neighbouring cells. */
+static void render_underline(unsigned int style, int x, int y, int width, int cell_width,
+                             int cell_height, int origin)
+{
+    int thickness = decoration_thickness(cell_height);
+    int base = cell_height - 1 - thickness;
+    if (base < 0) base = 0;
+    switch (style) {
+    case TERMINAL_UNDERLINE_DOUBLE:
+        render_rectangle(x, y + base, width, thickness);
+        if (base >= 2 * thickness) render_rectangle(x, y + base - 2 * thickness, width, thickness);
+        break;
+    case TERMINAL_UNDERLINE_CURLY: {
+        int amplitude = cell_height / 8 > thickness + 1 ? cell_height / 8 : thickness + 1;
+        if (amplitude > base + thickness) amplitude = base + thickness;
+        int rise = amplitude - thickness;
+        for (int i = 0; i < width; ++i) {
+            int phase = (x - origin + i) % cell_width;
+            double angle = 2.0 * 3.14159265358979323846 * (phase + 0.5) / cell_width;
+            int lift = (int)(rise * (1.0 - cos(angle)) / 2.0 + 0.5);
+            render_rectangle(x + i, y + base - lift, 1, thickness + (rise > 0));
+        }
+        break;
+    }
+    case TERMINAL_UNDERLINE_DOTTED:
+        for (int i = 0; i < width; ++i) {
+            if ((x - origin + i) % (2 * thickness) < thickness) render_rectangle(x + i, y + base, 1, thickness);
+        }
+        break;
+    case TERMINAL_UNDERLINE_DASHED:
+        for (int offset = 0; offset < width; offset += cell_width) {
+            int inset = cell_width / 6;
+            render_rectangle(x + offset + inset, y + base, cell_width - 2 * inset, thickness);
+        }
+        break;
+    default:
+        render_rectangle(x, y + base, width, thickness);
+        break;
+    }
+}
+
+static TerminalColor underline_color(const Config *config, const TerminalCell *cell, TerminalColor foreground)
+{
+    if (cell->underline_source == 0) return foreground;
+    if (cell->underline_source == SOURCE_RGB) return cell->underline_color;
+    return cell_color(config, cell->underline_source, cell->underline_color);
 }
 
 static void render_screen(FontRenderer *renderer, const TerminalView *view, int width, int height,
@@ -1391,6 +1574,7 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
         block_first = cursor_column - (cells[cursor_column].width == 0 && cursor_column > 0);
         block_end = block_first + cells[block_first].width;
     }
+    bool any_strikethrough = false;
     glBegin(GL_QUADS);
     for (size_t row = 0; row < screen->rows; ++row) {
         uint64_t line = view->first_visible + row;
@@ -1401,7 +1585,7 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
         size_t start = 0;
         TerminalColor run = background;
         bool solid_run = false;
-        bool has_underline = false;
+        bool has_decoration = false;
         for (size_t column = 0; column < screen->columns; ++column) {
             const TerminalCell *cell = view_cell(view, &source, column);
             bool under_block = row == block_row && column >= block_first && column < block_end;
@@ -1420,24 +1604,36 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
                 solid_run = solid;
                 start = column;
             }
-            has_underline |= cell->underline || (view->hovered_link && cell->hyperlink == view->hovered_link);
+            has_decoration |= cell->underline || cell->overline ||
+                              (view->hovered_link && cell->hyperlink == view->hovered_link);
+            any_strikethrough |= cell->strikethrough;
         }
         if (solid_run) {
             render_color(run);
             render_rectangle(pad_x + (int)start * cell_width, y, (int)(screen->columns - start) * cell_width, cell_height);
         }
-        if (!has_underline) continue;
+        if (!has_decoration) continue;
         for (size_t column = 0; column < screen->columns && column < source.stored; ++column) {
             const TerminalCell *cell = &source.cells[column];
             bool hover = view->hovered_link && cell->hyperlink == view->hovered_link;
-            if (!cell->underline && !hover) continue;
+            if (!cell->underline && !cell->overline && !hover) continue;
             bool selected = column >= selected_first && column < selected_end;
             bool under_block = row == block_row && column >= block_first && column < block_end;
             TerminalColor fg = selected ? config->selection_foreground : cell_color(config, cell->foreground_source, cell->foreground);
             TerminalColor bg = selected ? config->selection_background : cell_color(config, cell->background_source, cell->background);
-            render_color(under_block ? bg : fg);
-            render_rectangle(pad_x + (int)column * cell_width, y + (cell_height > 1 ? cell_height - 2 : 0),
-                             hover && !cell->underline && cell_width > 1 ? cell_width - 1 : cell_width, 1);
+            int x = pad_x + (int)column * cell_width;
+            if (cell->overline) {
+                render_color(under_block ? bg : fg);
+                render_rectangle(x, y, cell_width, decoration_thickness(cell_height));
+            }
+            if (cell->underline) {
+                render_color(under_block ? bg : underline_color(config, cell, fg));
+                render_underline(cell->underline, x, y, cell_width, cell_width, cell_height, pad_x);
+            } else if (hover) {
+                render_color(under_block ? bg : fg);
+                render_rectangle(x, y + (cell_height > 1 ? cell_height - 2 : 0),
+                                 cell_width > 1 ? cell_width - 1 : cell_width, 1);
+            }
         }
     }
     glEnd();
@@ -1458,22 +1654,52 @@ static void render_screen(FontRenderer *renderer, const TerminalView *view, int 
             const TerminalCell *cell = &source.cells[column];
             if (cell->width == 0 || column + cell->width > screen->columns) continue;
             bool glyph = cell->character != ' ' && cell->character != 0x2800;
-            if (!glyph && !cell->combining[0]) continue;
+            if ((!glyph && !cell->combining[0]) || cell->concealed) continue;
             int x = pad_x + (int)column * cell_width;
             bool selected = column >= selected_first && column < selected_end;
             TerminalColor foreground = selected ? config->selection_foreground : cell_color(config, cell->foreground_source, cell->foreground);
             if (row == block_row && column == block_first) foreground = selected ? config->selection_background : cell_color(config, cell->background_source, cell->background);
             if (glyph) {
-                render_glyph(renderer, cell->character, cell->width, false, foreground, x, y);
+                render_glyph(renderer, cell->character, cell->width, cell->style, false, foreground, x, y);
             }
             for (size_t i = 0; i < sizeof cell->combining / sizeof cell->combining[0] && cell->combining[i]; ++i) {
-                render_glyph(renderer, cell->combining[i], cell->width, true, foreground, x, y);
+                render_glyph(renderer, cell->combining[i], cell->width, cell->style, true, foreground, x, y);
             }
         }
     }
     glyph_flush(renderer);
     glDisable(GL_BLEND);
     glDisable(GL_TEXTURE_2D);
+
+    /* Strikethrough crosses the glyphs, so it follows them. */
+    if (any_strikethrough) {
+        int thickness = decoration_thickness(cell_height);
+        int offset = renderer->metrics.baseline - renderer->x_height / 2 - thickness / 2;
+        if (offset < 0) offset = 0;
+        glBegin(GL_QUADS);
+        for (size_t row = 0; row < screen->rows; ++row) {
+            uint64_t line = view->first_visible + row;
+            LineView source = view_line(view, line);
+            size_t selected_first, selected_end;
+            view_selection_columns(view, line, source.columns, &selected_first, &selected_end);
+            int y = pad_y + (int)row * cell_height + offset;
+            for (size_t column = 0; column < screen->columns && column < source.stored; ++column) {
+                const TerminalCell *cell = &source.cells[column];
+                if (!cell->strikethrough) continue;
+                bool selected = column >= selected_first && column < selected_end;
+                bool under_block = row == block_row && column >= block_first && column < block_end;
+                TerminalColor color = selected ? config->selection_foreground
+                                               : cell_color(config, cell->foreground_source, cell->foreground);
+                if (under_block) {
+                    color = selected ? config->selection_background
+                                     : cell_color(config, cell->background_source, cell->background);
+                }
+                render_color(color);
+                render_rectangle(pad_x + (int)column * cell_width, y, cell_width, thickness);
+            }
+        }
+        glEnd();
+    }
 
     if (show_cursor && block_row == SIZE_MAX) {
         int x = pad_x + (int)cursor_column * cell_width;
@@ -2180,10 +2406,15 @@ typedef struct {
 typedef struct {
     ColorSpec foreground;
     ColorSpec background;
+    ColorSpec underline_color;
+    unsigned char underline; /* TERMINAL_UNDERLINE_* */
     bool bold;
     bool dim;
-    bool underline;
+    bool italic;
     bool inverse;
+    bool strikethrough;
+    bool overline;
+    bool concealed;
 } Rendition;
 
 typedef struct {
@@ -2266,6 +2497,7 @@ typedef struct {
     bool application_keypad;
     bool insert_mode;
     bool bracketed_paste, bell_pending;
+    bool bold_bright;
 } Terminal;
 
 static size_t minimum(size_t a, size_t b)
@@ -2364,6 +2596,7 @@ static void terminal_configure(Terminal *terminal, const Config *config)
     terminal->defaults.background = config->background;
     terminal->cursor_color = config->cursor;
     memcpy(terminal->palette, config->palette, sizeof terminal->palette);
+    terminal->bold_bright = config->bold_bright;
     if (terminal->default_cursor_style != config->cursor_style) {
         terminal->default_cursor_style = config->cursor_style;
         terminal->primary.cursor_style = terminal->alternate.cursor_style = config->cursor_style;
@@ -2478,7 +2711,7 @@ static TerminalCell terminal_cell(const Terminal *terminal, const TerminalBuffer
                                   uint32_t character, unsigned char width)
 {
     const Rendition *rendition = &buffer->cursor.rendition;
-    uint8_t fs = color_source(rendition->foreground, SOURCE_FG, rendition->bold);
+    uint8_t fs = color_source(rendition->foreground, SOURCE_FG, rendition->bold && terminal->bold_bright);
     uint8_t bs = color_source(rendition->background, SOURCE_BG, false);
     TerminalColor fg = resolve_color(terminal, rendition->foreground, fs);
     TerminalColor bg = resolve_color(terminal, rendition->background, bs);
@@ -2488,17 +2721,34 @@ static TerminalCell terminal_cell(const Terminal *terminal, const TerminalBuffer
         fg.green /= 2;
         fg.blue /= 2;
     }
+    uint8_t us = 0;
+    TerminalColor underline = {0};
+    if (rendition->underline_color.kind != COLOR_DEFAULT) {
+        us = color_source(rendition->underline_color, 0, false);
+        underline = resolve_color(terminal, rendition->underline_color, us);
+        if (us == 0) us = SOURCE_RGB;
+    }
     return (TerminalCell){.character = character, .foreground = rendition->inverse ? bg : fg,
                           .background = rendition->inverse ? fg : bg,
                           .foreground_source = rendition->inverse ? bs : fs,
                           .background_source = rendition->inverse ? fs : bs,
-                          .underline = rendition->underline, .width = width};
+                          .underline = rendition->underline, .underline_source = us,
+                          .underline_color = underline,
+                          .style = (rendition->bold ? TERMINAL_STYLE_BOLD : 0) |
+                                   (rendition->italic ? TERMINAL_STYLE_ITALIC : 0),
+                          .strikethrough = rendition->strikethrough, .overline = rendition->overline,
+                          .concealed = rendition->concealed, .width = width};
 }
 
 static TerminalCell terminal_blank(const Terminal *terminal, const TerminalBuffer *buffer)
 {
     TerminalCell cell = terminal_cell(terminal, buffer, ' ', 1);
-    cell.underline = false;
+    /* Erasure keeps only the colors. */
+    cell.underline = TERMINAL_UNDERLINE_NONE;
+    cell.underline_source = 0;
+    cell.underline_color = (TerminalColor){0};
+    cell.style = 0;
+    cell.strikethrough = cell.overline = cell.concealed = false;
     return cell;
 }
 
@@ -3046,14 +3296,17 @@ static void terminal_sgr(Rendition *rendition, const Parser *parser)
         size_t end = i + 1;
         while (end < parser->count && parser->subparameter[end]) ++end;
         if (code == 38 || code == 48 || code == 58) {
-            ColorSpec discard;
             ColorSpec *target = code == 38 ? &rendition->foreground
-                               : code == 48 ? &rendition->background : &discard;
+                               : code == 48 ? &rendition->background : &rendition->underline_color;
             size_t limit = end > i + 1 ? end : parser->count;
             i = sgr_extended(target, parser, i, limit);
             continue;
         }
         if (end > i + 1) {
+            /* 4:0 through 4:5 select an underline style. */
+            if (code == 4 && parser->parameters[i + 1] <= TERMINAL_UNDERLINE_DASHED) {
+                rendition->underline = (unsigned char)parser->parameters[i + 1];
+            }
             i = end;
             continue;
         }
@@ -3061,13 +3314,24 @@ static void terminal_sgr(Rendition *rendition, const Parser *parser)
         case 0: *rendition = (Rendition){0}; break;
         case 1: rendition->bold = true; break;
         case 2: rendition->dim = true; break;
-        case 4: rendition->underline = true; break;
+        case 3: rendition->italic = true; break;
+        case 4: rendition->underline = TERMINAL_UNDERLINE_SINGLE; break;
         case 7: rendition->inverse = true; break;
+        case 8: rendition->concealed = true; break;
+        case 9: rendition->strikethrough = true; break;
+        case 21: rendition->underline = TERMINAL_UNDERLINE_DOUBLE; break;
         case 22: rendition->bold = rendition->dim = false; break;
-        case 24: rendition->underline = false; break;
+        case 23: rendition->italic = false; break;
+        case 24: rendition->underline = TERMINAL_UNDERLINE_NONE; break;
         case 27: rendition->inverse = false; break;
+        case 28: rendition->concealed = false; break;
+        case 29: rendition->strikethrough = false; break;
         case 39: rendition->foreground = (ColorSpec){0}; break;
         case 49: rendition->background = (ColorSpec){0}; break;
+        case 53: rendition->overline = true; break;
+        case 55: rendition->overline = false; break;
+        case 59: rendition->underline_color = (ColorSpec){0}; break;
+        /* Blink (5, 6 and 25) is accepted and deliberately not animated. */
         default:
             if (code >= 30 && code <= 37) rendition->foreground = indexed_color(code - 30);
             else if (code >= 40 && code <= 47) rendition->background = indexed_color(code - 40);
@@ -5768,7 +6032,7 @@ static int options_parse(Options *options, int argc, char **argv)
     return 0;
 }
 
-static void print_diagnostics(const Config *config, const FontRenderer *renderer,
+static void print_diagnostics(const Config *config, FontRenderer *renderer,
                               const Platform *platform, const char *graphical_error)
 {
     char *default_path = config->options->config_path == NULL ? config_path("deal.conf", true) : NULL;
@@ -5804,11 +6068,24 @@ static void print_diagnostics(const Config *config, const FontRenderer *renderer
         printf("Font: %s, %d px\nCell: %d × %d px\n",
                face != NULL && face->family_name != NULL ? face->family_name : font_family(config),
                renderer->size, renderer->metrics.width, renderer->metrics.height);
+        static const char *const names[] = {NULL, "Bold", "Italic", "Bold italic"};
+        for (unsigned int style = 1; style < 4; ++style) {
+            const StyledFace *styled = font_styled(renderer, style);
+            FT_Face styled_face = styled->font.face;
+            const char *synthesis = styled->synthesis == 0 ? ""
+                : styled->synthesis == TERMINAL_STYLE_BOLD ? " (synthetic bold)"
+                : styled->synthesis == TERMINAL_STYLE_ITALIC ? " (synthetic italic)" : " (synthetic bold italic)";
+            printf("%s face: %s%s%s%s\n", names[style],
+                   styled_face != NULL && styled_face->family_name ? styled_face->family_name : "regular face",
+                   styled_face != NULL && styled_face->style_name ? " " : "",
+                   styled_face != NULL && styled_face->style_name ? styled_face->style_name : "", synthesis);
+        }
     } else puts("Font: unavailable");
     if (graphical_error != NULL) printf("Startup probe: %s\n", graphical_error);
     puts("Features: desktop OpenGL, UTF-8, ANSI 256/RGB, alternate screen, scrollback reflow, "
          "Wayland keyboard repeat, keyboard and wheel zoom, selection, clipboard, mouse reports, "
-         "focus reporting, OSC titles and links, visual bell, INI reload");
+         "focus reporting, OSC titles and links, bold and italic faces, underline styles and colors, "
+         "strikethrough, overline, visual bell, INI reload");
 }
 
 int main(int argc, char **argv)
