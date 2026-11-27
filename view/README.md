@@ -1,12 +1,12 @@
 # view
 
-`view` is an image viewer for dwl. Version 0.3 browses PNG and JPEG images: a file and the images beside it, a directory, or a list. It zooms, pans, rotates and flips them, and reloads an image when its file is replaced. What's left is in [docs/view-roadmap.md](../docs/view-roadmap.md).
+`view` is an image viewer for dwl. Version 0.4 browses PNG, JPEG, GIF and WebP images: a file and the images beside it, a directory, or a list. It zooms, pans, rotates and flips them, and reloads an image when its file is replaced. What's left is in [docs/view-roadmap.md](../docs/view-roadmap.md).
 
 It's a normal xdg-shell window with app ID `view`, so dwl tiles or floats it like any other client. It renders at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so images stay sharp at fractional scales, and uses `cursor-shape-v1` for the drag cursor. It's built on [desk](../desk/README.md): image decoding, shm buffers, key repeat and the file watch.
 
 ## Build
 
-On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-protocols`, `libxkbcommon`, `libpng` and `libjpeg-turbo`.
+On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-protocols`, `libxkbcommon`, `libpng`, `libjpeg-turbo` and `libwebp`. GIF decoding is built in.
 
 ```sh
 make
@@ -30,13 +30,13 @@ view [FILE | DIRECTORY]...
 | One `DIRECTORY` | Its images, starting at the first |
 | Several | Exactly those, in order, with directories expanded in place |
 
-A directory's images are the `.png`, `.jpg` and `.jpeg` files (any case), without hidden ones, in natural order: `img2` before `img10`. A file named explicitly is included whatever its name, because the decoder is chosen by content. `-` reads one image from standard input (`shot - | view -`), and view refuses when standard input is a terminal.
+A directory's images are the `.png`, `.jpg`, `.jpeg`, `.jpe`, `.gif` and `.webp` files (any case), without hidden ones, in natural order: `img2` before `img10`. A file named explicitly is included whatever its name, because the decoder is chosen by content. `-` reads one image from standard input (`shot - | view -`), and view refuses when standard input is a terminal.
 
 The list wraps around. Each image opens fitted and upright. While one image is on screen, its neighbours are decoded in the background between events, so stepping is instant; the one in the direction of travel goes first. An image that can't be decoded shows the background and the error in the title, and browsing carries on. A single `FILE` that can't be decoded is still an error, exiting 1.
 
 view watches the file on screen. When it's replaced or rewritten (by shot, wall or an editor), the new version is shown, keeping the zoom and position when the size is unchanged. If the new version doesn't decode, the old one stays.
 
-The image opens fitted to the window and centred on a dark background, never enlarged: an image smaller than the window shows one image pixel per screen pixel. While fitted, it refits when the window changes size. Transparent images are composited over the background. When the compositor leaves the window size to view, as for a floating window, the window starts at the image's size, limited to 80% of the output.
+The image opens fitted to the window and centred on a dark background, never enlarged: an image smaller than the window shows one image pixel per screen pixel. While fitted, it refits when the window changes size. Transparent images are drawn over a dark checkerboard that moves with the image. JPEGs are turned upright by their EXIF orientation, so phone photos open the right way up. When the compositor leaves the window size to view, as for a floating window, the window starts at the image's size, limited to 80% of the output.
 
 | Key | Action |
 |---|---|
@@ -59,7 +59,16 @@ Zoom and pan keys repeat while held, at the compositor's rate. Zoom ranges from 
 
 Shrinking averages the area each screen pixel covers, using halved copies of the image prepared when it opens, so fine detail doesn't shimmer. Enlarging is smooth below 400% and draws sharp square pixels from 400% up.
 
-Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 size; a larger PNG fails. Colors are treated as sRGB, with no color management.
+| Format | Notes |
+|---|---|
+| PNG | All color types and bit depths, interlaced |
+| JPEG | Baseline, progressive, CMYK; EXIF orientation applied |
+| GIF | The first frame only; animation is ignored |
+| WebP | Lossy and lossless, with alpha; animated WebP fails with a message |
+
+A recognised format view can't decode (AVIF, HEIC, JPEG XL, BMP, TIFF, SVG and a few others) fails with a message naming it.
+
+Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 size; anything else that large fails. Colors are treated as sRGB and the screen as sRGB: there's no color management, so wide-gamut photos look a little dull.
 
 ## Exit status
 
@@ -68,6 +77,14 @@ Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 si
 | 0 | The window was closed |
 | 1 | A single `FILE` couldn't be decoded, a directory had no images or couldn't be read, or the Wayland connection failed |
 | 2 | Usage error |
+
+## Manual checks (0.4)
+
+Checked offline under ASan and UBSan: six generated GIFs (plain, interlaced, transparent with a local color table and an offset frame, 256-color noise that fills the LZW table, two colors, a frame larger than the screen) decode pixel-exact, and over 3,700 truncated or bit-flipped variants fail cleanly; three real GIFs on this system decode; a lossless WebP with alpha matches exactly, premultiplied; the EXIF orientation is read from both byte orders, and all eight orientations come out as the EXIF spec maps them; BMP, AVIF, HEIC, SVG and TIFF are named. Live on dwl, a transparent PNG shows the checkerboard and a real GIF opens.
+
+- [ ] A portrait phone photo opens upright.
+- [ ] A WebP from the web opens.
+- [ ] An animated GIF shows its first frame.
 
 ## Manual checks (0.3)
 

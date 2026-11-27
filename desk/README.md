@@ -50,7 +50,7 @@ This is Phase 3 step 2's parser. The other apps still have their own.
 
 ## Images (`-DDESK_IMAGE`)
 
-`desk_image_load(file, &image, max_bytes, flags, error, size)` decodes a PNG or JPEG, detected by content, from a seekable `FILE` into premultiplied RGBA8 (`DeskImage`, stride `width * 4`, freed with `free(image.pixels)`). 16-bit, palette, grayscale and interlaced PNGs, progressive JPEGs and CMYK JPEGs are converted. Warnings and recoverable damage, such as a truncated JPEG, count as failures. An image whose pixels would exceed `max_bytes` fails with `File too large`, unless `DESK_IMAGE_SHRINK` is set and it's a JPEG, which is then decoded at 1/2, 1/4 or 1/8 size. On failure it returns false and writes a message such as `PNG: CRC error` to `error`. Compiling with `-DDESK_IMAGE` needs `libpng` and `libjpeg`.
+`desk_image_load(file, &image, max_bytes, flags, error, size)` decodes a PNG or JPEG, detected by content (plus GIF with `-DDESK_IMAGE_GIF`, built in, and WebP with `-DDESK_IMAGE_WEBP`, which needs `libwebp`), from a seekable `FILE` into premultiplied RGBA8 (`DeskImage`, stride `width * 4`, freed with `free(image.pixels)`). 16-bit, palette, grayscale and interlaced PNGs, progressive JPEGs and CMYK JPEGs are converted. Warnings and recoverable damage, such as a truncated JPEG, count as failures. An image whose pixels would exceed `max_bytes` fails with `File too large`, unless `DESK_IMAGE_SHRINK` is set and it's a JPEG, which is then decoded at 1/2, 1/4 or 1/8 size. `image.orientation` is the JPEG's EXIF orientation (1–8, 1 when absent), reported but not applied. On failure it returns false and writes a message such as `PNG: CRC error` to `error`; a format it recognises but doesn't decode is named, as in `AVIF images aren't supported`. Compiling with `-DDESK_IMAGE` needs `libpng` and `libjpeg`.
 
 ## Users
 
@@ -59,6 +59,6 @@ This is Phase 3 step 2's parser. The other apps still have their own.
 | deal | Palette and watch, since 0.12.0 |
 | shot | Atomic files and shared memory since 0.1; config, INI and shm buffers since 0.2 |
 | wall | Image decoding (its own decoders moved here for view) |
-| view | Image decoding and shm buffers since 0.1; key repeat since 0.2; file watch since 0.3 |
+| view | Image decoding and shm buffers since 0.1; key repeat since 0.2; file watch since 0.3; GIF, WebP and EXIF orientation since 0.4 |
 
 net, dwl, bar, run and wall still have their own palette parsers. Moving them is Phase 3 step 1.

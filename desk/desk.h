@@ -185,11 +185,14 @@ void desk_buffer_pool_finish(DeskBufferPool *pool);
 #endif
 
 #ifdef DESK_IMAGE
-/* Image decoding: needs libpng and libjpeg. */
+/* Image decoding: needs libpng and libjpeg. -DDESK_IMAGE_GIF adds GIF (first
+   frame, built in, no library) and -DDESK_IMAGE_WEBP adds still WebP
+   (libwebp). */
 
 typedef struct {
     uint32_t width, height;
     unsigned char *pixels; /* Premultiplied RGBA8, stride width * 4. free() it. */
+    int orientation;       /* EXIF orientation 1–8, as stored; 1 when absent. Not applied. */
 } DeskImage;
 
 enum {
@@ -198,9 +201,10 @@ enum {
     DESK_IMAGE_SHRINK = 1 << 0,
 };
 
-/* Decode a PNG or JPEG, detected by content, from a seekable file. The decoded
+/* Decode an image, detected by content, from a seekable file. The decoded
    image may use at most max_bytes. Return true, or false with image zeroed
-   and a message such as "PNG: CRC error" in error. */
+   and a message such as "PNG: CRC error" in error. A known format that isn't
+   compiled in is named, as in "AVIF images aren't supported". */
 bool desk_image_load(FILE *file, DeskImage *image, size_t max_bytes, unsigned flags,
                      char *error, size_t error_size);
 #endif

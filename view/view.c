@@ -20,6 +20,10 @@
 #define MAX_IMAGE_BYTES ((size_t)1 << 30)
 #define MAX_STDIN_BYTES ((size_t)512 << 20)
 #define BACKGROUND 0xff1e1e1eu
+/* Behind transparent images, anchored to the image so it moves with it. */
+#define CHECKER_DARK 0xff2a2a2au
+#define CHECKER_LIGHT 0xff3a3a3au
+#define CHECKER_CELL 8 /* Logical pixels. */
 /* An initial window never covers more than this share of the output. */
 #define INITIAL_SHARE 0.8
 #define MIN_INITIAL_WIDTH 240
@@ -138,61 +142,11 @@ static void levels_build(struct picture *picture)
     picture->generation = ++generations;
 }
 
-/* Decode path ("-" for stdin). On failure, return false with a message in error. */
-static bool load_picture(struct picture *picture, const char *path, char *error, size_t error_size)
-{
-    *picture = (struct picture){ .level_count = 0 };
-    char *data = NULL;
-    FILE *file;
-    if (strcmp(path, "-") == 0) {
-        if (isatty(STDIN_FILENO)) {
-            snprintf(error, error_size, "refusing to read an image from a terminal");
-            return false;
-        }
-        file = read_stdin(&data);
-    } else {
-        file = fopen(path, "rb");
-    }
-    if (!file) {
-        snprintf(error, error_size, "%s", errno ? strerror(errno) : "empty input");
-        return false;
-    }
-
-    DeskImage image;
-    bool ok = desk_image_load(file, &image, MAX_IMAGE_BYTES, DESK_IMAGE_SHRINK, error, error_size);
-    fclose(file);
-    free(data);
-    if (!ok)
-        return false;
-
-    /* Premultiplied RGBA bytes to ARGB8888 words, in place. */
-    size_t count = (size_t)image.width * image.height;
-    uint32_t *pixels = (uint32_t *)(void *)image.pixels;
-    bool opaque = true;
-    for (size_t i = 0; i < count; ++i) {
-        const unsigned char *p = image.pixels + i * 4;
-        uint32_t a = p[3];
-        opaque &= a == 255;
-        pixels[i] = a << 24 | (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
-    }
-    *picture = (struct picture){ .opaque = opaque };
-    picture->levels[0] = (struct level){ image.width, image.height, pixels };
-    levels_build(picture);
-    return true;
-}
-
-static void picture_free(struct picture *picture)
-{
-    levels_free(picture);
-    free(picture->levels[0].pixels);
-    *picture = (struct picture){ .level_count = 0 };
-}
-
 /* Orientation. Applied to the pixels, so everything after works on an upright
    image. Rotation and flips are view-only: the file is never written. */
 
 enum orientation {
-    ROTATE_CLOCKWISE,
+    ROTATE_CLOCKWISE = 0,
     ROTATE_COUNTER_CLOCKWISE,
     FLIP_HORIZONTAL,
     FLIP_VERTICAL,
@@ -248,6 +202,77 @@ static bool orient_pixels(struct level *image, enum orientation change)
     free(image->pixels);
     *image = (struct level){ height, width, rotated };
     return true;
+}
+
+/* Turn an image stored as EXIF orientation says into upright. */
+static void apply_exif(struct level *image, int orientation)
+{
+    static const enum orientation steps[9][2] = {
+        [2] = {FLIP_HORIZONTAL, -1},
+        [3] = {ROTATE_CLOCKWISE, ROTATE_CLOCKWISE},
+        [4] = {FLIP_VERTICAL, -1},
+        [5] = {ROTATE_CLOCKWISE, FLIP_HORIZONTAL}, /* Transpose. */
+        [6] = {ROTATE_CLOCKWISE, -1},
+        [7] = {ROTATE_CLOCKWISE, FLIP_VERTICAL},   /* Transverse. */
+        [8] = {ROTATE_COUNTER_CLOCKWISE, -1},
+    };
+    if (orientation < 2 || orientation > 8)
+        return;
+    for (int i = 0; i < 2 && (int)steps[orientation][i] >= 0; ++i) {
+        if (!orient_pixels(image, steps[orientation][i]))
+            return; /* Out of memory: shown as stored. */
+    }
+}
+
+/* Decode path ("-" for stdin). On failure, return false with a message in error. */
+static bool load_picture(struct picture *picture, const char *path, char *error, size_t error_size)
+{
+    *picture = (struct picture){ .level_count = 0 };
+    char *data = NULL;
+    FILE *file;
+    if (strcmp(path, "-") == 0) {
+        if (isatty(STDIN_FILENO)) {
+            snprintf(error, error_size, "refusing to read an image from a terminal");
+            return false;
+        }
+        file = read_stdin(&data);
+    } else {
+        file = fopen(path, "rb");
+    }
+    if (!file) {
+        snprintf(error, error_size, "%s", errno ? strerror(errno) : "empty input");
+        return false;
+    }
+
+    DeskImage image;
+    bool ok = desk_image_load(file, &image, MAX_IMAGE_BYTES, DESK_IMAGE_SHRINK, error, error_size);
+    fclose(file);
+    free(data);
+    if (!ok)
+        return false;
+
+    /* Premultiplied RGBA bytes to ARGB8888 words, in place. */
+    size_t count = (size_t)image.width * image.height;
+    uint32_t *pixels = (uint32_t *)(void *)image.pixels;
+    bool opaque = true;
+    for (size_t i = 0; i < count; ++i) {
+        const unsigned char *p = image.pixels + i * 4;
+        uint32_t a = p[3];
+        opaque &= a == 255;
+        pixels[i] = a << 24 | (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
+    }
+    *picture = (struct picture){ .opaque = opaque };
+    picture->levels[0] = (struct level){ image.width, image.height, pixels };
+    apply_exif(&picture->levels[0], image.orientation);
+    levels_build(picture);
+    return true;
+}
+
+static void picture_free(struct picture *picture)
+{
+    levels_free(picture);
+    free(picture->levels[0].pixels);
+    *picture = (struct picture){ .level_count = 0 };
 }
 
 /* Layout */
@@ -399,26 +424,43 @@ static inline uint32_t channel(float value)
     return (uint32_t)(value + 0.5f);
 }
 
-/* A premultiplied pixel over the opaque background. */
-static inline uint32_t over_background(float a, float r, float g, float b)
+/* A premultiplied pixel over an opaque backdrop. */
+static inline uint32_t over(uint32_t backdrop, float a, float r, float g, float b)
 {
     float inverse = 1 - a / 255;
-    return 0xff000000u | channel(r + (BACKGROUND >> 16 & 0xff) * inverse) << 16 |
-           channel(g + (BACKGROUND >> 8 & 0xff) * inverse) << 8 | channel(b + (BACKGROUND & 0xff) * inverse);
+    return 0xff000000u | channel(r + (backdrop >> 16 & 0xff) * inverse) << 16 |
+           channel(g + (backdrop >> 8 & 0xff) * inverse) << 8 | channel(b + (backdrop & 0xff) * inverse);
 }
 
-static inline uint32_t pixel_over_background(uint32_t pixel)
+static inline uint32_t pixel_over(uint32_t backdrop, uint32_t pixel)
 {
     if (pixel >> 24 == 255)
         return pixel;
-    return over_background((float)(pixel >> 24), (float)(pixel >> 16 & 0xff), (float)(pixel >> 8 & 0xff),
-                           (float)(pixel & 0xff));
+    return over(backdrop, (float)(pixel >> 24), (float)(pixel >> 16 & 0xff), (float)(pixel >> 8 & 0xff),
+                (float)(pixel & 0xff));
 }
 
 struct sampler {
     const struct level *level;
     struct taps columns, rows;
+    bool checker;   /* Draw the checkerboard behind the image. */
+    int left, top;  /* The image's corner, which the checkerboard is anchored to. */
+    int cell;       /* Checker square size in buffer pixels. */
 };
+
+static inline int floor_divide(int a, int b)
+{
+    return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
+/* What's behind the image at buffer pixel (x, y). */
+static inline uint32_t backdrop(const struct sampler *sampler, int x, int y)
+{
+    if (!sampler->checker)
+        return BACKGROUND;
+    int cell = floor_divide(x - sampler->left, sampler->cell) + floor_divide(y - sampler->top, sampler->cell);
+    return cell & 1 ? CHECKER_LIGHT : CHECKER_DARK;
+}
 
 /* Render the rectangle [x0, x1) × [y0, y1) of the frame. */
 static void render(const struct sampler *sampler, struct frame *frame, int x0, int y0, int x1, int y1)
@@ -445,7 +487,7 @@ static void render(const struct sampler *sampler, struct frame *frame, int x0, i
             const float *column_weight = columns->weight + (size_t)x * columns->span;
             const uint32_t *source = source_row + columns->first[x];
             if (row_single && column_count == 1 && column_weight[0] == 1.0f) {
-                target[x] = pixel_over_background(*source);
+                target[x] = pixel_over(backdrop(sampler, x, y), *source);
                 continue;
             }
             float a = 0, r = 0, g = 0, b = 0;
@@ -459,7 +501,7 @@ static void render(const struct sampler *sampler, struct frame *frame, int x0, i
                     b += w * (float)(pixel & 0xff);
                 }
             }
-            target[x] = over_background(a, r, g, b);
+            target[x] = over(backdrop(sampler, x, y), a, r, g, b);
         }
     }
 }
@@ -520,7 +562,15 @@ static void paint(struct view *view, uint32_t *pixels, int width, int height)
         if (level_index >= picture->level_count)
             level_index = picture->level_count - 1;
     }
-    struct sampler sampler = { .level = &picture->levels[level_index] };
+    struct sampler sampler = {
+        .level = &picture->levels[level_index],
+        .checker = !picture->opaque,
+        .left = left,
+        .top = top,
+        .cell = (int)lround(CHECKER_CELL * (view->width > 0 ? (double)width / view->width : 1)),
+    };
+    if (sampler.cell < 1)
+        sampler.cell = 1;
     if (!taps_build(&sampler.columns, width, left, zoom, sampler.level, level_index, image->width, true) ||
         !taps_build(&sampler.rows, height, top, zoom, sampler.level, level_index, image->height, false)) {
         taps_free(&sampler.columns);
@@ -746,12 +796,13 @@ static void slot_free(struct slot *slot)
     *slot = (struct slot){ .used = false };
 }
 
+/* Decode image index. A failure is kept in the slot and shown in the title
+   when the image is on screen, not printed, since preloading tries images
+   that may never be shown. */
 static void slot_load(struct view *view, struct slot *slot, int index)
 {
     *slot = (struct slot){ .used = true, .index = index };
-    const char *path = view->paths[index];
-    if (!load_picture(&slot->picture, path, slot->error, sizeof slot->error))
-        fprintf(stderr, "view: %s: %s\n", display_path(path), slot->error);
+    load_picture(&slot->picture, view->paths[index], slot->error, sizeof slot->error);
 }
 
 static bool file_signature(const char *path, struct signature *signature)
@@ -1662,8 +1713,13 @@ static void list_free(struct list *list)
 
 static bool has_image_extension(const char *name)
 {
+    static const char *const extensions[] = {".png", ".jpg", ".jpeg", ".jpe", ".gif", ".webp"};
     const char *dot = strrchr(name, '.');
-    return dot && (strcasecmp(dot, ".png") == 0 || strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0);
+    for (size_t i = 0; dot && i < sizeof extensions / sizeof *extensions; ++i) {
+        if (strcasecmp(dot, extensions[i]) == 0)
+            return true;
+    }
+    return false;
 }
 
 /* Natural order on the file name, so img2 comes before img10. */
@@ -1674,7 +1730,7 @@ static int compare_paths(const void *a, const void *b)
     return order ? order : strcmp(x, y);
 }
 
-/* Append the PNG and JPEG files in directory, sorted, skipping hidden ones.
+/* Append the image files in directory, sorted, skipping hidden ones.
    With prefix, each path starts with the directory; otherwise it's the bare
    name, for the working directory. Return false with errno set when the
    directory can't be read. */
@@ -1762,7 +1818,7 @@ static int build_list(struct list *list, int argc, char **argv, int *start)
         }
     }
     if (list->count == 0) {
-        fprintf(stderr, "view: no PNG or JPEG images in %s\n", argc == 1 ? argv[0] : "the arguments");
+        fprintf(stderr, "view: no images in %s\n", argc == 1 ? argv[0] : "the arguments");
         return EXIT_FAILED;
     }
     return 0;
@@ -1771,7 +1827,7 @@ static int build_list(struct list *list, int argc, char **argv, int *start)
 static void usage(FILE *stream)
 {
     fputs("Usage: view [FILE | DIRECTORY]...\n"
-          "Show PNG and JPEG images. One FILE browses the images beside it, a DIRECTORY\n"
+          "Show PNG, JPEG, GIF and WebP images. One FILE browses the images beside it, a DIRECTORY\n"
           "browses its images, and several arguments browse exactly those. FILE \"-\"\n"
           "reads standard input.\n"
           "\n"
@@ -1827,6 +1883,7 @@ int main(int argc, char **argv)
     /* A single FILE that can't be shown is an error, as before browsing existed. */
     bool single_file = argc - optind == 1 && !is_directory(argv[optind]);
     if (!has_image(&view) && (single_file || view.count == 1)) {
+        fprintf(stderr, "view: %s: %s\n", display_path(view.paths[start]), view.current.error);
         list_free(&list);
         return EXIT_FAILED;
     }

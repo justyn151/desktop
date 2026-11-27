@@ -5,11 +5,11 @@ WAYLAND_PROTOCOLS_DIR ?= $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-pro
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
-PACKAGES = wayland-client xkbcommon libpng libjpeg
+PACKAGES = wayland-client xkbcommon libpng libjpeg libwebp
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PKG_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 CFLAGS ?= -O2
-VIEW_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_IMAGE -I$(BUILD) -I$(DESK)
+VIEW_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_IMAGE -DDESK_IMAGE_GIF -DDESK_IMAGE_WEBP -I$(BUILD) -I$(DESK)
 
 DESK = ../desk
 BUILD = .build

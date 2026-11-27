@@ -576,6 +576,9 @@ void desk_buffer_pool_finish(DeskBufferPool *pool)
 #include <png.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#ifdef DESK_IMAGE_WEBP
+#include <webp/decode.h>
+#endif
 
 struct image_error {
     char *text;
@@ -690,6 +693,45 @@ static void jpeg_message(j_common_ptr info, int level)
         jpeg_fail(info);
 }
 
+static uint32_t exif_read(const unsigned char *at, int bytes, bool big_endian)
+{
+    uint32_t value = 0;
+    for (int i = 0; i < bytes; ++i)
+        value |= (uint32_t)at[big_endian ? i : bytes - 1 - i] << (8 * (bytes - 1 - i));
+    return value;
+}
+
+/* The Orientation tag (0x0112) from the first IFD of an EXIF TIFF block, or 1. */
+static int exif_orientation(const unsigned char *tiff, size_t length)
+{
+    if (length < 8)
+        return 1;
+    bool big_endian;
+    if (memcmp(tiff, "II*\0", 4) == 0)
+        big_endian = false;
+    else if (memcmp(tiff, "MM\0*", 4) == 0)
+        big_endian = true;
+    else
+        return 1;
+    uint32_t ifd = exif_read(tiff + 4, 4, big_endian);
+    if (ifd > length - 2)
+        return 1;
+    uint32_t count = exif_read(tiff + ifd, 2, big_endian);
+    for (uint32_t i = 0; i < count; ++i) {
+        size_t entry = ifd + 2 + (size_t)i * 12;
+        if (entry + 12 > length)
+            break;
+        if (exif_read(tiff + entry, 2, big_endian) != 0x0112)
+            continue;
+        /* A SHORT, stored in the first two bytes of the value field. */
+        if (exif_read(tiff + entry + 2, 2, big_endian) != 3)
+            return 1;
+        uint32_t value = exif_read(tiff + entry + 8, 2, big_endian);
+        return value >= 1 && value <= 8 ? (int)value : 1;
+    }
+    return 1;
+}
+
 static bool jpeg_fits(const struct jpeg_decompress_struct *info, size_t max_bytes)
 {
     return info->output_width && info->output_width <= max_bytes / 4 &&
@@ -719,7 +761,16 @@ static bool decode_jpeg(FILE *file, DeskImage *image, size_t max_bytes, unsigned
 
     jpeg_create_decompress(info);
     jpeg_stdio_src(info, file);
+    jpeg_save_markers(info, JPEG_APP0 + 1, 0xffff);
     jpeg_read_header(info, TRUE);
+    int orientation = 1;
+    for (jpeg_saved_marker_ptr marker = info->marker_list; marker; marker = marker->next) {
+        if (marker->marker == JPEG_APP0 + 1 && marker->data_length > 6 &&
+            memcmp(marker->data, "Exif\0\0", 6) == 0) {
+            orientation = exif_orientation(marker->data + 6, marker->data_length - 6);
+            break;
+        }
+    }
     bool cmyk = info->jpeg_color_space == JCS_CMYK || info->jpeg_color_space == JCS_YCCK;
     info->out_color_space = cmyk ? JCS_CMYK : JCS_EXT_RGBA;
     jpeg_calc_output_dimensions(info);
@@ -757,15 +808,410 @@ static bool decode_jpeg(FILE *file, DeskImage *image, size_t max_bytes, unsigned
     jpeg_finish_decompress(info);
     jpeg_destroy_decompress(info);
     free(decoder);
+    image->orientation = orientation;
     return true;
 }
+
+#if defined DESK_IMAGE_GIF || defined DESK_IMAGE_WEBP
+/* The whole file, for decoders that work on memory. */
+static unsigned char *read_whole(FILE *file, size_t limit, size_t *size, struct image_error *error)
+{
+    size_t length = 0, capacity = 1 << 16;
+    unsigned char *data = malloc(capacity);
+    for (;;) {
+        if (!data) {
+            image_error(error->text, error->size, "%s", strerror(ENOMEM));
+            return NULL;
+        }
+        length += fread(data + length, 1, capacity - length, file);
+        if (ferror(file)) {
+            image_error(error->text, error->size, "%s", strerror(errno));
+            free(data);
+            return NULL;
+        }
+        if (length < capacity)
+            break;
+        if (capacity >= limit) {
+            image_error(error->text, error->size, "%s", strerror(EFBIG));
+            free(data);
+            return NULL;
+        }
+        capacity *= 2;
+        unsigned char *grown = realloc(data, capacity);
+        if (!grown)
+            free(data);
+        data = grown;
+    }
+    *size = length;
+    return data;
+}
+
+static void premultiply(DeskImage *image)
+{
+    size_t bytes = (size_t)image->width * image->height * 4;
+    for (size_t i = 0; i < bytes; i += 4) {
+        unsigned alpha = image->pixels[i + 3];
+        for (size_t channel = 0; channel < 3; ++channel)
+            image->pixels[i + channel] = (unsigned char)((image->pixels[i + channel] * alpha + 127) / 255);
+    }
+}
+#endif
+
+#ifdef DESK_IMAGE_GIF
+/* GIF, first frame only. The canvas is the logical screen, transparent where
+   the frame doesn't cover it; the background color is ignored, as browsers do. */
+
+struct gif_reader {
+    const unsigned char *data;
+    size_t size, at;
+};
+
+static int gif_byte(struct gif_reader *reader)
+{
+    return reader->at < reader->size ? reader->data[reader->at++] : -1;
+}
+
+static int gif_word(struct gif_reader *reader)
+{
+    int low = gif_byte(reader), high = gif_byte(reader);
+    return low < 0 || high < 0 ? -1 : low | high << 8;
+}
+
+/* Skip data sub-blocks up to and including the terminator. */
+static bool gif_skip_blocks(struct gif_reader *reader)
+{
+    for (;;) {
+        int length = gif_byte(reader);
+        if (length < 0)
+            return false;
+        if (length == 0)
+            return true;
+        reader->at += (size_t)length;
+    }
+}
+
+/* Reads LZW codes across the image's data sub-blocks. */
+struct gif_bits {
+    struct gif_reader *reader;
+    int block_left;
+    uint32_t buffer;
+    int count;
+    bool ended;
+};
+
+static int gif_code(struct gif_bits *bits, int size)
+{
+    while (bits->count < size) {
+        if (bits->ended)
+            return -1;
+        if (bits->block_left == 0) {
+            int length = gif_byte(bits->reader);
+            if (length <= 0) {
+                bits->ended = true;
+                return -1;
+            }
+            bits->block_left = length;
+        }
+        int byte = gif_byte(bits->reader);
+        if (byte < 0) {
+            bits->ended = true;
+            return -1;
+        }
+        --bits->block_left;
+        bits->buffer |= (uint32_t)byte << bits->count;
+        bits->count += 8;
+    }
+    int code = (int)(bits->buffer & ((1u << size) - 1));
+    bits->buffer >>= size;
+    bits->count -= size;
+    return code;
+}
+
+/* The row of the n-th decoded row, for interlaced frames. */
+static uint32_t gif_row(uint32_t n, uint32_t height, bool interlaced)
+{
+    if (!interlaced)
+        return n;
+    static const uint32_t start[4] = {0, 4, 2, 1}, step[4] = {8, 8, 4, 2};
+    for (int pass = 0; pass < 4; ++pass) {
+        uint32_t rows = start[pass] < height ? (height - start[pass] + step[pass] - 1) / step[pass] : 0;
+        if (n < rows)
+            return start[pass] + n * step[pass];
+        n -= rows;
+    }
+    return height;
+}
+
+static bool decode_gif(FILE *file, DeskImage *image, size_t max_bytes, struct image_error *error)
+{
+    size_t size;
+    unsigned char *data = read_whole(file, max_bytes, &size, error);
+    if (!data)
+        return false;
+    struct gif_reader reader = { data, size, 6 };
+    const char *problem = NULL;
+    uint16_t *prefix = NULL;
+    unsigned char *suffix = NULL, *first = NULL, *stack = NULL;
+
+    int screen_width = gif_word(&reader), screen_height = gif_word(&reader);
+    int flags = gif_byte(&reader);
+    reader.at += 2; /* Background color and aspect ratio. */
+    if (screen_width <= 0 || screen_height <= 0 || flags < 0) {
+        problem = "bad header";
+        goto done;
+    }
+    const unsigned char *global = NULL;
+    int global_count = 0;
+    if (flags & 0x80) {
+        global_count = 2 << (flags & 7);
+        global = data + reader.at;
+        reader.at += (size_t)global_count * 3;
+    }
+    if (!image_allocate(image, (uint32_t)screen_width, (uint32_t)screen_height, max_bytes)) {
+        image_error(error->text, error->size, "GIF: %s", strerror(errno));
+        free(data);
+        return false;
+    }
+    memset(image->pixels, 0, (size_t)image->width * image->height * 4);
+
+    int transparent = -1;
+    for (;;) {
+        int block = gif_byte(&reader);
+        if (block == 0x21) {
+            int label = gif_byte(&reader);
+            if (label == 0xf9) {
+                /* Graphic control: only the transparent index matters for one frame. */
+                size_t start = reader.at;
+                int length = gif_byte(&reader);
+                if (length >= 4 && start + 5 < size) {
+                    if (data[start + 1] & 1)
+                        transparent = data[start + 4];
+                }
+                reader.at = start;
+            }
+            if (label < 0 || !gif_skip_blocks(&reader)) {
+                problem = "truncated";
+                goto done;
+            }
+        } else if (block == 0x2c) {
+            break;
+        } else {
+            problem = block == 0x3b ? "no image" : block < 0 ? "truncated" : "bad block";
+            goto done;
+        }
+    }
+
+    int left = gif_word(&reader), top = gif_word(&reader);
+    int width = gif_word(&reader), height = gif_word(&reader);
+    int frame_flags = gif_byte(&reader);
+    if (left < 0 || top < 0 || width < 0 || height < 0 || frame_flags < 0) {
+        problem = "truncated";
+        goto done;
+    }
+    const unsigned char *colors = global;
+    int color_count = global_count;
+    if (frame_flags & 0x80) {
+        color_count = 2 << (frame_flags & 7);
+        colors = data + reader.at;
+        reader.at += (size_t)color_count * 3;
+    }
+    if (reader.at > size) {
+        problem = "truncated";
+        goto done;
+    }
+    if (!colors) {
+        problem = "no color table";
+        goto done;
+    }
+    bool interlaced = frame_flags & 0x40;
+    int minimum = gif_byte(&reader);
+    if (minimum < 1 || minimum > 11) {
+        problem = "bad LZW code size";
+        goto done;
+    }
+
+    enum { CODES = 4096 };
+    prefix = malloc(CODES * sizeof *prefix);
+    suffix = malloc(CODES);
+    first = malloc(CODES);
+    stack = malloc(CODES + 2); /* A string, plus the KwKwK case's extra byte. */
+    if (!prefix || !suffix || !first || !stack) {
+        problem = "out of memory";
+        goto done;
+    }
+    int clear = 1 << minimum, end = clear + 1;
+    for (int i = 0; i < clear; ++i) {
+        suffix[i] = (unsigned char)i;
+        first[i] = (unsigned char)i;
+    }
+    int next = clear + 2, code_size = minimum + 1, previous = -1;
+    struct gif_bits bits = { .reader = &reader };
+    size_t total = (size_t)width * height, written = 0;
+
+    while (written < total) {
+        int code = gif_code(&bits, code_size);
+        if (code < 0)
+            break;
+        if (code == clear) {
+            next = clear + 2;
+            code_size = minimum + 1;
+            previous = -1;
+            continue;
+        }
+        if (code == end)
+            break;
+
+        int depth = 0, walk;
+        if (previous < 0) {
+            if (code >= clear) {
+                problem = "bad LZW code";
+                goto done;
+            }
+            stack[depth++] = (unsigned char)code;
+        } else {
+            if (code > next || (code == next && next >= CODES)) {
+                problem = "bad LZW code";
+                goto done;
+            }
+            /* code == next: the previous string plus its own first byte. */
+            walk = code == next ? previous : code;
+            if (code == next)
+                stack[depth++] = first[previous];
+            while (walk >= clear) {
+                if (depth >= CODES) {
+                    problem = "bad LZW code";
+                    goto done;
+                }
+                stack[depth++] = suffix[walk];
+                walk = prefix[walk];
+            }
+            stack[depth++] = (unsigned char)walk;
+            if (next < CODES) {
+                prefix[next] = (uint16_t)previous;
+                suffix[next] = (unsigned char)walk;
+                first[next] = first[previous];
+                ++next;
+                if (next == 1 << code_size && code_size < 12)
+                    ++code_size;
+            }
+        }
+        previous = code;
+
+        /* The stack holds the string backwards. */
+        while (depth > 0 && written < total) {
+            int index = stack[--depth];
+            uint32_t x = (uint32_t)(written % (size_t)width);
+            uint32_t y = gif_row((uint32_t)(written / (size_t)width), (uint32_t)height, interlaced);
+            ++written;
+            uint32_t canvas_x = (uint32_t)left + x, canvas_y = (uint32_t)top + y;
+            if (canvas_x >= image->width || canvas_y >= image->height || index == transparent)
+                continue;
+            unsigned char *pixel = image->pixels + ((size_t)canvas_y * image->width + canvas_x) * 4;
+            if (index < color_count) {
+                memcpy(pixel, colors + index * 3, 3);
+            } else {
+                pixel[0] = pixel[1] = pixel[2] = 0;
+            }
+            pixel[3] = 255;
+        }
+    }
+    if (written < total)
+        problem = "truncated";
+
+done:
+    free(prefix);
+    free(suffix);
+    free(first);
+    free(stack);
+    free(data);
+    if (problem) {
+        image_error(error->text, error->size, "GIF: %s", problem);
+        return false;
+    }
+    image->orientation = 1;
+    return true;
+}
+#endif
+
+#ifdef DESK_IMAGE_WEBP
+static bool decode_webp(FILE *file, DeskImage *image, size_t max_bytes, struct image_error *error)
+{
+    size_t size;
+    unsigned char *data = read_whole(file, max_bytes, &size, error);
+    if (!data)
+        return false;
+    WebPBitstreamFeatures features;
+    bool ok = false;
+    if (WebPGetFeatures(data, size, &features) != VP8_STATUS_OK) {
+        image_error(error->text, error->size, "WebP: not a valid file");
+    } else if (features.has_animation) {
+        image_error(error->text, error->size, "WebP: animated images aren't supported");
+    } else if (!image_allocate(image, (uint32_t)features.width, (uint32_t)features.height, max_bytes)) {
+        image_error(error->text, error->size, "WebP: %s", strerror(errno));
+    } else {
+        size_t stride = (size_t)image->width * 4;
+        ok = WebPDecodeRGBAInto(data, size, image->pixels, stride * image->height, (int)stride) != NULL;
+        if (ok)
+            premultiply(image);
+        else
+            image_error(error->text, error->size, "WebP: decoding failed");
+    }
+    free(data);
+    image->orientation = 1;
+    return ok;
+}
+#endif
+
+/* A format recognised by its signature but not decoded here, or NULL. */
+static const char *unsupported_format(const unsigned char *s, size_t length)
+{
+#ifndef DESK_IMAGE_GIF
+    if (length >= 6 && (memcmp(s, "GIF87a", 6) == 0 || memcmp(s, "GIF89a", 6) == 0))
+        return "GIF";
+#endif
+#ifndef DESK_IMAGE_WEBP
+    if (length >= 12 && memcmp(s, "RIFF", 4) == 0 && memcmp(s + 8, "WEBP", 4) == 0)
+        return "WebP";
+#endif
+    if (length >= 12 && memcmp(s + 4, "ftyp", 4) == 0) {
+        if (memcmp(s + 8, "avif", 4) == 0 || memcmp(s + 8, "avis", 4) == 0)
+            return "AVIF";
+        if (memcmp(s + 8, "heic", 4) == 0 || memcmp(s + 8, "heix", 4) == 0 || memcmp(s + 8, "mif1", 4) == 0 ||
+            memcmp(s + 8, "msf1", 4) == 0)
+            return "HEIC";
+    }
+    if ((length >= 2 && s[0] == 0xff && s[1] == 0x0a) ||
+        (length >= 12 && memcmp(s, "\0\0\0\x0cJXL \r\n\x87\n", 12) == 0))
+        return "JPEG XL";
+    if (length >= 2 && memcmp(s, "BM", 2) == 0)
+        return "BMP";
+    if (length >= 4 && (memcmp(s, "II*\0", 4) == 0 || memcmp(s, "MM\0*", 4) == 0))
+        return "TIFF";
+    if (length >= 4 && memcmp(s, "qoif", 4) == 0)
+        return "QOI";
+    if (length >= 4 && memcmp(s, "8BPS", 4) == 0)
+        return "Photoshop";
+    if (length >= 1 && s[0] == '<')
+        return "SVG";
+    return NULL;
+}
+
+#if defined DESK_IMAGE_GIF && defined DESK_IMAGE_WEBP
+#define DESK_IMAGE_FORMATS "PNG, JPEG, GIF or WebP"
+#elif defined DESK_IMAGE_GIF
+#define DESK_IMAGE_FORMATS "PNG, JPEG or GIF"
+#elif defined DESK_IMAGE_WEBP
+#define DESK_IMAGE_FORMATS "PNG, JPEG or WebP"
+#else
+#define DESK_IMAGE_FORMATS "PNG or JPEG"
+#endif
 
 bool desk_image_load(FILE *file, DeskImage *image, size_t max_bytes, unsigned flags,
                      char *error, size_t error_size)
 {
     struct image_error failure = { error, error_size };
-    unsigned char signature[8];
-    *image = (DeskImage){0};
+    unsigned char signature[16];
+    *image = (DeskImage){ .orientation = 1 };
     clearerr(file);
     if (fseek(file, 0, SEEK_SET) != 0) {
         image_error(error, error_size, "%s", strerror(errno));
@@ -778,17 +1224,29 @@ bool desk_image_load(FILE *file, DeskImage *image, size_t max_bytes, unsigned fl
     }
 
     bool ok;
-    if (length == sizeof signature && png_sig_cmp(signature, 0, sizeof signature) == 0) {
+    const char *unsupported;
+    if (length >= 8 && png_sig_cmp(signature, 0, 8) == 0) {
         ok = decode_png(file, image, max_bytes, &failure);
     } else if (length >= 2 && signature[0] == 0xff && signature[1] == 0xd8) {
         ok = decode_jpeg(file, image, max_bytes, flags, &failure);
+#ifdef DESK_IMAGE_GIF
+    } else if (length >= 6 && (memcmp(signature, "GIF87a", 6) == 0 || memcmp(signature, "GIF89a", 6) == 0)) {
+        ok = decode_gif(file, image, max_bytes, &failure);
+#endif
+#ifdef DESK_IMAGE_WEBP
+    } else if (length >= 12 && memcmp(signature, "RIFF", 4) == 0 && memcmp(signature + 8, "WEBP", 4) == 0) {
+        ok = decode_webp(file, image, max_bytes, &failure);
+#endif
+    } else if ((unsupported = unsupported_format(signature, length))) {
+        image_error(error, error_size, "%s images aren't supported", unsupported);
+        return false;
     } else {
-        image_error(error, error_size, "expected a PNG or JPEG image");
+        image_error(error, error_size, "expected a " DESK_IMAGE_FORMATS " image");
         return false;
     }
     if (!ok) {
         free(image->pixels);
-        *image = (DeskImage){0};
+        *image = (DeskImage){ .orientation = 1 };
     }
     return ok;
 }

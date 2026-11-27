@@ -15,7 +15,7 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-#define VIEW_VERSION "0.3.0"
+#define VIEW_VERSION "0.4.0"
 
 /* Exit statuses. */
 enum {

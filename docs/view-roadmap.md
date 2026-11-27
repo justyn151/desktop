@@ -192,6 +192,14 @@ view [FILE|DIR]...
   Formats go through `desk_image_load`, each behind its own `-DDESK_IMAGE_<FORMAT>` flag, so wall only links what it uses.
 - **Colour management:** none. Images are treated as sRGB and the screen as sRGB. Note it in the README.
 
+### As built
+
+- GIF and WebP both went in. GIF decoding is built into desk (about 250 lines of LZW, first frame only) instead of giflib, which isn't installed and would be a new dependency, per the ground rules. It was checked against an independent encoder and fuzzed with truncations and bit flips under ASan. Each format sits behind its own flag, `-DDESK_IMAGE_GIF` and `-DDESK_IMAGE_WEBP`; wall sets neither.
+- The EXIF parser lives in desk's JPEG decoder (`jpeg_save_markers` for APP1, then IFD0's `Orientation`), and `DeskImage.orientation` reports it without applying it. view applies it with the same pixel operations as `r` and `f`; wall ignores it, so its output is unchanged.
+- The checkerboard is anchored to the image's corner, not the window, so the kept frame from 0.2 can still be shifted when panning. The config switch (`transparency = checker | background`) comes with the config file in 0.5.
+- Recognised but unsupported formats are named in the error. wall's messages change for those files only ("GIF images aren't supported" instead of "expected a PNG or JPEG image").
+- Decode errors for preloaded images aren't printed. They show in the title when the image is on screen, and only a single `FILE` that fails at start-up prints and exits 1.
+
 ### Manual checks
 
 - A portrait phone photo (EXIF orientation 6) opens upright.
@@ -256,6 +264,6 @@ view [FILE|DIR]...
 | 0.1 | One image, fit to window, scale-correct; decoders move from wall to desk | Done (fractional scale check skipped: 1× only for now) |
 | 0.2 | Zoom, pan, rotate, filters, key repeat | Done |
 | 0.3 | Directory browsing, preloading, reload on change | Done |
-| 0.4 | EXIF orientation, transparency, format decision | Planned |
+| 0.4 | EXIF orientation, checkerboard, GIF and WebP | Code done, checklist pending |
 | 0.5 | Config, palette, dwl rule, desktop entry, install | Planned |
 | 1.0 | Checklists, fuzzing, README | Final |
