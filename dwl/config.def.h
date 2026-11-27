@@ -108,7 +108,7 @@ LIBINPUT_CONFIG_TAP_MAP_LMR -- 1/2/3 finger tap maps to left/middle/right
 static const enum libinput_config_tap_button_map button_map = LIBINPUT_CONFIG_TAP_MAP_LRM;
 
 /* If you want to use the windows key for MODKEY, use WLR_MODIFIER_LOGO */
-#define MODKEY WLR_MODIFIER_ALT
+#define MODKEY WLR_MODIFIER_LOGO
 
 #define TAGKEYS(KEY,TAG) \
 	{ MODKEY,                    KEY,            view,            {.ui = 1 << TAG} }, \
@@ -120,7 +120,7 @@ static const enum libinput_config_tap_button_map button_map = LIBINPUT_CONFIG_TA
 #define SHCMD(cmd) { .v = (const char*[]){ "/bin/sh", "-c", cmd, NULL } }
 
 /* commands */
-static const char *termcmd[] = { "foot", NULL };
+static const char *termcmd[] = { "deal", NULL };
 static const char *menucmd[] = { "run", NULL };
 
 static const Key keys[] = {
@@ -139,10 +139,10 @@ static const Key keys[] = {
 	{ WLR_MODIFIER_LOGO|WLR_MODIFIER_SHIFT, XKB_KEY_k,  swapdirection,    {.i = WLR_DIRECTION_UP} },
 	{ WLR_MODIFIER_LOGO|WLR_MODIFIER_SHIFT, XKB_KEY_l,  swapdirection,    {.i = WLR_DIRECTION_RIGHT} },
 	{ MODKEY,                    XKB_KEY_i,           incnmaster,       {.i = +1} },
-	{ MODKEY,                    XKB_KEY_d,           incnmaster,       {.i = -1} },
+	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_d,           incnmaster,       {.i = -1} },
 	{ WLR_MODIFIER_LOGO|WLR_MODIFIER_CTRL, XKB_KEY_h,   setmfact,         {.f = -0.05f} },
 	{ WLR_MODIFIER_LOGO|WLR_MODIFIER_CTRL, XKB_KEY_l,   setmfact,         {.f = +0.05f} },
-	{ MODKEY,                    XKB_KEY_Return,      zoom,             {0} },
+	{ MODKEY|WLR_MODIFIER_CTRL,  XKB_KEY_Return,      zoom,             {0} },
 	{ MODKEY,                    XKB_KEY_Tab,         view,             {0} },
 	{ WLR_MODIFIER_LOGO,         XKB_KEY_q,           killclient,       {0} },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_c,           killclient,       {0} },
@@ -181,9 +181,9 @@ static const Key keys[] = {
 };
 
 static const Button buttons[] = {
-	{ WLR_MODIFIER_LOGO, BTN_LEFT,   moveresize,     {.ui = CurMove} },
-	{ WLR_MODIFIER_LOGO, BTN_MIDDLE, togglefloating, {0} },
-	{ WLR_MODIFIER_LOGO, BTN_RIGHT,  moveresize,     {.ui = CurResize} },
+	{ MODKEY, BTN_LEFT,   moveresize,     {.ui = CurMove} },
+	{ MODKEY, BTN_MIDDLE, togglefloating, {0} },
+	{ MODKEY, BTN_RIGHT,  moveresize,     {.ui = CurResize} },
 };
 
 static const Axis axes[] = {

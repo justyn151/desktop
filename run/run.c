@@ -36,7 +36,7 @@ static const struct config defaults = {
     .font_file = "/usr/share/fonts/TTF/DejaVuSansMono.ttf", .prompt = "run:",
     .desktop_entries = true, .path_commands = true, .prefer_desktop_entries = true,
     .case_sensitive = false, .fuzzy = true,
-    .terminal = "foot",
+    .terminal = "deal -e",
 };
 
 static int min(int a, int b) { return a < b ? a : b; }

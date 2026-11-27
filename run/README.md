@@ -75,8 +75,8 @@ search tier. Moving past the edge of the visible results changes the page.
 Long input scrolls to keep the cursor visible.
 
 For Shift+Enter, type a case-sensitive command name from `PATH` or an
-explicit path. For example, `foot -a "notes window"` passes two arguments
-to `foot`. Single and double quotes preserve spaces, adjacent quoted and
+explicit path. For example, `deal --title "notes window"` passes two arguments
+to `deal`. Single and double quotes preserve spaces, adjacent quoted and
 unquoted text forms one argument, and a backslash escapes the next
 character outside single quotes. Empty quoted arguments are preserved.
 `run` executes the program directly. Shell operators such as `|` and `>`
@@ -113,9 +113,9 @@ starts applications without files or URLs. D-Bus-activatable entries use
 their `Exec` fallback. Entries without a usable fallback are skipped.
 [Desktop entry Exec rules](https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html)
 
-`Terminal=true` entries open in `foot` by default. Set `terminal` to a
-different executable and any fixed options it needs before the command
-and its arguments. For example, use `terminal = xterm -e`. A matching
+`Terminal=true` entries open in deal by default (`terminal = deal -e`). Set
+`terminal` to a different executable and any fixed options it needs before
+the command and its arguments. For example, use `terminal = xterm -e`. A matching
 PATH command or a command typed with Shift+Enter also uses the terminal,
 with the arguments supplied by the user. Detached launches keep the
 login console out of their standard streams.
@@ -170,7 +170,7 @@ with `#` or `;` are allowed.
 | `[applications]` | `desktop_entries` | `true` | Discover and show desktop applications |
 | | `path_commands` | `true` | Show raw PATH commands. Shift+Enter still resolves commands on PATH |
 | | `prefer_desktop_entries` | `true` | Prefer desktop entries at equal match quality |
-| | `terminal` | `foot` | Terminal executable and optional fixed arguments |
+| | `terminal` | `deal -e` | Terminal executable and optional fixed arguments |
 | `[search]` | `case_sensitive` | `false` | Require matching capitalization |
 | | `fuzzy` | `true` | Include subsequence matches after all direct matches |
 

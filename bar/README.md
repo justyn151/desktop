@@ -76,12 +76,12 @@ signal percentage, and `enabled = false` removes the indicator and its
 separator. Set `custom_text = ""` to omit the Wi-Fi label while retaining any
 enabled SSID or strength. The default separator is `" | "`. [NetworkManager D-Bus API](https://www.networkmanager.dev/docs/api/latest/gdbus-org.freedesktop.NetworkManager.html)
 
-Left-click the network label to open `net` in Foot. The default is
-`command = foot -a net -W 84x26 -f monospace:size=14 net`. Set `click_enabled = false` to disable
+Left-click the network label to open `net` in deal. The default is
+`command = deal --app-id net --columns 84 --rows 26 -e net`. Set `click_enabled = false` to disable
 launching. Commands are split on whitespace, with single or double quotes
 for grouped arguments and backslashes to escape characters outside single
 quotes. Shell expansion and pipelines are unavailable. Use a foreground
-command so bar can suppress repeat launches until it exits. Foot and `net`
+command so bar can suppress repeat launches until it exits. deal and `net`
 must be on the session's `PATH` for the default command. See the
 [net installation and dwl rule notes](../net/README.md#bar-and-dwl-integration).
 

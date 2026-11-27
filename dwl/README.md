@@ -189,8 +189,7 @@ windows, with outer gaps and borders. Restoring it returns it to tiling or to it
 previous floating geometry. Fullscreen uses the whole monitor with no gaps or
 borders. Leaving fullscreen returns to maximization if it is still enabled.
 
-In the local Super-based config, the previous master-window promotion shortcut
-is now Super + Ctrl + Enter. Super + left or right drag still moves or resizes
+The master-window promotion shortcut is Super + Ctrl + Enter. Super + left or right drag still moves or resizes
 windows, floating tiled windows as needed. Super + middle click toggles floating.
 
 ### Gaps and borders

@@ -72,14 +72,15 @@ In bar's [configuration](../bar/README.md), add these options to the existing
 
 ```ini
 click_enabled = true
-command = foot -a net -W 84x26 -f monospace:size=14 net
+command = deal --app-id net --columns 84 --rows 26 -e net
 ```
 
 Build and install the updated bar, then use that build in your session. Once
 it is running, `pkill -HUP -x bar` reloads changes to its configuration.
 The launch command runs as an argument vector. Quote individual paths or
-arguments that contain spaces. The default command uses Foot's `net` app ID
-and requests 84 columns by 26 rows with a 14-point monospace font. [Foot manual](https://man.archlinux.org/man/extra/foot/foot.1.en)
+arguments that contain spaces. The default command sets deal's app ID to `net`
+and requests 84 columns by 26 rows. The font comes from deal's configuration. See
+the [deal command line](../deal/README.md#command-line).
 
 The local dwl `config.h` has a floating rule for the exact ID `net`. It opens
 on the current workspace, centered in the selected monitor's usable area,

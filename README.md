@@ -11,7 +11,7 @@ builds generate bindings with `wayland-scanner`.
 | Application | Purpose | Build | Additional dependencies |
 | --- | --- | --- | --- |
 | [dwl](dwl/README.md) | Tiling Wayland compositor with desktop IPC and wallpaper lifecycle management | `make -C dwl` | wlroots 0.20, Wayland server, wayland-protocols, libinput, xkbcommon. Optional XWayland support uses xcb and xcb-icccm. |
-| [bar](bar/README.md) | Wayland status bar with workspaces, network status, and a clock | `make -C bar` | Wayland client, wayland-protocols, wlr-protocols, FreeType, Fontconfig, libsystemd. The network shortcut uses Foot. |
+| [bar](bar/README.md) | Wayland status bar with workspaces, network status, and a clock | `make -C bar` | Wayland client, wayland-protocols, wlr-protocols, FreeType, Fontconfig, libsystemd. The network shortcut uses deal. |
 | [run](run/README.md) | Wayland launcher for desktop entries and shell commands | `make -C run` | Wayland client, wayland-protocols, wlr-protocols, xkbcommon, FreeType, DejaVu Sans Mono by default. |
 | [wall](wall/README.md) | Wayland wallpaper renderer, browser, and color palette generator | `make -C wall` | Wayland client and cursor libraries, wayland-protocols, wlr-protocols, libpng, libjpeg, FreeType, Fontconfig, xkbcommon. |
 | [net](net/README.md) | Terminal interface for Wi-Fi and network management | `make -C net` | libsystemd. NetworkManager must be running for network operations. |
@@ -29,7 +29,7 @@ dwl -s 'exec bar'
 
 dwl starts the wallpaper renderer and opens its browser with **Super+W**.
 **Super+D** launches `run`, and clicking the bar's network indicator opens
-`net` in Foot. If another `net` is on the session's `PATH`, set the full path
+`net` in deal. If another `net` is on the session's `PATH`, set the full path
 to this repository's installed `net` in the bar configuration. For a custom
 wallpaper executable location, set `DWL_WALL` to its absolute path. The
 existing XDG configuration locations and dwl's local `config.h` still apply.

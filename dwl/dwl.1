@@ -43,7 +43,7 @@ Users are encouraged to customize
 .Nm
 by editing the sources, in particular
 .Pa config.h .
-The default key bindings are as follows:
+The default key bindings are as follows, where Mod is the Super key:
 .Bl -tag -width 20n -offset indent -compact
 .It Mod-[1-9]
 Show only all windows with a tag.
@@ -53,25 +53,23 @@ Show all windows with a tag.
 Move window to a single tag.
 .It Mod-Ctrl-Shift-[1-9]
 Toggle tag for window.
-.It Mod-p
-Spawn
-.Xr wmenu-run 1 .
+.It Mod-p / Super-d
+Spawn the run launcher.
 .It Mod-Shift-Return
-Spawn
-.Xr foot 1 .
+Spawn the deal terminal.
 .It Super-[hjkl]
 Focus left, down, up, or right on the current monitor and visible tags.
 .It Super-Shift-[hjkl]
 Swap the focused tiled window with a visible tiled window to the left, down,
 up, or right. Keyboard focus stays on the same window.
-.It Mod-[id]
+.It Mod-i / Mod-Shift-d
 Increase/decrease number of windows in master area.
 .It Super-Ctrl-[hl]
 Decrease or increase master area width.
 .It Super-Return
 Open the terminal.
 .It Super-Ctrl-Return
-Promote a window to the master area in the local Super-based configuration.
+Promote a window to the master area.
 .It Mod-Tab
 Show only all windows with previous tag.
 .It Super-q
@@ -256,8 +254,6 @@ with s6 in the background:
 .Dl dwl \-s \(aqs6\-svscan <&\-\(aq
 .Sh SEE ALSO
 .Xr dwm 1 ,
-.Xr foot 1 ,
-.Xr wmenu 1 ,
 .Xr xkeyboard-config 7
 .Sh BUGS
 All of them.

@@ -54,7 +54,7 @@ static const struct bar_config bar_defaults = {
     .network_click_enabled = true,
     .network_separator = " | ",
     .network_custom_text = "WiFi",
-    .network_command = "foot -a net -W 84x26 -f monospace:size=14 net",
+    .network_command = "deal --app-id net --columns 84 --rows 26 -e net",
 };
 
 #endif

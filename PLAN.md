@@ -41,10 +41,10 @@ dwl already supports `wp_fractional_scale_v1` and `wp_viewporter`.
 
 ### 1.4 Make deal the default terminal
 
-- [ ] `dwl/config.def.h`: `termcmd` → `deal`
-- [ ] `bar.conf`: the network `command` → `deal --app-id net --columns 84 --rows 26 -e net`
+- [x] `dwl/config.def.h`: `termcmd` → `deal`
+- [x] `bar.conf`: the network `command` → `deal --app-id net --columns 84 --rows 26 -e net`
 - [ ] dwl floating rule: confirm it matches app ID `net` when launched from deal
-- [ ] `run`: confirm desktop entries with `Terminal=true` launch in deal
+- [x] `run`: desktop entries with `Terminal=true` launch in deal (`terminal = deal -e`)
 - [ ] Use only deal for a week, then uninstall foot
 
 ### Deferred deal milestones
@@ -63,7 +63,7 @@ Goal: fix existing problems before refactoring, so the migration to desk starts 
 
 ### Known issues
 
-- [ ] **dwl config mismatch:** `config.def.h` still uses `MODKEY = Alt` and `Alt+Shift+Enter` for the terminal. The README documents a Super-based layout (Super+Enter, Super+Q) that only exists in the gitignored `config.h`. Commit the real layout as `config.def.h`.
+- [x] **dwl config mismatch:** `config.def.h` still uses `MODKEY = Alt` and `Alt+Shift+Enter` for the terminal. The README documents a Super-based layout (Super+Enter, Super+Q) that only exists in the gitignored `config.h`. Commit the real layout as `config.def.h`.
 - [ ] **Remaining foot references:** sweep the repo after Phase 1.4 (`grep -rn foot`)
 - [ ] **dwl TODO/FIXME:** review the 4 markers in `dwl.c`
 
