@@ -15,7 +15,7 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-#define VIEW_VERSION "0.4.0"
+#define VIEW_VERSION "0.5.0"
 
 /* Exit statuses. */
 enum {
@@ -25,6 +25,30 @@ enum {
 };
 
 #define MAX_LEVELS 24
+
+enum filter {
+    FILTER_AUTO,    /* Bilinear, then nearest from 400%. */
+    FILTER_SMOOTH,  /* Always bilinear when enlarging. */
+    FILTER_NEAREST, /* Always nearest when enlarging. */
+};
+
+enum sort {
+    SORT_NATURAL,  /* strverscmp on the name. */
+    SORT_NAME,     /* strcmp on the name. */
+    SORT_MODIFIED, /* Oldest first. */
+};
+
+/* ~/.config/view/view.conf over the built-in defaults. */
+struct config {
+    bool background_palette; /* Follow the palette's background role. */
+    uint32_t background_rgb; /* Otherwise this, 0xRRGGBB. */
+    bool checker;            /* Checkerboard behind transparent images. */
+    bool fit_enlarge;
+    enum filter filter;
+    char *start;             /* Browsed without arguments, ~ not expanded. */
+    bool wrap;
+    enum sort sort;
+};
 
 /* Premultiplied ARGB8888, rows packed. */
 struct level {
@@ -69,6 +93,12 @@ struct frame {
 };
 
 struct view {
+    struct config config;
+    uint32_t background;               /* Resolved, 0xffRRGGBB. */
+    uint32_t checker_dark, checker_light;
+    char *palette_path;
+    DeskWatch palette_watch;           /* Follows wallpaper changes when background = palette. */
+
     /* The images to browse, as given or found in a directory. "-" is stdin. */
     char **paths;
     int count;

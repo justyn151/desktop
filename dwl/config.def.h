@@ -29,6 +29,7 @@ static const Rule rules[] = {
 	{ "firefox_EXAMPLE",  NULL,       1 << 8,       0,           -1 }, /* Start on ONLY tag "9" */
 	{ net_app_id,         NULL,       0,            1,           -1 },
 	{ wall_browser_app_id, NULL,      0,            1,           -1 },
+	{ "view",             NULL,       0,            1,           -1 }, /* Floats at the image's size */
     /* default/example rule: can be changed but cannot be eliminated; at least one rule must exist */
 };
 

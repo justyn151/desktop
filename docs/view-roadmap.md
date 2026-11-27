@@ -230,6 +230,16 @@ view [FILE|DIR]...
 - shot: add `[save] open = false` to shot.conf. When it's true, shot spawns `view FILE` after saving. Off by default.
 - `make install` follows bar's `PREFIX`/`BINDIR`/`DESTDIR` conventions. Add `/view/view` to `.gitignore`. Add view to the root README's table.
 
+### As built
+
+- `[browse] start` (default `~/Pictures/Screenshots`) is new: without it, launching view from `run` or the desktop entry with no files would only print usage. With no arguments, view now browses that directory.
+- The checkerboard colors are derived from the background, 6% and 14% of the way towards white on a dark background or black on a light one, so they follow the palette too.
+- `filter = nearest` switches to nearest from 100% up and `smooth` never does; `auto` keeps 0.2's 400% switch. Shrinking always averages.
+- `sort = modified` stats each file once and sorts oldest first, with natural order between files changed at the same moment. It applies to directories; explicit arguments keep their order.
+- `xdg-mime` isn't installed, so `make install` doesn't call it. A separate `make default` does, or prints the `mimeapps.list` lines without it. `xdg-open` isn't installed either, so that check waits.
+- shot's `open` spawns `view -- FILE` in a new session through a double fork, with stdin and stdout on `/dev/null`, so `$(shot)` and key bindings return at once.
+- The dwl rule is in both `config.h` and `config.def.h`; it takes effect after dwl is rebuilt, installed and restarted.
+
 ### Manual checks
 
 - Changing the wallpaper recolors an open view's background within a second.
@@ -265,5 +275,5 @@ view [FILE|DIR]...
 | 0.2 | Zoom, pan, rotate, filters, key repeat | Done |
 | 0.3 | Directory browsing, preloading, reload on change | Done |
 | 0.4 | EXIF orientation, checkerboard, GIF and WebP | Done (live checks untested: no sample files yet; covered offline) |
-| 0.5 | Config, palette, dwl rule, desktop entry, install | Planned |
+| 0.5 | Config, palette background, start directory, dwl float rule, desktop entry, shot's `open` | Code done, checklist pending |
 | 1.0 | Checklists, fuzzing, README | Final |

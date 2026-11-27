@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=view
+GenericName=Image Viewer
+Comment=Browse PNG, JPEG, GIF and WebP images
+Exec=view %F
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;image/gif;image/webp;

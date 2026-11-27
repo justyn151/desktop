@@ -86,6 +86,8 @@ static void config_entry(void *data, const char *section, const char *key, const
         valid = value[0] != 0 && strchr(value, '/') == NULL && set_string(&config->name, value);
     } else if (strcmp(section, "save") == 0 && strcmp(key, "clipboard") == 0) {
         valid = desk_parse_bool(value, &config->clipboard);
+    } else if (strcmp(section, "save") == 0 && strcmp(key, "open") == 0) {
+        valid = desk_parse_bool(value, &config->open);
     } else if (strcmp(section, "capture") == 0 && strcmp(key, "cursor") == 0) {
         valid = desk_parse_bool(value, &config->cursor);
     } else if (strcmp(section, "png") == 0 && strcmp(key, "compression") == 0) {
@@ -1312,6 +1314,34 @@ static bool default_path(const struct config *config, char **stem, char extensio
     return error == 0;
 }
 
+/* Start `view path`, detached: in its own session, not a child of shot, and
+   without shot's stdin and stdout, so `xdg-open "$(shot)"` and key bindings
+   don't wait for the viewer to close. */
+static void open_in_view(const char *path)
+{
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        warn("can't start view: %s", strerror(errno));
+        return;
+    }
+    if (pid > 0) {
+        waitpid(pid, NULL, 0);
+        return;
+    }
+    setsid();
+    if (fork() != 0) _exit(0); /* The grandchild is reparented, so nothing waits on it. */
+    int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null >= 0) {
+        dup2(null, STDIN_FILENO);
+        dup2(null, STDOUT_FILENO);
+    }
+    execlp("view", "view", "--", path, (char *)NULL);
+    warn("can't run view: %s", strerror(errno));
+    _exit(127);
+}
+
 /* Write path, or a name built from the config when path is NULL. Configured
    names never replace a file: they get -1, -2... instead. */
 static int save_file(const struct config *config, const char *path, const struct png_data *png)
@@ -1356,6 +1386,7 @@ static int save_file(const struct config *config, const char *path, const struct
     desk_atomic_abort(&atomic);
     if (error != 0) warn("can't save %s: %s", path != NULL ? path : "the capture", strerror(error));
     else printf("%s\n", path);
+    if (error == 0 && config->open) open_in_view(path);
     free(stem);
     free(target);
     return error != 0 ? EXIT_FAILED : EXIT_SAVED;

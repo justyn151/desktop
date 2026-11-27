@@ -61,6 +61,7 @@ shot reads `~/.config/shot/shot.conf` (or `$XDG_CONFIG_HOME/shot/shot.conf`). Wh
 | `[save]` | `directory` | `~/Pictures/Screenshots` | Where captures go without a `FILE`. A leading `~/` means `HOME`. |
 | | `name` | `%Y-%m-%d_%H-%M-%S.png` | `strftime` format. No `/`. |
 | | `clipboard` | `true` | Also copy every saved capture to the clipboard. |
+| | `open` | `false` | Open every saved capture in [view](../view/README.md), detached, so shot returns straight away. Not for captures written to stdout. |
 | `[capture]` | `cursor` | `false` | Always paint the cursor. `-c` does it for one capture. |
 | `[png]` | `compression` | `6` | zlib level 0–9. |
 | `[region]` | `dim` | `0.5` | Darkening outside the selection, 0–1. |

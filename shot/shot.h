@@ -28,6 +28,7 @@ struct config {
     char *directory; /* Expanded, for captures without a FILE argument. */
     char *name;      /* strftime format. */
     bool clipboard;  /* Also copy every saved capture. */
+    bool open;       /* Open every saved capture in view. */
     bool cursor;
     int compression; /* zlib level 0–9. */
     double dim;      /* 0 (none) to 1 (black) outside the selection. */

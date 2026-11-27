@@ -1,8 +1,8 @@
 # view
 
-`view` is an image viewer for dwl. Version 0.4 browses PNG, JPEG, GIF and WebP images: a file and the images beside it, a directory, or a list. It zooms, pans, rotates and flips them, and reloads an image when its file is replaced. What's left is in [docs/view-roadmap.md](../docs/view-roadmap.md).
+`view` is an image viewer for dwl. Version 0.5 browses PNG, JPEG, GIF and WebP images: a file and the images beside it, a directory, or a list. It zooms, pans, rotates and flips them, and reloads an image when its file is replaced. What's left is in [docs/view-roadmap.md](../docs/view-roadmap.md).
 
-It's a normal xdg-shell window with app ID `view`, so dwl tiles or floats it like any other client. It renders at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so images stay sharp at fractional scales, and uses `cursor-shape-v1` for the drag cursor. It's built on [desk](../desk/README.md): image decoding, shm buffers, key repeat and the file watch.
+It's a normal xdg-shell window with app ID `view`, so dwl tiles or floats it like any other client. It renders at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so images stay sharp at fractional scales, and uses `cursor-shape-v1` for the drag cursor. It's built on [desk](../desk/README.md): image decoding, shm buffers, key repeat, the file watch, the palette and the INI parser.
 
 ## Build
 
@@ -10,8 +10,13 @@ On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-prot
 
 ```sh
 make
-make install      # /usr/local/bin/view; honors PREFIX, BINDIR and DESTDIR
+make install      # /usr/local/bin/view and share/applications/view.desktop; honors PREFIX, BINDIR, DATADIR and DESTDIR
+make default      # make view the default for PNG, JPEG, GIF and WebP (needs xdg-mime)
 ```
+
+`view.desktop` lists view in `run` and registers it for `image/png`, `image/jpeg`, `image/gif` and `image/webp`, so `xdg-open` can use it. `make default` sets it as the default through `xdg-mime`; without `xdg-mime` it prints the lines to add to `~/.config/mimeapps.list` instead. Neither `xdg-mime` nor `xdg-open` is installed on this system yet.
+
+dwl floats view (a rule on app ID `view` in `dwl/config.h`), so it opens at the image's size, up to 80% of the output.
 
 ## Usage
 
@@ -26,6 +31,7 @@ view [FILE | DIRECTORY]...
 
 | Arguments | Browses |
 |---|---|
+| None | `[browse] start`, `~/Pictures/Screenshots` unless configured, such as when started from `run` |
 | One `FILE` | The images in its directory, starting at it |
 | One `DIRECTORY` | Its images, starting at the first |
 | Several | Exactly those, in order, with directories expanded in place |
@@ -70,13 +76,38 @@ A recognised format view can't decode (AVIF, HEIC, JPEG XL, BMP, TIFF, SVG and a
 
 Images up to 256 megapixels open. A larger JPEG is decoded at 1/2, 1/4 or 1/8 size; anything else that large fails. Colors are treated as sRGB and the screen as sRGB: there's no color management, so wide-gamut photos look a little dull.
 
+## Configuration
+
+view reads `~/.config/view/view.conf` (or `$XDG_CONFIG_HOME/view/view.conf`). When the file is missing, view writes the sample [`view.conf`](view.conf) there and says so on stderr. Delete the file to get the defaults back. Missing keys keep their built-in values, and a bad line is reported with its line number and ignored.
+
+| Section | Key | Default | Meaning |
+|---|---|---|---|
+| `[view]` | `background` | `palette` | `palette` for the wallpaper palette's `background`, which follows wallpaper changes while view is open, or `#RRGGBB`. Without a palette it's `#1e1e1e`. |
+| | `transparency` | `checker` | `checker` draws a checkerboard behind transparent images, derived from the background (lighter on a dark one, darker on a light one); `background` draws the plain background. |
+| | `fit_enlarge` | `false` | Enlarge images smaller than the window to fit it. |
+| | `filter` | `auto` | Enlarging: `auto` is smooth below 400% and sharp from 400%, `smooth` is always smooth, `nearest` always sharp. Shrinking always averages. |
+| `[browse]` | `start` | `~/Pictures/Screenshots` | Browsed without arguments. |
+| | `wrap` | `true` | Go from the last image to the first and back. |
+| | `sort` | `natural` | A directory's order: `natural` (`img2` before `img10`), `name` (byte order) or `modified` (oldest first). |
+
+shot can open each capture in view: set `[save] open = true` in `shot.conf`.
+
 ## Exit status
 
 | Status | Meaning |
 |---|---|
 | 0 | The window was closed |
-| 1 | A single `FILE` couldn't be decoded, a directory had no images or couldn't be read, or the Wayland connection failed |
+| 1 | A single `FILE` couldn't be decoded, a directory (or `[browse] start`) had no images or couldn't be read, or the Wayland connection failed |
 | 2 | Usage error |
+
+## Manual checks (0.5)
+
+Checked with a scratch `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`: the sample config is created on first run; a bad value, an unknown key and a malformed line are each reported with their line number; with no arguments view browses `[browse] start`; replacing the palette file recolored an open view's background (and its checkerboard) within a second; shot with `open = true` started view detached (its own session, parent PID 1), and `$(shot)` returned while view stayed open. Offline: the three sort orders, `wrap = false` stopping at both ends, `fit_enlarge`, the three filters, and the checkerboard on a light background.
+
+- [ ] After installing dwl and restarting it, view opens floating at the image's size.
+- [ ] `run` lists view, and launching it browses `~/Pictures/Screenshots`.
+- [ ] Changing the wallpaper with wall recolors an open view.
+- [ ] `xdg-open photo.jpg` opens view. Waits for `xdg-utils`.
 
 ## Manual checks (0.4)
 

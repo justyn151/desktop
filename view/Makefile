@@ -31,7 +31,7 @@ all: view
 view: $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PKG_LIBS) -lm $(LDLIBS)
 
-$(BUILD)/view.o: view.c view.h $(HEADERS) $(DESK)/desk.h
+$(BUILD)/view.o: view.c view.h $(HEADERS) $(BUILD)/default-config.h $(DESK)/desk.h
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(VIEW_CFLAGS) -c -o $@ view.c
 
 $(BUILD)/desk.o: $(DESK)/desk.c $(DESK)/desk.h | $(BUILD)
@@ -42,6 +42,11 @@ $(BUILD)/%-protocol.o: $(BUILD)/%-protocol.c
 
 $(BUILD):
 	mkdir -p $@
+
+# The sample config, embedded so view can write it when the user has none.
+$(BUILD)/default-config.h: view.conf | $(BUILD)
+	LC_ALL=C od -An -v -tu1 view.conf | awk '{ for (i = 1; i <= NF; ++i) printf "%s,", $$i; print "" }' > "$@.tmp"
+	mv -f "$@.tmp" "$@"
 
 $(BUILD)/xdg-shell-client-protocol.h $(BUILD)/xdg-shell-protocol.c: $(XDG_SHELL_XML)
 $(BUILD)/viewporter-client-protocol.h $(BUILD)/viewporter-protocol.c: $(VIEWPORTER_XML)
@@ -59,10 +64,23 @@ clean:
 	rm -f view
 	rm -rf $(BUILD)
 
+DATADIR ?= $(PREFIX)/share
+MIME_TYPES = image/png image/jpeg image/gif image/webp
+
 install: view
 	install -Dm755 view "$(DESTDIR)$(BINDIR)/view"
+	install -Dm644 view.desktop "$(DESTDIR)$(DATADIR)/applications/view.desktop"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/view"
+	rm -f "$(DESTDIR)$(BINDIR)/view" "$(DESTDIR)$(DATADIR)/applications/view.desktop"
 
-.PHONY: all clean install uninstall
+# Make view the default for its image types, for the user running make.
+default:
+	@if command -v xdg-mime >/dev/null; then \
+		xdg-mime default view.desktop $(MIME_TYPES) && echo "view is the default for $(MIME_TYPES)"; \
+	else \
+		echo "xdg-mime isn't installed. Add these lines under [Default Applications] in ~/.config/mimeapps.list:"; \
+		for type in $(MIME_TYPES); do echo "$$type=view.desktop"; done; \
+	fi
+
+.PHONY: all clean install uninstall default

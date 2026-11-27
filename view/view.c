@@ -19,11 +19,11 @@
 /* 256 megapixels as ARGB8888. */
 #define MAX_IMAGE_BYTES ((size_t)1 << 30)
 #define MAX_STDIN_BYTES ((size_t)512 << 20)
-#define BACKGROUND 0xff1e1e1eu
-/* Behind transparent images, anchored to the image so it moves with it. */
-#define CHECKER_DARK 0xff2a2a2au
-#define CHECKER_LIGHT 0xff3a3a3au
-#define CHECKER_CELL 8 /* Logical pixels. */
+/* Without a palette (background = palette before wall has run). */
+#define FALLBACK_BACKGROUND 0x1e1e1eu
+/* The checkerboard behind transparent images, anchored to the image so it
+   moves with it, in squares this many logical pixels wide. */
+#define CHECKER_CELL 8
 /* An initial window never covers more than this share of the output. */
 #define INITIAL_SHARE 0.8
 #define MIN_INITIAL_WIDTH 240
@@ -34,10 +34,139 @@
 #define ZOOM_STEP 1.4142135623730951
 #define MIN_ZOOM 0.1        /* Unless fitting needs less. */
 #define MAX_ZOOM 32.0
-#define NEAREST_ZOOM 4.0    /* From here up, pixels are drawn as sharp squares. */
+#define NEAREST_ZOOM 4.0    /* With filter = auto, pixels are sharp squares from here up. */
 #define PAN_STEP 0.1        /* Of the window, per key press. */
 #define SMOOTH_SCROLL 200.0 /* Touchpad scroll, in logical pixels, that halves or doubles the zoom. */
 #define MAX_REPEATS 8       /* Repeats handled at once after a stall. */
+
+/* Config */
+
+static const char default_config[] = {
+#include "default-config.h"
+};
+
+struct config_parse {
+    struct config *config;
+    const char *label;
+};
+
+static bool set_string(char **target, const char *value)
+{
+    char *copy = strdup(value);
+    if (!copy)
+        return false;
+    free(*target);
+    *target = copy;
+    return true;
+}
+
+static void config_entry(void *data, const char *section, const char *key, const char *value, int line)
+{
+    struct config_parse *parse = data;
+    struct config *config = parse->config;
+    if (!key) {
+        fprintf(stderr, "view: %s:%d: expected [section] or key = value\n", parse->label, line);
+        return;
+    }
+    bool known = true, valid = true;
+    if (strcmp(section, "view") == 0 && strcmp(key, "background") == 0) {
+        if (strcmp(value, "palette") == 0)
+            config->background_palette = true;
+        else if ((valid = desk_parse_rgb(value, &config->background_rgb)))
+            config->background_palette = false;
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "transparency") == 0) {
+        valid = strcmp(value, "checker") == 0 || strcmp(value, "background") == 0;
+        if (valid)
+            config->checker = strcmp(value, "checker") == 0;
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "fit_enlarge") == 0) {
+        valid = desk_parse_bool(value, &config->fit_enlarge);
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "filter") == 0) {
+        if (strcmp(value, "auto") == 0)
+            config->filter = FILTER_AUTO;
+        else if (strcmp(value, "smooth") == 0)
+            config->filter = FILTER_SMOOTH;
+        else if (strcmp(value, "nearest") == 0)
+            config->filter = FILTER_NEAREST;
+        else
+            valid = false;
+    } else if (strcmp(section, "browse") == 0 && strcmp(key, "start") == 0) {
+        valid = value[0] != 0 && set_string(&config->start, value);
+    } else if (strcmp(section, "browse") == 0 && strcmp(key, "wrap") == 0) {
+        valid = desk_parse_bool(value, &config->wrap);
+    } else if (strcmp(section, "browse") == 0 && strcmp(key, "sort") == 0) {
+        if (strcmp(value, "natural") == 0)
+            config->sort = SORT_NATURAL;
+        else if (strcmp(value, "name") == 0)
+            config->sort = SORT_NAME;
+        else if (strcmp(value, "modified") == 0)
+            config->sort = SORT_MODIFIED;
+        else
+            valid = false;
+    } else {
+        known = false;
+    }
+    if (!known)
+        fprintf(stderr, "view: %s:%d: unknown key %s in [%s]\n", parse->label, line, key, section);
+    else if (!valid)
+        fprintf(stderr, "view: %s:%d: invalid value for %s, keeping the default\n", parse->label, line, key);
+}
+
+/* The built-in defaults, then the user's file, which is created when it's
+   missing so there's always one to edit. Problems are reported and the
+   defaults stay in effect. */
+static void config_load(struct config *config)
+{
+    *config = (struct config){ .wrap = true };
+    struct config_parse parse = { .config = config, .label = "built-in config" };
+    desk_ini_parse(default_config, sizeof default_config, config_entry, &parse);
+    char *path = desk_config_path("view");
+    if (!path) {
+        fprintf(stderr, "view: neither XDG_CONFIG_HOME nor HOME is set, using the built-in config\n");
+        return;
+    }
+    int error = desk_write_default(path, default_config, sizeof default_config);
+    if (error == 0) {
+        fprintf(stderr, "view: created %s\n", path);
+    } else if (error != EEXIST) {
+        fprintf(stderr, "view: can't create %s: %s\n", path, strerror(error));
+    } else {
+        parse.label = path;
+        error = desk_ini_load(path, config_entry, &parse);
+        if (error != 0 && error != ENOENT)
+            fprintf(stderr, "view: can't read %s: %s\n", path, strerror(error));
+    }
+    free(path);
+}
+
+/* a moved towards b by amount out of 256, per channel. */
+static uint32_t mix(uint32_t a, uint32_t b, unsigned amount)
+{
+    uint32_t out = 0xff000000u;
+    for (int shift = 0; shift < 24; shift += 8) {
+        unsigned x = a >> shift & 0xff, y = b >> shift & 0xff;
+        out |= ((x * (256 - amount) + y * amount) >> 8) << shift;
+    }
+    return out;
+}
+
+/* Resolve the background, from the palette when configured, and derive the
+   checkerboard from it: slightly lighter on a dark background, darker on a
+   light one. */
+static void update_colors(struct view *view)
+{
+    uint32_t rgb = view->config.background_rgb;
+    if (view->config.background_palette) {
+        DeskPalette palette;
+        rgb = FALLBACK_BACKGROUND;
+        if (view->palette_path && desk_palette_load(view->palette_path, &palette) == 0)
+            rgb = palette.rgb[DESK_BACKGROUND];
+    }
+    view->background = 0xff000000u | rgb;
+    unsigned luma = (unsigned)(((rgb >> 16 & 0xff) * 299 + (rgb >> 8 & 0xff) * 587 + (rgb & 0xff) * 114) / 1000);
+    uint32_t toward = luma < 128 ? 0xffffffffu : 0xff000000u;
+    view->checker_dark = mix(view->background, toward, 16);
+    view->checker_light = mix(view->background, toward, 36);
+}
 
 /* Loading */
 
@@ -287,8 +416,9 @@ static double fit_zoom(const struct view *view, int width, int height)
     const struct level *image = &view->current.picture.levels[0];
     if (!has_image(view))
         return 1;
-    /* Never enlarged: a small image shows one image pixel per buffer pixel. */
-    return fmin(1.0, fmin((double)width / image->width, (double)height / image->height));
+    double fit = fmin((double)width / image->width, (double)height / image->height);
+    /* Unless configured, never enlarged: a small image shows one image pixel per buffer pixel. */
+    return view->config.fit_enlarge ? fit : fmin(1.0, fit);
 }
 
 static double clamp_axis(double center, double extent, double window, double zoom)
@@ -355,9 +485,9 @@ static void taps_free(struct taps *taps)
 
 /* outputs pixels, with the image's edge at origin and zoom buffer pixels per
    image pixel. Shrinking averages the area each output pixel covers in mip
-   level level_index; enlarging is bilinear, then nearest from NEAREST_ZOOM. */
+   level level_index; enlarging is bilinear, then nearest from nearest_zoom. */
 static bool taps_build(struct taps *taps, int outputs, int origin, double zoom, const struct level *level,
-                       int level_index, uint32_t full_size, bool horizontal)
+                       int level_index, uint32_t full_size, bool horizontal, double nearest_zoom)
 {
     double unit = ldexp(1.0, level_index); /* Image pixels per level pixel. */
     double width = 1.0 / (zoom * unit);    /* Level pixels per output pixel. */
@@ -385,7 +515,7 @@ static bool taps_build(struct taps *taps, int outputs, int origin, double zoom, 
         } else {
             double u = (p + 0.5 - origin) / zoom;
             if (u >= 0 && u < full_size) {
-                if (zoom >= NEAREST_ZOOM) {
+                if (zoom >= nearest_zoom) {
                     first = (int)u;
                     weight[count++] = 1;
                 } else {
@@ -443,6 +573,7 @@ static inline uint32_t pixel_over(uint32_t backdrop, uint32_t pixel)
 struct sampler {
     const struct level *level;
     struct taps columns, rows;
+    uint32_t background, checker_dark, checker_light;
     bool checker;   /* Draw the checkerboard behind the image. */
     int left, top;  /* The image's corner, which the checkerboard is anchored to. */
     int cell;       /* Checker square size in buffer pixels. */
@@ -457,9 +588,9 @@ static inline int floor_divide(int a, int b)
 static inline uint32_t backdrop(const struct sampler *sampler, int x, int y)
 {
     if (!sampler->checker)
-        return BACKGROUND;
+        return sampler->background;
     int cell = floor_divide(x - sampler->left, sampler->cell) + floor_divide(y - sampler->top, sampler->cell);
-    return cell & 1 ? CHECKER_LIGHT : CHECKER_DARK;
+    return cell & 1 ? sampler->checker_light : sampler->checker_dark;
 }
 
 /* Render the rectangle [x0, x1) × [y0, y1) of the frame. */
@@ -472,7 +603,7 @@ static void render(const struct sampler *sampler, struct frame *frame, int x0, i
         int row_count = rows->count[y];
         if (!row_count) {
             for (int x = x0; x < x1; ++x)
-                target[x] = BACKGROUND;
+                target[x] = sampler->background;
             continue;
         }
         const float *row_weight = rows->weight + (size_t)y * rows->span;
@@ -481,7 +612,7 @@ static void render(const struct sampler *sampler, struct frame *frame, int x0, i
         for (int x = x0; x < x1; ++x) {
             int column_count = columns->count[x];
             if (!column_count) {
-                target[x] = BACKGROUND;
+                target[x] = sampler->background;
                 continue;
             }
             const float *column_weight = columns->weight + (size_t)x * columns->span;
@@ -523,10 +654,10 @@ static void shift_frame(struct frame *frame, int dx, int dy)
     }
 }
 
-static void fill_background(uint32_t *pixels, int width, int height)
+static void fill_background(uint32_t *pixels, int width, int height, uint32_t color)
 {
     for (size_t i = 0; i < (size_t)width * height; ++i)
-        pixels[i] = BACKGROUND;
+        pixels[i] = color;
 }
 
 /* Draw the current view into pixels. The previous frame is kept: when only
@@ -538,7 +669,7 @@ static void paint(struct view *view, uint32_t *pixels, int width, int height)
     struct frame *frame = &view->frame;
     if (!has_image(view)) {
         frame->valid = false;
-        fill_background(pixels, width, height);
+        fill_background(pixels, width, height, view->background);
         return;
     }
     layout(view, width, height);
@@ -551,7 +682,7 @@ static void paint(struct view *view, uint32_t *pixels, int width, int height)
         free(frame->pixels);
         *frame = (struct frame){ .pixels = malloc((size_t)width * height * 4), .width = width, .height = height };
         if (!frame->pixels) {
-            fill_background(pixels, width, height);
+            fill_background(pixels, width, height, view->background);
             return;
         }
     }
@@ -564,18 +695,26 @@ static void paint(struct view *view, uint32_t *pixels, int width, int height)
     }
     struct sampler sampler = {
         .level = &picture->levels[level_index],
-        .checker = !picture->opaque,
+        .background = view->background,
+        .checker_dark = view->checker_dark,
+        .checker_light = view->checker_light,
+        .checker = !picture->opaque && view->config.checker,
         .left = left,
         .top = top,
         .cell = (int)lround(CHECKER_CELL * (view->width > 0 ? (double)width / view->width : 1)),
     };
     if (sampler.cell < 1)
         sampler.cell = 1;
-    if (!taps_build(&sampler.columns, width, left, zoom, sampler.level, level_index, image->width, true) ||
-        !taps_build(&sampler.rows, height, top, zoom, sampler.level, level_index, image->height, false)) {
+    double nearest_zoom = view->config.filter == FILTER_NEAREST  ? 1.0
+                        : view->config.filter == FILTER_SMOOTH ? INFINITY
+                                                               : NEAREST_ZOOM;
+    if (!taps_build(&sampler.columns, width, left, zoom, sampler.level, level_index, image->width, true,
+                    nearest_zoom) ||
+        !taps_build(&sampler.rows, height, top, zoom, sampler.level, level_index, image->height, false,
+                    nearest_zoom)) {
         taps_free(&sampler.columns);
         frame->valid = false;
-        fill_background(pixels, width, height);
+        fill_background(pixels, width, height, view->background);
         return;
     }
 
@@ -881,7 +1020,8 @@ static void show(struct view *view, int index)
 
 static void step(struct view *view, int direction)
 {
-    if (view->count < 2)
+    int target = view->current.index + direction;
+    if (view->count < 2 || (!view->config.wrap && (target < 0 || target >= view->count)))
         return;
     view->direction = direction;
     show(view, view->current.index + direction);
@@ -1635,12 +1775,13 @@ static bool run(struct view *view)
         /* Preload a neighbour once the current image is on screen and nothing else is waiting. */
         int next;
         bool idle_work = view->configured && !view->dirty && !view->frame_callback && preload_wanted(view, &next);
-        struct pollfd fds[3] = {
+        struct pollfd fds[4] = {
             { .fd = wl_display_get_fd(display), .events = POLLIN },
             { .fd = view->repeat.fd, .events = POLLIN },
             { .fd = view->watch.fd, .events = POLLIN },
+            { .fd = view->palette_watch.fd, .events = POLLIN },
         };
-        int ready = poll(fds, 3, idle_work ? 0 : -1);
+        int ready = poll(fds, 4, idle_work ? 0 : -1);
         if (ready < 0) {
             wl_display_cancel_read(display);
             if (errno == EINTR)
@@ -1667,6 +1808,15 @@ static bool run(struct view *view)
         }
         if (view->watch.fd >= 0 && fds[2].revents && desk_watch_changed(&view->watch, fds[2].revents))
             reload_current(view);
+        if (view->palette_watch.fd >= 0 && fds[3].revents &&
+            desk_watch_changed(&view->palette_watch, fds[3].revents)) {
+            uint32_t old = view->background;
+            update_colors(view);
+            if (view->background != old) {
+                view->frame.valid = false;
+                mark_dirty(view);
+            }
+        }
         if (ready == 0 && idle_work)
             preload(view);
         /* A buffer may have been released since a skipped draw. */
@@ -1722,19 +1872,59 @@ static bool has_image_extension(const char *name)
     return false;
 }
 
-/* Natural order on the file name, so img2 comes before img10. */
-static int compare_paths(const void *a, const void *b)
+/* By file name: natural order puts img2 before img10, name is plain bytes. */
+static int compare_names(const void *a, const void *b, void *data)
 {
     const char *x = *(char *const *)a, *y = *(char *const *)b;
-    int order = strverscmp(base_name(x), base_name(y));
+    enum sort sort = *(const enum sort *)data;
+    int order = sort == SORT_NAME ? strcmp(base_name(x), base_name(y)) : strverscmp(base_name(x), base_name(y));
     return order ? order : strcmp(x, y);
+}
+
+struct dated {
+    char *path;
+    struct timespec modified;
+};
+
+/* Oldest first, then natural order for files changed at the same moment. */
+static int compare_dated(const void *a, const void *b)
+{
+    const struct dated *x = a, *y = b;
+    if (x->modified.tv_sec != y->modified.tv_sec)
+        return x->modified.tv_sec < y->modified.tv_sec ? -1 : 1;
+    if (x->modified.tv_nsec != y->modified.tv_nsec)
+        return x->modified.tv_nsec < y->modified.tv_nsec ? -1 : 1;
+    enum sort natural = SORT_NATURAL;
+    return compare_names(&x->path, &y->path, &natural);
+}
+
+static void sort_paths(char **paths, int count, enum sort sort)
+{
+    if (sort == SORT_MODIFIED) {
+        struct dated *dated = malloc((size_t)count * sizeof *dated);
+        if (dated) {
+            for (int i = 0; i < count; ++i) {
+                struct stat st;
+                dated[i] = (struct dated){ .path = paths[i] };
+                if (strcmp(paths[i], "-") != 0 && stat(paths[i], &st) == 0)
+                    dated[i].modified = st.st_mtim;
+            }
+            qsort(dated, (size_t)count, sizeof *dated, compare_dated);
+            for (int i = 0; i < count; ++i)
+                paths[i] = dated[i].path;
+            free(dated);
+            return;
+        }
+        sort = SORT_NATURAL; /* Out of memory: by name instead. */
+    }
+    qsort_r(paths, (size_t)count, sizeof *paths, compare_names, &sort);
 }
 
 /* Append the image files in directory, sorted, skipping hidden ones.
    With prefix, each path starts with the directory; otherwise it's the bare
    name, for the working directory. Return false with errno set when the
    directory can't be read. */
-static bool list_directory(struct list *list, const char *directory, bool prefix)
+static bool list_directory(struct list *list, const char *directory, bool prefix, enum sort sort)
 {
     DIR *dir = opendir(directory);
     if (!dir)
@@ -1758,7 +1948,7 @@ static bool list_directory(struct list *list, const char *directory, bool prefix
         }
     }
     closedir(dir);
-    qsort(list->paths + start, (size_t)(list->count - start), sizeof *list->paths, compare_paths);
+    sort_paths(list->paths + start, list->count - start, sort);
     return true;
 }
 
@@ -1770,13 +1960,13 @@ static bool is_directory(const char *path)
 
 /* One FILE: the images beside it, starting at it. It's included even when
    its name doesn't look like an image, since content decides. */
-static bool list_around(struct list *list, const char *file, int *start)
+static bool list_around(struct list *list, const char *file, int *start, enum sort sort)
 {
     const char *slash = strrchr(file, '/');
     char *directory = slash ? strndup(file, slash == file ? 1 : (size_t)(slash - file)) : strdup(".");
     if (!directory)
         return false;
-    list_directory(list, directory, slash != NULL); /* Unreadable: just the file. */
+    list_directory(list, directory, slash != NULL, sort); /* Unreadable: just the file. */
     free(directory);
 
     const char *name = base_name(file);
@@ -1788,7 +1978,7 @@ static bool list_around(struct list *list, const char *file, int *start)
     }
     if (!list_add(list, strdup(file)))
         return false;
-    qsort(list->paths, (size_t)list->count, sizeof *list->paths, compare_paths);
+    sort_paths(list->paths, list->count, sort);
     for (int i = 0; i < list->count; ++i) {
         if (strcmp(list->paths[i], file) == 0)
             *start = i;
@@ -1797,11 +1987,11 @@ static bool list_around(struct list *list, const char *file, int *start)
 }
 
 /* Build the list from the arguments. Return 0 or an exit status. */
-static int build_list(struct list *list, int argc, char **argv, int *start)
+static int build_list(struct list *list, int argc, char **argv, int *start, enum sort sort)
 {
     *start = 0;
     if (argc == 1 && !is_directory(argv[0])) {
-        bool ok = strcmp(argv[0], "-") == 0 ? list_add(list, strdup("-")) : list_around(list, argv[0], start);
+        bool ok = strcmp(argv[0], "-") == 0 ? list_add(list, strdup("-")) : list_around(list, argv[0], start, sort);
         if (!ok)
             fprintf(stderr, "view: %s\n", strerror(ENOMEM));
         return ok ? 0 : EXIT_FAILED;
@@ -1812,7 +2002,7 @@ static int build_list(struct list *list, int argc, char **argv, int *start)
                 fprintf(stderr, "view: %s\n", strerror(ENOMEM));
                 return EXIT_FAILED;
             }
-        } else if (!list_directory(list, argv[i], true)) {
+        } else if (!list_directory(list, argv[i], true, sort)) {
             fprintf(stderr, "view: %s: %s\n", argv[i], strerror(errno));
             return EXIT_FAILED;
         }
@@ -1827,9 +2017,10 @@ static int build_list(struct list *list, int argc, char **argv, int *start)
 static void usage(FILE *stream)
 {
     fputs("Usage: view [FILE | DIRECTORY]...\n"
-          "Show PNG, JPEG, GIF and WebP images. One FILE browses the images beside it, a DIRECTORY\n"
-          "browses its images, and several arguments browse exactly those. FILE \"-\"\n"
-          "reads standard input.\n"
+          "Show PNG, JPEG, GIF and WebP images. One FILE browses the images beside it, a\n"
+          "DIRECTORY browses its images, and several arguments browse exactly those.\n"
+          "Without arguments, [browse] start in ~/.config/view/view.conf is browsed.\n"
+          "FILE \"-\" reads standard input.\n"
           "\n"
           "  -h, --help     Show this help\n"
           "  -v, --version  Show the version\n"
@@ -1862,30 +2053,50 @@ int main(int argc, char **argv)
         default: usage(stderr); return EXIT_USAGE;
         }
     }
+    struct config config;
+    config_load(&config);
+
+    /* Without arguments, browse the configured start directory. */
+    char *start_directory = NULL;
     if (argc - optind < 1) {
-        usage(stderr);
-        return EXIT_USAGE;
+        start_directory = desk_expand_home(config.start ? config.start : "~/Pictures/Screenshots");
+        if (!start_directory) {
+            fprintf(stderr, "view: can't expand %s (is HOME set?)\n", config.start);
+            free(config.start);
+            return EXIT_FAILED;
+        }
     }
+    char **arguments = start_directory ? &start_directory : argv + optind;
+    int argument_count = start_directory ? 1 : argc - optind;
 
     struct list list = { .count = 0 };
     int start;
-    int status = build_list(&list, argc - optind, argv + optind, &start);
+    int status = build_list(&list, argument_count, arguments, &start, config.sort);
     if (status) {
         list_free(&list);
+        free(start_directory);
+        free(config.start);
         return status;
     }
 
     struct view view = {
-        .paths = list.paths, .count = list.count, .direction = 1, .watch = { .fd = -1 },
+        .config = config, .paths = list.paths, .count = list.count, .direction = 1,
+        .watch = { .fd = -1 }, .palette_watch = { .fd = -1 }, .repeat = { .fd = -1 },
         .buffer_scale = 1, .running = true, .fit = true, .zoom = 1,
     };
+    if (config.background_palette) {
+        view.palette_path = desk_palette_path();
+        if (view.palette_path)
+            desk_watch_open(&view.palette_watch, view.palette_path);
+    }
+    update_colors(&view);
     slot_load(&view, &view.current, start);
     /* A single FILE that can't be shown is an error, as before browsing existed. */
-    bool single_file = argc - optind == 1 && !is_directory(argv[optind]);
+    bool single_file = argument_count == 1 && !is_directory(arguments[0]);
     if (!has_image(&view) && (single_file || view.count == 1)) {
         fprintf(stderr, "view: %s: %s\n", display_path(view.paths[start]), view.current.error);
-        list_free(&list);
-        return EXIT_FAILED;
+        status = EXIT_FAILED;
+        goto done;
     }
     watch_current(&view);
     int error = desk_repeat_open(&view.repeat);
@@ -1899,12 +2110,17 @@ int main(int argc, char **argv)
         status = EXIT_FAILED;
     }
     close_window(&view);
+done:
     desk_repeat_close(&view.repeat);
     desk_watch_close(&view.watch);
+    desk_watch_close(&view.palette_watch);
+    free(view.palette_path);
     free(view.frame.pixels);
     slot_free(&view.current);
     for (int i = 0; i < 2; ++i)
         slot_free(&view.cache[i]);
     list_free(&list);
+    free(start_directory);
+    free(view.config.start);
     return status;
 }
