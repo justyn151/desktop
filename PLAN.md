@@ -11,6 +11,30 @@ Ground rules that apply to every phase:
 
 ---
 
+## Where things stand (2026-11-27)
+
+**Now:** `view`, the image viewer, pulled forward from Phase 5. 0.1 to 0.4 are done and pushed. Each milestone's details and checks are in [docs/view-roadmap.md](docs/view-roadmap.md).
+
+**Next, in order:**
+
+1. `view` 0.5: config file (`~/.config/view/view.conf`), background from the wallpaper palette with live updates, a dwl rule to float it, a `view.desktop` entry so `xdg-open` and `run` use it, and an optional `[save] open` in shot.conf to open each capture
+2. `view` 1.0: checklists, fuzzing `desk_image_load` (PNG, JPEG, GIF, WebP and the EXIF parser) under ASan/UBSan, README, tag `view-1.0.0`
+3. `mark`, the terminal markdown viewer: write `docs/mark-roadmap.md` first, then build it
+4. Back to the open items: deal 0.10.4 and 0.11.0 (Phase 1), the week on deal and removing foot (Phase 1.4), shot 0.5 and 1.0 (Phase 4), then Phase 3
+
+**Recently finished:**
+
+| What | Result |
+|---|---|
+| shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
+| view 0.1 | One image fitted to the window, sharp at any scale |
+| view 0.2 | Zoom (keys and scroll around the pointer), pan, rotate, flip; smooth shrinking, crisp enlarging; key repeat |
+| view 0.3 | Browse a directory or a list, preload neighbours, reload a replaced file |
+| view 0.4 | GIF (built-in decoder) and WebP, EXIF orientation, checkerboard behind transparency, unsupported formats named. Live checks for portrait photos, WebP and GIF still to do once there are sample files |
+| desk | Image decoding moved from wall (`desk_image_load`), key repeat (`DeskRepeat`), alongside shot's atomic files, shm, INI config and buffer pool |
+
+---
+
 ## Phase 1: Finish deal and replace foot
 
 Goal: deal is the only terminal on the system.
@@ -122,6 +146,17 @@ Migrate one step at a time. Behavior must stay identical, verified with each app
 
 deal 0.12.0 started `desk/` early with `desk_palette_load` and `desk_watch_*`. deal already uses them, so step 1 now means moving net, dwl, bar, run and wall onto the same functions. The palette has no `ansi[16]`, so deal derives its ANSI colors from the roles.
 
+shot and view have grown desk further ahead of this phase. What's already there and who uses it:
+
+| desk piece | From | Used by | Step it pre-empts |
+|---|---|---|---|
+| Palette and file watch | deal 0.12.0 | deal, view | 1 |
+| INI parser, config paths, `desk_write_default` | shot 0.2 | shot | 2 (the other apps still have their own) |
+| shm buffer pool (`-DDESK_WAYLAND`) | shot 0.2 | shot, view | 4 (layer-shell setup still in each app) |
+| Key repeat (`DeskRepeat`, a timerfd) | view 0.2 | view | 6 (keymap and compose still in each app) |
+| Atomic files, `desk_shm_open` | shot 0.1 | shot | none |
+| Image decoding (`-DDESK_IMAGE`, PNG, JPEG, optional GIF and WebP, EXIF orientation) | wall, moved for view 0.1 | wall, view | none |
+
 **Phase 3 is done when:** no app contains its own palette parser, config parser, shm buffer code or font loader.
 
 ---
@@ -132,13 +167,14 @@ Built on desk from its first commit, so it's also a test of whether the desk API
 
 dwl already supports `ext-image-copy-capture-v1`, `ext-image-capture-source-v1` and `ext-foreign-toplevel-image-capture-source`.
 
-| Version | Milestone |
-|---|---|
-| 0.1 | Full-monitor capture to PNG (libpng, already used by wall) |
-| 0.2 | Region capture: freeze all outputs first, select on a layer-shell overlay, crop from the frozen frame |
-| 0.3 | Clipboard (`image/png`). The process stays in the background until the selection is cancelled |
-| 0.4 | Skipped: focused-window capture, not needed for now |
-| 0.5 | Config, Super+Shift+S for region capture, save to `~/Pictures/Screenshots/%Y-%m-%d_%H-%M-%S.png` and copy |
+| Version | Milestone | Status |
+|---|---|---|
+| 0.1 | Full-monitor capture to PNG (libpng, already used by wall) | Done (multi-monitor and rotation untested) |
+| 0.2 | Region capture: freeze all outputs first, select on a layer-shell overlay, crop from the frozen frame | Done (cancel, edge and scale checks pending) |
+| 0.3 | Clipboard (`image/png`). The process stays in the background until the selection is cancelled | Done |
+| 0.4 | Skipped: focused-window capture, not needed for now | Skipped |
+| 0.5 | Config, Super+Shift+S for region capture, save to `~/Pictures/Screenshots/%Y-%m-%d_%H-%M-%S.png` and copy | Binding added, pending a dwl restart; install left |
+| 1.0 | Checklists, exit codes, README | Not started |
 
 Notes:
 - Handle XRGB8888 and XBGR8888 shm formats
@@ -157,11 +193,28 @@ Rough order, based on what gets touched most often day to day:
 4. `vol`
 5. `power`
 6. `mount`
-7. `view` (pulled forward and started early; the detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md))
+7. `view`: pulled forward and in progress (see below)
    - `mark` comes right after `view` is finished, ahead of the rest of this list
 8. `files`
 9. `ctl`
 10. Then everything else from the project list below
+
+### view
+
+The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on desk: image decoding, shm buffers, key repeat and the file watch.
+
+| Version | Milestone | Status |
+|---|---|---|
+| 0.1 | One image fitted to the window, scale-correct; decoders move from wall to desk | Done (fractional scale check skipped: 1× only for now) |
+| 0.2 | Zoom, pan, rotate, flip; area-average shrinking from mip levels, bilinear then nearest enlarging; key repeat | Done |
+| 0.3 | Browse a file's directory, a directory or a list; preload neighbours; reload a replaced file | Done |
+| 0.4 | GIF (built-in) and WebP, EXIF orientation, checkerboard, unsupported formats named | Done (live checks wait for sample files) |
+| 0.5 | Config, palette background, dwl float rule, desktop entry and `xdg-open`, shot's open-after-capture | Next |
+| 1.0 | Checklists, fuzzing the decoders, README, tag | After 0.5 |
+
+### mark
+
+A terminal markdown viewer, built as soon as `view` reaches 1.0. It renders headings, emphasis, lists, tables, code blocks and links in a pager, using deal's text attributes (real bold and italic faces, strikethrough, colored underlines, OSC 8 links). The roadmap, `docs/mark-roadmap.md`, gets written before the first line of code.
 
 ---
 
