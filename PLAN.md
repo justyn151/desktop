@@ -17,7 +17,7 @@ Ground rules that apply to every phase:
 
 **Next, in order:**
 
-1. `mark`: write `docs/mark-roadmap.md` first (what it renders, how it pages, which deal features it relies on), then build it milestone by milestone
+1. `mark`: build it milestone by milestone from [docs/mark-roadmap.md](docs/mark-roadmap.md), starting with 0.1 (parse and print)
 2. Alongside `mark`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
    - 0.4 live checks once there are sample files: a portrait phone photo, a WebP, an animated GIF
@@ -219,7 +219,16 @@ The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on d
 
 ### mark
 
-A terminal markdown viewer, started once `view`'s features were done (0.5), while view 1.0's week of use runs. It renders headings, emphasis, lists, tables, code blocks and links in a pager, using deal's text attributes (real bold and italic faces, strikethrough, colored underlines, OSC 8 links). The roadmap, `docs/mark-roadmap.md`, gets written before the first line of code.
+A terminal markdown viewer, started once `view`'s features were done (0.5), while view 1.0's week of use runs. It renders headings, emphasis, lists, tables, code blocks and links in a pager, using deal's text attributes (real bold and italic faces, strikethrough, colored underlines, OSC 8 links). The detailed plan is in [docs/mark-roadmap.md](docs/mark-roadmap.md). Built on desk's Layer 0 only (INI config, palette, file watch), so it links nothing beyond libc.
+
+| Version | Milestone | Status |
+|---|---|---|
+| 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Not started |
+| 0.2 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Not started |
+| 0.3 | GitHub tables, strikethrough, task lists, extended autolinks | Not started |
+| 0.4 | Following links, back stack, search, heading jumps, outline | Not started |
+| 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Not started |
+| 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Not started |
 
 ---
 
