@@ -12,7 +12,7 @@ builds generate bindings with `wayland-scanner`.
 | --- | --- | --- | --- |
 | [dwl](dwl/README.md) | Tiling Wayland compositor with desktop IPC and wallpaper lifecycle management | `make -C dwl` | wlroots 0.20, Wayland server, wayland-protocols, libinput, xkbcommon. Optional XWayland support uses xcb and xcb-icccm. |
 | [bar](bar/README.md) | Wayland status bar with workspaces, network status, and a clock | `make -C bar` | Wayland client, wayland-protocols, wlr-protocols, FreeType, Fontconfig, libsystemd. The network shortcut uses deal. |
-| [run](run/README.md) | Wayland launcher for desktop entries and shell commands | `make -C run` | Wayland client, wayland-protocols, wlr-protocols, xkbcommon, FreeType, DejaVu Sans Mono by default. |
+| [run](run/README.md) | Wayland launcher for desktop entries and shell commands | `make -C run` | Wayland client, wayland-protocols, wlr-protocols, xkbcommon, FreeType, Noto Sans Mono (`noto-fonts`) by default. |
 | [wall](wall/README.md) | Wayland wallpaper renderer, browser, and color palette generator | `make -C wall` | Wayland client and cursor libraries, wayland-protocols, wlr-protocols, libpng, libjpeg, FreeType, Fontconfig, xkbcommon. |
 | [net](net/README.md) | Terminal interface for Wi-Fi and network management | `make -C net` | libsystemd. NetworkManager must be running for network operations. |
 | [deal](deal/README.md) | Native Wayland terminal emulator | `make -C deal` | Wayland client and EGL libraries, wayland-protocols, EGL, desktop OpenGL, xkbcommon, FreeType, Fontconfig, libutil. `tic` and `xdg-open` are optional. |

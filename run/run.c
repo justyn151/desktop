@@ -33,7 +33,7 @@ static const struct config defaults = {
     .selected_background = 0xc5ad81, .selected_foreground = 0x353535,
     .opacity = 0.78, .height = 24, .padding = 8,
     .font_size = 14, .input_width = 240, .result_spacing = 12,
-    .font_file = "/usr/share/fonts/TTF/DejaVuSansMono.ttf", .prompt = "run:",
+    .font_file = "/usr/share/fonts/noto/NotoSansMono-Regular.ttf", .prompt = "run:",
     .desktop_entries = true, .path_commands = true, .prefer_desktop_entries = true,
     .case_sensitive = false, .fuzzy = true,
     .terminal = "deal -e",

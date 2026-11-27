@@ -11,7 +11,7 @@ Version 0.13.2 splits the tab bar equally between tabs and adds close buttons. V
 | Compiler, Make and pkg-config | `gcc`, `make`, `pkgconf` |
 | Wayland client, EGL window glue, scanner and protocol XML | `wayland`, `wayland-protocols` |
 | Desktop OpenGL and EGL | `libglvnd` and a compatible graphics driver such as `mesa` |
-| Fonts and keyboard input | `freetype2`, `fontconfig`, `libxkbcommon`, and a monospace font such as `ttf-dejavu` |
+| Fonts and keyboard input | `freetype2`, `fontconfig`, `libxkbcommon`, and a monospace font such as `noto-fonts` |
 | Optional custom terminfo compiler | `ncurses` for `tic` |
 | Optional HTTP/HTTPS opener | `xdg-utils` for `xdg-open` |
 

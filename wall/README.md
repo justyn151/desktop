@@ -4,7 +4,7 @@
 
 ## Build on Arch Linux
 
-Install `base-devel`, `wayland`, `wayland-protocols`, `wlr-protocols`, `libpng`, `libjpeg-turbo`, `freetype2`, `fontconfig`, and `libxkbcommon`. Install `ttf-dejavu` for the default browser font, or choose an installed font in `wall.conf`. The build uses `wayland-scanner` from `wayland` and XML files from the protocol packages. [Arch Linux package database](https://archlinux.org/packages/)
+Install `base-devel`, `wayland`, `wayland-protocols`, `wlr-protocols`, `libpng`, `libjpeg-turbo`, `freetype2`, `fontconfig`, and `libxkbcommon`. The browser's default font is the fontconfig family `monospace` (Noto Sans Mono from `noto-fonts` here); choose another installed font in `wall.conf`. The build uses `wayland-scanner` from `wayland` and XML files from the protocol packages. [Arch Linux package database](https://archlinux.org/packages/)
 
 ```sh
 make

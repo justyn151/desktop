@@ -4929,7 +4929,7 @@ static void paint_browser(struct browser *browser, struct buffer *buffer)
 
 static bool setup_font(struct browser *browser)
 {
-    const char *name = browser->config.font ? browser->config.font : "DejaVu Sans Mono";
+    const char *name = browser->config.font ? browser->config.font : "monospace";
     if (FT_Init_FreeType(&browser->freetype))
         return false;
     FcConfig *config = FcInitLoadConfigAndFonts();

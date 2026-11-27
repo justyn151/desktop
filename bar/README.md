@@ -10,8 +10,9 @@ translucent background.
 On Arch Linux the build uses `gcc`, `make`, `pkgconf`, `wayland`,
 `wayland-protocols`, `wlr-protocols`, `freetype2`, `fontconfig`, and
 `systemd-libs` (providing `libsystemd`).
-The default font comes from `ttf-dejavu`. Fontconfig resolves configured
-font families and FreeType renders the text.
+The default font family is `monospace`, which fontconfig resolves (to Noto Sans
+Mono from `noto-fonts` with this desktop's fontconfig settings). FreeType
+renders the text.
 
 ```sh
 make

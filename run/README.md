@@ -13,9 +13,9 @@ matches, and the matching/total command count.
 On Arch Linux, the build uses `gcc`, `make`, `pkgconf`, `wayland`,
 `wayland-protocols`, `wlr-protocols`, `libxkbcommon`, and `freetype2`.
 The runtime needs `wayland`, `libxkbcommon`, `freetype2`, and the configured
-font. The default font comes from `ttf-dejavu`.
+font. The default font is Noto Sans Mono from `noto-fonts`.
 [Arch layer-shell protocol files](https://archlinux.org/packages/extra/any/wlr-protocols/files/)
-· [Arch DejaVu package](https://archlinux.org/packages/extra/any/ttf-dejavu/)
+· [Arch Noto package](https://archlinux.org/packages/extra/any/noto-fonts/)
 
 Build in the project directory and launch from a terminal in the dwl session.
 
@@ -162,7 +162,7 @@ with `#` or `;` are allowed.
 | | `height` | `24` | Row height in logical pixels, from 1 to 512 |
 | | `padding` | `8` | Horizontal padding in logical pixels, from 0 to 512 |
 | | `scale` | Inherited | Positive multiplier for logical pixel dimensions |
-| `[font]` | `file` | `/usr/share/fonts/TTF/DejaVuSansMono.ttf` | Font file loaded by FreeType |
+| `[font]` | `file` | `/usr/share/fonts/noto/NotoSansMono-Regular.ttf` | Font file loaded by FreeType |
 | | `size` | `14` | Font size in logical pixels, from 1 to 256 |
 | `[layout]` | `prompt` | `run:` | Prompt text. An empty value hides it |
 | | `input_width` | `240` | Preferred input width in logical pixels, from 1 to 8192 |
