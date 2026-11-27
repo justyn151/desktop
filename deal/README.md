@@ -121,13 +121,13 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 
 ### 0.10.5 text attributes
 
-- [ ] Build and check `./deal --version` reports 0.10.5. Run diagnostics and check the bold, italic and bold italic faces it reports.
-- [ ] Print each SGR from the table above. Check that bold and italic use real faces and that `bold_is_bright = false` keeps bold text in its original color after reload.
-- [ ] Check every underline style at several zoom levels. Curly, dotted and dashed patterns continue across cells without gaps. Check underline colors in 256-color and RGB forms and that 59 resets them.
-- [ ] Check italic letters with descenders and overhangs (`gjyf`) are not clipped badly. Check box drawing under italic stays connected.
-- [ ] Combine attributes with selection, the block cursor, inverse, dim and opacity below 1. Erase a line with an attribute active (`printf '\e[9;4m'; tput el`) and check nothing is drawn on the erased cells.
-- [ ] With `term = deal` installed, check Neovim diagnostics show undercurls in their own color, and `:hi Comment gui=italic` renders italic.
-- [ ] Repeat the 0.10.3 rendering and selection checks for regressions.
+- [x] Build and check `./deal --version` reports 0.10.5. Run diagnostics and check the bold, italic and bold italic faces it reports.
+- [x] Print each SGR from the table above. Check that bold and italic use real faces and that `bold_is_bright = false` keeps bold text in its original color after reload.
+- [x] Check every underline style at several zoom levels. Curly, dotted and dashed patterns continue across cells without gaps. Check underline colors in 256-color and RGB forms and that 59 resets them.
+- [x] Check italic letters with descenders and overhangs (`gjyf`) are not clipped badly. Check box drawing under italic stays connected.
+- [x] Combine attributes with selection, the block cursor, inverse, dim and opacity below 1. Erase a line with an attribute active (`printf '\e[9;4m'; tput el`) and check nothing is drawn on the erased cells.
+- [x] With `term = deal` installed, check Neovim diagnostics show undercurls in their own color, and `:hi Comment gui=italic` renders italic.
+- [x] Repeat the 0.10.3 rendering and selection checks for regressions.
 
 ### 0.10.3 baseline
 

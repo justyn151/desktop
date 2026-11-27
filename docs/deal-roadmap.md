@@ -244,7 +244,7 @@ Release work:
 |---|---|---|
 | 0.10.3 | Verify clipboard, selection, mouse | Done |
 | 0.10.4 | HiDPI and fractional scaling | Planned |
-| 0.10.5 | Text attributes, bold/italic faces | Code done, checklist pending |
+| 0.10.5 | Text attributes, bold/italic faces | Done |
 | 0.11.0 | Compose, urgency, OSC 52, sync output, OSC 7 | Planned (extended) |
 | 0.11.1 | Kitty keyboard protocol | **New** |
 | 0.11.2 | Scrollback search and prompt marks | **New** |
