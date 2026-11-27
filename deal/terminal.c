@@ -264,7 +264,7 @@ static Config config_defaults(void)
                     .columns = INITIAL_COLUMNS, .rows = INITIAL_ROWS, .decorations = true, .opacity = 1.0f,
                     .blink_interval = DEFAULT_BLINK_INTERVAL, .cursor_thickness = DEFAULT_CURSOR_THICKNESS,
                     .history_capacity = 10000, .scroll_on_input = true, .scroll_lines = 3,
-                    .click_interval = 350, .primary_selection = true, .bold_bright = true, .bell_urgency = true,
+                    .click_interval = 350, .primary_selection = true, .bold_bright = true,
                     .foreground = blank_cell.foreground,
                     .background = blank_cell.background, .cursor = blank_cell.foreground,
                     .cursor_style = CURSOR_UNDERLINE, .selection_foreground = {16, 22, 30},

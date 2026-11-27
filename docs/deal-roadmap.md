@@ -254,7 +254,7 @@ Release work:
 | 0.10.3 | Verify clipboard, selection, mouse | Done |
 | 0.10.4 | HiDPI and fractional scaling | Planned |
 | 0.10.5 | Text attributes, bold/italic faces | Done |
-| 0.11.0 | Compose and dead keys, urgency bell | Code done, checklist pending |
+| 0.11.0 | Compose and dead keys, urgency bell (off by default) | Done (Compose untested) |
 | 0.11.1 | OSC 52, synchronized output, OSC 7 | **New** (split from 0.11.0) |
 | 0.11.2 | Kitty keyboard protocol | **New** |
 | 0.11.3 | Scrollback search and prompt marks | **New** |

@@ -83,7 +83,7 @@ With `mouse.reporting` enabled, applications can request button, motion and whee
 
 deal reads the Compose table for the locale in `LC_ALL`, `LC_CTYPE` or `LANG`, so dead keys and the Compose key (for example `setxkbmap -option compose:ralt` or `xkb_options compose:ralt` in dwl) work as in other applications. `~/.XCompose` is honored. A cancelled sequence types nothing, and composed characters don't repeat. `--diagnostics` shows the Compose locale in use.
 
-When a program rings the bell (BEL) while the window is unfocused, `[bell] urgency = true` (the default) asks the compositor for attention through `xdg-activation-v1`. dwl marks the window urgent and highlights its tag without moving focus. Focusing the window clears it. deal sends at most one request a second. `visual = true` flashes the window as before.
+When a program rings the bell (BEL) while the window is unfocused, `[bell] urgency = true` asks the compositor for attention through `xdg-activation-v1`. dwl marks the window urgent and highlights its tag without moving focus. Focusing the window clears it. deal sends at most one request a second. `visual = true` flashes the window as before.
 
 ## Text attributes
 
@@ -127,13 +127,15 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 
 ### 0.11.0 Compose and urgency
 
-- [ ] Build and check `./deal --version` reports 0.11.0. Diagnostics show a Compose locale and `Urgency (xdg-activation): enabled`.
+Compose checks are not run on this setup because no Compose key or dead-key layout is configured.
+
+- [x] Build and check `./deal --version` reports 0.11.0. Diagnostics show a Compose locale and `Urgency (xdg-activation): disabled` by default, `enabled` with `urgency = true`.
 - [ ] With a Compose key, type Compose `'` `e`, Compose `o` `c`, and Compose `-` `-` `.`, then check `é`, `©` and `–`. Type a sequence that doesn't exist and check nothing is inserted.
 - [ ] With a dead-key layout such as `us(intl)`, check `'` `e` gives `é`, `'` Space gives `'`, and `"` `u` gives `ü`.
 - [ ] Hold the final key of a sequence and check it doesn't repeat. Start a sequence, change focus, come back and type a letter: the letter appears without composition.
-- [ ] Run `sleep 3; printf '\a'`, then focus another window. Check the deal window becomes urgent in dwl and the bar, and focusing it clears the urgency. A bell in the focused window does nothing.
-- [ ] Run `for i in $(seq 50); do printf '\a'; sleep 0.05; done` in an unfocused window and check dwl stays responsive. Set `urgency = false`, reload, and check the bell no longer marks the window.
-- [ ] Repeat the 0.10.5 and 0.10.3 keyboard checks for regressions.
+- [x] With `urgency = true`, run `sleep 3; printf '\a'`, then focus another window. Check the deal window becomes urgent in dwl and the bar, and focusing it clears the urgency. A bell in the focused window does nothing.
+- [x] Run `for i in $(seq 50); do printf '\a'; sleep 0.05; done` in an unfocused window and check dwl stays responsive. Set `urgency = false`, reload, and check the bell no longer marks the window.
+- [x] Repeat the 0.10.5 and 0.10.3 keyboard checks for regressions.
 
 ### 0.10.5 text attributes
 
