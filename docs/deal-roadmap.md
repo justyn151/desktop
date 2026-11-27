@@ -131,9 +131,9 @@ Recommendation: **defer `zwp_text_input_v3` to after 1.0**, but write the code s
 
 Split out of 0.11.0.
 
-- **OSC 52 clipboard write**, so Neovim's `"+y` works over SSH. Decode base64 and publish to the clipboard (`c`) or primary (`p`). Writes are on by default. Reads (`?`) are off by default and controlled by a config key, because reading the clipboard is a data-exfiltration path.
+- **OSC 52 clipboard write**, so Neovim's `"+y` works over SSH. Decode base64 and publish to the clipboard (`c`) or primary (`p`). Writes are on by default (`[selection] osc52`). Reads (`?`) are never supported, because reading the clipboard is a data-exfiltration path. Payloads use their own buffer, capped at 16 MiB of base64, because the normal OSC buffer holds only 2,304 bytes.
 - **Synchronized output (DECSET 2026):** while it's set, hold frame submission until it's reset or a 150 ms timeout. Report it in DECRQM. This removes tearing in Neovim and other fast TUIs.
-- **OSC 7:** store the reported `file://host/path` working directory. Add a "new window" shortcut (default Ctrl+Shift+N) that spawns `deal --working-directory <cwd>`.
+- **OSC 7:** store the reported `file://host/path` working directory when the host is local. Add a "new window" shortcut (default Ctrl+Shift+N) that spawns `deal --working-directory <cwd>`, falling back to `/proc/<shell>/cwd` when the shell doesn't report one.
 
 ### Manual checks
 
@@ -255,7 +255,7 @@ Release work:
 | 0.10.4 | HiDPI and fractional scaling | Planned |
 | 0.10.5 | Text attributes, bold/italic faces | Done |
 | 0.11.0 | Compose and dead keys, urgency bell (off by default) | Done (Compose untested) |
-| 0.11.1 | OSC 52, synchronized output, OSC 7 | **New** (split from 0.11.0) |
+| 0.11.1 | OSC 52, synchronized output, OSC 7 | Code done, checklist pending |
 | 0.11.2 | Kitty keyboard protocol | **New** |
 | 0.11.3 | Scrollback search and prompt marks | **New** |
 | (Phase 1.4) | deal becomes the default, foot removed | Planned |

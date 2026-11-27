@@ -61,7 +61,7 @@ enum {
 static const TerminalCell blank_cell = {
     .character = ' ', .foreground = {220, 229, 237}, .background = {16, 22, 30}, .width = 1
 };
-static const char deal_version[] = "0.11.0";
+static const char deal_version[] = "0.11.1";
 static const char compatibility_term[] = "xterm-color";
 static const char default_title[] = "deal";
 static const char default_font_family[] = "monospace";
@@ -166,6 +166,9 @@ static const TerminalColor ansi_colors[] = {
 /* SOURCE_RGB only appears in underline_source, where zero follows the foreground. */
 enum { SOURCE_FG = 1, SOURCE_BG, SOURCE_ANSI, SOURCE_RGB = 127, SOURCE_DIM = 128 };
 enum { TITLE_LIMIT = 512, LINK_LIMIT = 2048, LINK_SLOTS = 512, OSC_LIMIT = 2304 };
+/* OSC 52 payloads use their own buffer: 16 MiB of base64 is 12 MiB of text. */
+enum { OSC52_LIMIT = 16 * 1024 * 1024, SYNC_TIMEOUT = 150 };
+enum { OSC52_CLIPBOARD = 1, OSC52_PRIMARY = 2 };
 
 /* Startup configuration */
 
@@ -177,6 +180,7 @@ static const char default_zoom_out[] = "Ctrl+Shift+-";
 static const char default_zoom_reset[] = "Ctrl+Shift+0";
 static const char default_reload[] = "Ctrl+Shift+R";
 static const char default_fullscreen[] = "F11";
+static const char default_new_window[] = "Ctrl+Shift+N";
 
 typedef struct {
     xkb_keysym_t key;
@@ -252,8 +256,8 @@ typedef struct {
     unsigned int mouse_override, link_modifier;
     CursorStyle cursor_style;
     bool blink, decorations;
-    bool scroll_on_input, primary_selection, bold_bright;
-    Shortcut zoom_in, zoom_out, zoom_reset, reload, fullscreen;
+    bool scroll_on_input, primary_selection, bold_bright, osc52;
+    Shortcut zoom_in, zoom_out, zoom_reset, reload, fullscreen, new_window;
     bool dynamic_title, mouse_reporting, hyperlinks;
 } Config;
 
@@ -264,7 +268,7 @@ static Config config_defaults(void)
                     .columns = INITIAL_COLUMNS, .rows = INITIAL_ROWS, .decorations = true, .opacity = 1.0f,
                     .blink_interval = DEFAULT_BLINK_INTERVAL, .cursor_thickness = DEFAULT_CURSOR_THICKNESS,
                     .history_capacity = 10000, .scroll_on_input = true, .scroll_lines = 3,
-                    .click_interval = 350, .primary_selection = true, .bold_bright = true,
+                    .click_interval = 350, .primary_selection = true, .bold_bright = true, .osc52 = true,
                     .foreground = blank_cell.foreground,
                     .background = blank_cell.background, .cursor = blank_cell.foreground,
                     .cursor_style = CURSOR_UNDERLINE, .selection_foreground = {16, 22, 30},
@@ -277,6 +281,7 @@ static Config config_defaults(void)
     shortcut_parse(default_zoom_reset, &defaults.zoom_reset, false);
     shortcut_parse(default_reload, &defaults.reload, false);
     shortcut_parse(default_fullscreen, &defaults.fullscreen, true);
+    shortcut_parse(default_new_window, &defaults.new_window, true);
     return defaults;
 }
 
@@ -481,6 +486,7 @@ static const ConfigKey config_keys[] = {
     SETTING("selection", "background", CFG_COLOR, selection_background),
     SETTING("selection", "primary", CFG_BOOL, primary_selection),
     INTEGER("selection", "click_interval", click_interval, 100, 1000),
+    SETTING("selection", "osc52", CFG_BOOL, osc52),
     SETTING("terminal", "shell", CFG_SHELL, shell),
     SETTING("terminal", "term", CFG_TERM, custom_term),
     INTEGER("scrollback", "capacity", history_capacity, 0, 1000000),
@@ -498,6 +504,7 @@ static const ConfigKey config_keys[] = {
     SETTING("shortcuts", "zoom_reset", CFG_SHORTCUT, zoom_reset),
     SETTING("keybinds", "reload_config", CFG_SHORTCUT, reload),
     SETTING("keybinds", "fullscreen", CFG_OPTIONAL_SHORTCUT, fullscreen),
+    SETTING("keybinds", "new_window", CFG_OPTIONAL_SHORTCUT, new_window),
 };
 #undef INTEGER
 #undef SETTING
@@ -1765,6 +1772,7 @@ typedef struct {
     struct xdg_activation_v1 *activation;
     struct xdg_activation_token_v1 *activation_token;
     uint32_t seat_name, clipboard_name, primary_name, activation_name;
+    uint32_t input_serial; /* The latest serial from a key, button or keyboard focus event. */
     KeyRepeat repeat;
     PointerAxis scroll[2];
     double pointer_x, pointer_y;
@@ -1887,11 +1895,11 @@ static void platform_keyboard_enter(void *data, struct wl_keyboard *keyboard, ui
                                     struct wl_surface *surface, struct wl_array *keys)
 {
     (void)keyboard;
-    (void)serial;
     (void)keys;
     Platform *platform = data;
     platform->focused = surface == platform->surface;
     platform->repeat.key = 0;
+    if (platform->focused) platform->input_serial = serial;
 }
 
 static void platform_keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
@@ -1921,6 +1929,7 @@ static void platform_keyboard_key(void *data, struct wl_keyboard *keyboard, uint
         platform->repeat.key = 0;
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED || platform->keys == NULL ||
         !platform->focused || platform->key_pressed == NULL) return;
+    platform->input_serial = serial;
     char composed[64];
     bool finished = false;
     if (platform->compose != NULL &&
@@ -2050,6 +2059,7 @@ static void platform_pointer_button(void *data, struct wl_pointer *pointer, uint
 {
     (void)pointer;
     Platform *platform = data;
+    platform->input_serial = serial;
     if (platform->pointer_inside && platform->pointer_button_event != NULL)
         platform->pointer_button_event(platform->input_data, button,
                                        state == WL_POINTER_BUTTON_STATE_PRESSED, serial, time);
@@ -2566,6 +2576,7 @@ typedef struct {
     bool has_subparameters;
     bool unsupported;
     bool osc;
+    bool osc52; /* The string continues in Terminal.osc52 after "52;". */
     char string[OSC_LIMIT + 1];
     size_t string_length;
 } Parser;
@@ -2607,6 +2618,15 @@ typedef struct {
     bool insert_mode;
     bool bracketed_paste, bell_pending;
     bool bold_bright;
+    bool synchronized; /* DECSET 2026 holds frames until reset or SYNC_TIMEOUT. */
+    bool allow_osc52;
+    char *osc52;
+    size_t osc52_length, osc52_capacity;
+    /* A decoded OSC 52 write waiting for the Wayland side. */
+    unsigned char *clipboard_write;
+    size_t clipboard_write_length;
+    unsigned int clipboard_targets;
+    char directory[PATH_MAX]; /* From OSC 7, empty when unknown or remote. */
 } Terminal;
 
 static size_t minimum(size_t a, size_t b)
@@ -2706,6 +2726,7 @@ static void terminal_configure(Terminal *terminal, const Config *config)
     terminal->cursor_color = config->cursor;
     memcpy(terminal->palette, config->palette, sizeof terminal->palette);
     terminal->bold_bright = config->bold_bright;
+    terminal->allow_osc52 = config->osc52;
     if (terminal->default_cursor_style != config->cursor_style) {
         terminal->default_cursor_style = config->cursor_style;
         terminal->primary.cursor_style = terminal->alternate.cursor_style = config->cursor_style;
@@ -2748,6 +2769,7 @@ static void terminal_reset_modes(Terminal *terminal)
     terminal->application_arrows = terminal->application_keypad = terminal->insert_mode = false;
     terminal->bracketed_paste = terminal->focus_reporting = terminal->mouse_sgr = false;
     terminal->mouse_mode = 0;
+    terminal->synchronized = false;
     ++terminal->mouse_generation;
     terminal->last_character = 0;
     memset(terminal->tab_stops, 1, sizeof terminal->tab_stops);
@@ -3537,6 +3559,10 @@ static bool terminal_mode(Terminal *terminal, const Parser *parser, bool set)
             terminal->mouse_sgr = set;
             break;
         case 2004: terminal->bracketed_paste = set; break;
+        case 2026:
+            changed |= terminal->synchronized && !set;
+            terminal->synchronized = set;
+            break;
         case 47: case 1047: case 1049:
             changed |= terminal_alternate(terminal, mode, set);
             break;
@@ -3594,6 +3620,7 @@ static void terminal_mode_query(Terminal *terminal, const TerminalBuffer *buffer
         case 1006: status = terminal->mouse_sgr ? 1 : 2; break;
         case 1049: status = terminal->mode_1049 ? 1 : 2; break;
         case 2004: status = terminal->bracketed_paste ? 1 : 2; break;
+        case 2026: status = terminal->synchronized ? 1 : 2; break;
         }
     } else if (prefix == 0 && mode == 4) status = terminal->insert_mode ? 1 : 2;
     char response[32];
@@ -3767,8 +3794,10 @@ static bool parser_escape_byte(Terminal *terminal, unsigned char byte)
     case ']': case 'P': case 'X': case '^': case '_':
         parser->state = PARSE_STRING;
         parser->osc = byte == ']';
+        parser->osc52 = false;
         parser->unsupported = false;
         parser->string_length = 0;
+        terminal->osc52_length = 0;
         break;
     case '7': buffer->saved = buffer->cursor; break;
     case '8': return terminal_restore(buffer, buffer->saved);
@@ -3846,6 +3875,125 @@ static bool link_valid(const char *url, size_t length)
     return scheme && scheme < length && strcspn(url + scheme, "/?#") != 0;
 }
 
+static bool osc52_append(Terminal *terminal, unsigned char byte)
+{
+    if (terminal->osc52_length >= OSC52_LIMIT) return false;
+    if (terminal->osc52_length == terminal->osc52_capacity) {
+        size_t capacity = terminal->osc52_capacity ? terminal->osc52_capacity * 2 : 4096;
+        char *grown = realloc(terminal->osc52, capacity);
+        if (grown == NULL) return false;
+        terminal->osc52 = grown;
+        terminal->osc52_capacity = capacity;
+    }
+    terminal->osc52[terminal->osc52_length++] = (char)byte;
+    return true;
+}
+
+static int base64_value(unsigned char byte)
+{
+    if (byte >= 'A' && byte <= 'Z') return byte - 'A';
+    if (byte >= 'a' && byte <= 'z') return byte - 'a' + 26;
+    if (byte >= '0' && byte <= '9') return byte - '0' + 52;
+    if (byte == '+') return 62;
+    if (byte == '/') return 63;
+    return -1;
+}
+
+/* OSC 52 ; targets ; base64. Only writes are supported. Reading the
+   clipboard would let any program, including a remote one, take its contents. */
+static void osc52_finish(Terminal *terminal)
+{
+    const char *data = terminal->osc52;
+    size_t length = terminal->osc52_length;
+    const char *separator = length != 0 ? memchr(data, ';', length) : NULL;
+    if (!terminal->allow_osc52 || separator == NULL) return;
+    unsigned int targets = 0;
+    for (const char *target = data; target < separator; ++target) {
+        if (*target == 'c') targets |= OSC52_CLIPBOARD;
+        else if (*target == 'p' || *target == 's') targets |= OSC52_PRIMARY;
+    }
+    if (separator == data) targets = OSC52_CLIPBOARD;
+    const unsigned char *encoded = (const unsigned char *)separator + 1;
+    size_t count = length - (size_t)(separator + 1 - data);
+    if (targets == 0 || count == 0 || (count == 1 && encoded[0] == '?')) return;
+    unsigned char *decoded = malloc(count / 4 * 3 + 3);
+    if (decoded == NULL) return;
+    size_t written = 0;
+    uint32_t bits = 0;
+    int pending = 0;
+    bool padding = false;
+    for (size_t i = 0; i < count; ++i) {
+        if (encoded[i] == '=') {
+            padding = true;
+            continue;
+        }
+        int value = base64_value(encoded[i]);
+        if (value < 0 || padding) {
+            free(decoded);
+            return;
+        }
+        bits = (bits << 6) | (uint32_t)value;
+        pending += 6;
+        if (pending >= 8) {
+            pending -= 8;
+            decoded[written++] = (unsigned char)(bits >> pending);
+        }
+    }
+    if (written == 0 || memchr(decoded, 0, written) != NULL) {
+        free(decoded);
+        return;
+    }
+    free(terminal->clipboard_write);
+    terminal->clipboard_write = decoded;
+    terminal->clipboard_write_length = written;
+    terminal->clipboard_targets = targets;
+}
+
+static int hex_value(unsigned char byte)
+{
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    return -1;
+}
+
+/* OSC 7 ; file://host/path. A remote host, such as a shell over ssh,
+   names a directory that doesn't exist here, so it clears the value. */
+static void osc7_directory(Terminal *terminal, const char *url)
+{
+    terminal->directory[0] = 0;
+    if (strncmp(url, "file://", 7) != 0) return;
+    const char *host = url + 7, *path = strchr(host, '/');
+    if (path == NULL) return;
+    size_t host_length = (size_t)(path - host);
+    char name[256];
+    bool local = host_length == 0 || (host_length == 9 && strncasecmp(host, "localhost", 9) == 0);
+    if (!local && gethostname(name, sizeof name) == 0) {
+        name[sizeof name - 1] = 0;
+        local = strlen(name) == host_length && strncasecmp(host, name, host_length) == 0;
+    }
+    if (!local) return;
+    size_t written = 0;
+    for (const char *p = path; *p != 0; ++p) {
+        unsigned char byte = (unsigned char)*p;
+        if (byte == '%') {
+            int high = hex_value((unsigned char)p[1]), low = high >= 0 ? hex_value((unsigned char)p[2]) : -1;
+            if (low < 0) {
+                terminal->directory[0] = 0;
+                return;
+            }
+            byte = (unsigned char)(high * 16 + low);
+            p += 2;
+        }
+        if (byte == 0 || written + 1 >= sizeof terminal->directory) {
+            terminal->directory[0] = 0;
+            return;
+        }
+        terminal->directory[written++] = (char)byte;
+    }
+    terminal->directory[written] = 0;
+}
+
 static void parser_finish_string(Terminal *terminal)
 {
     Parser *parser = &terminal->parser;
@@ -3854,6 +4002,15 @@ static void parser_finish_string(Terminal *terminal)
     char *text = parser->string;
     size_t length = parser->string_length;
     text[length] = 0;
+    if (parser->osc52) {
+        if (!parser->unsupported) osc52_finish(terminal);
+        terminal->osc52_length = 0;
+        return;
+    }
+    if (length >= 2 && text[0] == '7' && text[1] == ';') {
+        if (!parser->unsupported) osc7_directory(terminal, text + 2);
+        return;
+    }
     if (length >= 2 && text[0] == '8' && text[1] == ';') {
         TerminalBuffer *buffer = terminal_buffer(terminal);
         buffer->active_link = 0;
@@ -3907,8 +4064,11 @@ static bool parser_string_byte(Terminal *terminal, unsigned char byte)
         parser->state = PARSE_STRING_ESCAPE;
     } else {
         parser->state = PARSE_STRING;
-        if (parser->osc && parser->string_length < OSC_LIMIT) {
+        if (parser->osc52) {
+            if (!parser->unsupported && !osc52_append(terminal, byte)) parser->unsupported = true;
+        } else if (parser->osc && parser->string_length < OSC_LIMIT) {
             parser->string[parser->string_length++] = (char)byte;
+            parser->osc52 = parser->string_length == 3 && memcmp(parser->string, "52;", 3) == 0;
         } else parser->unsupported = true;
     }
     return false;
@@ -5019,17 +5179,18 @@ static bool clipboard_channel_ready(const ClipboardChannel *channel, const Platf
                             : platform->clipboard_manager != NULL && channel->manager_name == platform->clipboard_name;
 }
 
-static void clipboard_copy(ClipboardChannel *channel, Platform *platform, Terminal *terminal, uint32_t serial)
+/* Publish text, taking ownership of it. */
+static void clipboard_offer(ClipboardChannel *channel, Platform *platform, TextBuffer *text, uint32_t serial)
 {
-    if (!clipboard_channel_ready(channel, platform)) return;
-    ClipboardSource *source = calloc(1, sizeof *source);
-    if (source == NULL) return;
-    source->refs = 1;
-    source->channel = channel;
-    if (!selection_text(terminal, &source->text)) {
-        clipboard_unref(source);
+    ClipboardSource *source = clipboard_channel_ready(channel, platform) ? calloc(1, sizeof *source) : NULL;
+    if (source == NULL) {
+        text_destroy(text);
         return;
     }
+    source->refs = 1;
+    source->channel = channel;
+    source->text = *text;
+    *text = (TextBuffer){0};
 
     bool listening;
     if (channel->primary) {
@@ -5060,6 +5221,33 @@ static void clipboard_copy(ClipboardChannel *channel, Platform *platform, Termin
     ClipboardSource *last = source;
     for (size_t i = 1; i < CLIPBOARD_SOURCES && last->next != NULL; ++i) last = last->next;
     if (last->next != NULL) clipboard_drop_source(last->next);
+}
+
+static void clipboard_copy(ClipboardChannel *channel, Platform *platform, Terminal *terminal, uint32_t serial)
+{
+    if (!clipboard_channel_ready(channel, platform)) return;
+    TextBuffer text = {0};
+    if (selection_text(terminal, &text)) clipboard_offer(channel, platform, &text, serial);
+    else text_destroy(&text);
+}
+
+/* Hand a decoded OSC 52 write to the requested selections. */
+static void clipboard_remote_write(Clipboard *clipboard, Platform *platform, Terminal *terminal)
+{
+    if (terminal->clipboard_write == NULL) return;
+    TextBuffer text = {terminal->clipboard_write, terminal->clipboard_write_length, terminal->clipboard_write_length};
+    terminal->clipboard_write = NULL;
+    unsigned int targets = terminal->clipboard_targets;
+    if ((targets & OSC52_PRIMARY) && (targets & OSC52_CLIPBOARD)) {
+        TextBuffer copy = {0};
+        if (text_append(&copy, text.bytes, text.length)) {
+            clipboard_offer(&clipboard->primary, platform, &copy, platform->input_serial);
+        } else text_destroy(&copy);
+    } else if (targets & OSC52_PRIMARY) {
+        clipboard_offer(&clipboard->primary, platform, &text, platform->input_serial);
+        return;
+    }
+    clipboard_offer(&clipboard->regular, platform, &text, platform->input_serial);
 }
 
 static void clipboard_clear_primary(ClipboardChannel *channel, const Platform *platform, uint32_t serial)
@@ -5320,6 +5508,8 @@ static void input_zoom(Interaction *input, int64_t steps)
     input->font_size = config_zoom_size(input->config, input->font_size + steps * input->config->zoom_step);
 }
 
+static void window_open(Interaction *input);
+
 static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint32_t serial)
 {
     Interaction *input = data;
@@ -5353,6 +5543,10 @@ static bool keyboard_event(void *data, xkb_keycode_t code, KeyEvent event, uint3
     }
     if (shortcut_matches(config->fullscreen, modifiers, normalized, unshifted)) {
         if (event == KEY_PRESS) platform_fullscreen(input->platform);
+        return true;
+    }
+    if (shortcut_matches(config->new_window, modifiers, normalized, unshifted)) {
+        if (event == KEY_PRESS) window_open(input);
         return true;
     }
     if (modifiers == (MOD_CTRL | MOD_SHIFT) && (normalized == XKB_KEY_c || normalized == XKB_KEY_v)) {
@@ -5457,6 +5651,62 @@ static void link_open(Interaction *input, const char *url)
         if (error != 0) fprintf(stderr, "deal: could not start xdg-open: %s\n", strerror(error));
         return;
     }
+}
+
+/* Start another deal in the shell's directory: OSC 7 when the shell reports
+   it, otherwise the directory of the shell process itself. */
+static void window_open(Interaction *input)
+{
+    extern char **environ;
+    char executable[PATH_MAX], directory[PATH_MAX];
+    ssize_t length = readlink("/proc/self/exe", executable, sizeof executable - 1);
+    if (length <= 0) return;
+    executable[length] = 0;
+    /* A rebuilt binary leaves the running one marked deleted at the same path. */
+    static const char deleted[] = " (deleted)";
+    if ((size_t)length > sizeof deleted - 1 && strcmp(executable + length - (sizeof deleted - 1), deleted) == 0)
+        executable[length - (sizeof deleted - 1)] = 0;
+    const char *chosen = NULL;
+    struct stat info;
+    if (input->terminal->directory[0] != 0 && stat(input->terminal->directory, &info) == 0 && S_ISDIR(info.st_mode)) {
+        chosen = input->terminal->directory;
+    } else if (input->session->child > 0) {
+        char link[64];
+        snprintf(link, sizeof link, "/proc/%d/cwd", (int)input->session->child);
+        ssize_t count = readlink(link, directory, sizeof directory - 1);
+        if (count > 0) {
+            directory[count] = 0;
+            chosen = directory;
+        }
+    }
+    char *arguments[6];
+    size_t count = 0;
+    arguments[count++] = executable;
+    if (chosen != NULL) {
+        arguments[count++] = "--working-directory";
+        arguments[count++] = (char *)chosen;
+    }
+    if (input->config->options->config_path != NULL) {
+        arguments[count++] = "--config";
+        arguments[count++] = (char *)input->config->options->config_path;
+    }
+    arguments[count] = NULL;
+    link_reap(input);
+    for (size_t i = 0; i < sizeof input->link_children / sizeof *input->link_children; ++i) {
+        if (input->link_children[i] != 0) continue;
+        posix_spawnattr_t attributes;
+        int error = posix_spawnattr_init(&attributes);
+        if (error == 0) {
+            error = posix_spawnattr_setsigmask(&attributes, &input->session->original_signal_mask);
+            if (error == 0) error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSID);
+            if (error == 0) error = posix_spawn(&input->link_children[i], executable, NULL, &attributes, arguments, environ);
+            if (error != 0) input->link_children[i] = 0;
+            posix_spawnattr_destroy(&attributes);
+        }
+        if (error != 0) fprintf(stderr, "deal: could not open a new window: %s\n", strerror(error));
+        return;
+    }
+    fprintf(stderr, "deal: too many windows are still starting\n");
 }
 
 static bool mouse_reporting(const Interaction *input, unsigned int modifiers)
@@ -5908,7 +6158,7 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
 
     bool redraw = true;
     bool focused = false, pty_hangup = false, pty_closed = false;
-    int64_t drain_deadline = 0, link_deadline = 0, zoom_deadline = 0;
+    int64_t drain_deadline = 0, link_deadline = 0, zoom_deadline = 0, sync_since = 0;
     CursorBlink blink = {0};
     Bell bell = {0};
     Interaction input = {.platform = platform, .terminal = terminal, .session = session,
@@ -5981,8 +6231,13 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
             platform_title(platform, config, terminal->dynamic_title);
             terminal->title_dirty = false;
         }
+        clipboard_remote_write(clipboard, platform, terminal);
         int64_t now = monotonic_milliseconds();
         int timeout = clipboard_timeout(clipboard, terminal, now);
+        if (!terminal->synchronized) sync_since = 0;
+        else if (sync_since == 0) sync_since = now > 0 ? now : 1;
+        bool hold = sync_since != 0 && now >= 0 && now - sync_since < SYNC_TIMEOUT;
+        if (hold && redraw) timeout = earlier_timeout(timeout, deadline_timeout(now, sync_since + SYNC_TIMEOUT));
         timeout = earlier_timeout(timeout, bell_tick(&bell, terminal, config, platform, now, &redraw));
         timeout = earlier_timeout(timeout, mouse_tick(&input, now));
         if (*save_zoom) {
@@ -6008,7 +6263,7 @@ static const char *run(Platform *platform, Terminal *terminal, Session *session,
         timeout = earlier_timeout(timeout, cursor_timeout(&blink, focused && buffer->cursor_visible &&
                                     buffer->cursor_blink && view.first_visible == view.first_live,
                                     config->blink_interval, now, &redraw));
-        if (redraw && platform->frame == NULL) {
+        if (redraw && !hold && platform->frame == NULL) {
             render_screen(renderer, &view, width, height, buffer->cursor.column, buffer->cursor.row,
                           buffer->cursor_visible && blink.visible, buffer->cursor_style, config,
                           config->opacity);
@@ -6212,7 +6467,8 @@ static void print_diagnostics(const Config *config, FontRenderer *renderer,
     puts("Features: desktop OpenGL, UTF-8, ANSI 256/RGB, alternate screen, scrollback reflow, "
          "Wayland keyboard repeat, keyboard and wheel zoom, selection, clipboard, mouse reports, "
          "focus reporting, OSC titles and links, bold and italic faces, underline styles and colors, "
-         "strikethrough, overline, compose and dead keys, visual and urgency bells, INI reload");
+         "strikethrough, overline, compose and dead keys, visual and urgency bells, OSC 52 copy, "
+         "synchronized output, OSC 7 and new windows, INI reload");
 }
 
 int main(int argc, char **argv)
@@ -6299,6 +6555,8 @@ int main(int argc, char **argv)
     clipboard_close(&clipboard);
     session_close(&session);
     links_clear(&terminal);
+    free(terminal.osc52);
+    free(terminal.clipboard_write);
     history_clear(&terminal.history);
     free(terminal.history.lines);
     terminal_screen_destroy(&terminal.primary.screen);

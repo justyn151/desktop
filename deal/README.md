@@ -1,8 +1,8 @@
-# deal 0.11.0
+# deal 0.11.1
 
 Experimental native Wayland milestone for Linux and dwl. deal uses xdg-shell for the window, EGL and desktop OpenGL for the existing fixed-function renderer, FreeType and Fontconfig for fonts, and a Linux PTY for the shell or command. Frames are drawn on changes and paced by the compositor. XWayland and an X server are unnecessary.
 
-Version 0.11.0 adds Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
+Version 0.11.1 adds OSC 52 copy, synchronized output, and new windows in the current directory. Version 0.11.0 added Compose and dead-key input and the urgency bell. Version 0.10.5 added bold, italic and bold italic font faces, underline styles and colors, strikethrough, overline and concealed text. Version 0.10.3 added text selection, native clipboard and optional primary selection, bracketed paste, application mouse reporting, and OSC 8 link activation.
 
 ## Build on Arch Linux
 
@@ -72,12 +72,21 @@ Reload with **Ctrl+Shift+R** or send **SIGHUP** to the deal process with `kill -
 | Middle click | Paste the primary selection when available |
 | Ctrl+left click | Open an HTTP or HTTPS OSC 8 link |
 | F11 | Request fullscreen or return to the previous layout |
+| Ctrl+Shift+N | Open a new window in the shell's current directory |
 
 Under `[font]`, set `zoom_min` and `zoom_max` between 6 and 96 pixels and keep `size` within those limits. `zoom_step` is a positive number of pixels from 1 to 90. The `[shortcuts]` keys `zoom_in`, `zoom_out`, and `zoom_reset` are configurable. Zoom keeps the window dimensions and updates the terminal grid and PTY. With the default configuration path, deal remembers the runtime size separately in `font-zoom`. Zoom leaves `deal.conf` untouched.
 
 Key repeat follows the compositor's rate and delay for XKB-repeatable keys. Reload, fullscreen, copy and paste are single-press actions. Vertical wheel zoom consumes the gesture locally. High-resolution wheels accumulate fractional detents, and touchpads accumulate logical scroll distance. Set `[scrollback] scroll_lines` from 1 to 100 to change the number of history lines per detent. It defaults to 3.
 
 With `mouse.reporting` enabled, applications can request button, motion and wheel reports in legacy or SGR format. Hold `mouse.selection_override` (Shift by default) for local selection, primary paste or scrollback. Set selection colors under `[selection]`. Set `click_interval` from 100 to 1000 milliseconds to change the double- and triple-click interval. Set `primary = false` to disable primary selection.
+
+## Remote copy, synchronized output and new windows
+
+**OSC 52.** Programs can copy to the clipboard by printing `ESC ] 52 ; c ; <base64> BEL`. This works over ssh, so Neovim's `"+y` reaches the local clipboard (Neovim 0.10 and later use OSC 52 automatically in an ssh session without another clipboard tool). In tmux, set `set -g set-clipboard on`. Targets `c` (or empty) copy to the clipboard, and `p` or `s` to the primary selection. Payloads up to 16 MiB of base64 are accepted. Reading the clipboard with `?` is not supported, because it would let any program read what you copied. Set `[selection] osc52 = false` to ignore OSC 52 completely.
+
+**Synchronized output.** Programs that set mode 2026 (`ESC [ ? 2026 h`) while they redraw, like Neovim and many TUI libraries, get one complete frame when they reset it. deal shows a frame anyway after 150 ms, so a program that forgets to reset the mode can't freeze the window. `ESC [ ? 2026 $ p` reports the mode.
+
+**New windows.** Ctrl+Shift+N opens another deal in the shell's directory. deal uses the directory the shell reports with OSC 7 (`ESC ] 7 ; file://host/path`) when the host is this machine, and otherwise reads the shell process's current directory, so it works without shell setup. A directory reported by a remote shell over ssh is ignored. The new window uses the same `--config` file. Set `[keybinds] new_window = false` to disable it.
 
 ## Compose and the bell
 
@@ -124,6 +133,17 @@ The default TERM is `xterm-color`. Set `[terminal] term = deal` to use the custo
 - A short-lived command closes its window on exit. Add a pause to inspect its output in manual checks.
 
 ## Manual verification on dwl
+
+### 0.11.1 Remote copy, synchronized output and new windows
+
+- [ ] Build and check `./deal --version` reports 0.11.1.
+- [ ] Run `printf '\e]52;c;%s\a' "$(printf 'hello from osc52' | base64)"`, then paste with Ctrl+Shift+V and into another application. Repeat with `p` instead of `c` and paste with middle click.
+- [ ] Over ssh to any host, run the same command and check it reaches the local clipboard. In Neovim over ssh, yank with `"+y` and paste locally.
+- [ ] Set `osc52 = false`, reload, and check the command changes nothing. Check `printf '\e]52;c;?\a'` never prints the clipboard back.
+- [ ] Scroll quickly through a large file in Neovim and check it redraws without tearing or half-drawn screens. Run `printf '\e[?2026h'; sleep 2; echo after; printf '\e[?2026l'` and check the window keeps updating.
+- [ ] `cd /tmp`, press Ctrl+Shift+N, and run `pwd` in the new window. Repeat after `cd` into a directory with a space in its name. Close the first window and check the second keeps running.
+- [ ] Inside `ssh host`, `cd /` there and press Ctrl+Shift+N. The new window opens in the local shell's directory, not `/` on the remote host.
+- [ ] Repeat the 0.10.3 clipboard checks for regressions.
 
 ### 0.11.0 Compose and urgency
 
