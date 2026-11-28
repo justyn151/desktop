@@ -108,6 +108,19 @@ struct worker {
     char *sent;            /* Main thread: the key of the last request, until its result arrives. */
 };
 
+/* Where the columns were drawn in the last frame, in buffer pixels, so the
+   dividers between them can be dragged. */
+struct columns {
+    bool shown[3];          /* Parent, current, preview. */
+    int left[3], right[3];
+    int divider[2];         /* x of parent|current and current|preview, -1 when absent. */
+    int inner;              /* The width the shown columns share. */
+};
+
+struct wl_pointer;
+struct wp_cursor_shape_manager_v1;
+struct wp_cursor_shape_device_v1;
+
 /* The entry last selected in a directory, for coming back to it. */
 struct memory {
     char *path, *name;
@@ -125,6 +138,16 @@ struct files {
     unsigned long long free_space; /* Bytes available here, or ULLONG_MAX when unknown. */
 
     bool show_preview;
+    double weights[3];        /* Column widths as parent : current : preview. */
+    struct columns columns;
+    char *state_path;         /* Remembers the column widths between runs. */
+
+    /* Changing files is allowed only inside home (home_real, symlinks
+       resolved), unless running as root. */
+    char *home_real;
+    bool root;
+    bool writable;            /* The current directory may be changed. */
+
     long preview_scroll;      /* Lines or rows scrolled with J and K. */
     char *preview_path;       /* What the scroll applies to. */
     struct preview *cache[PREVIEW_CACHE];
@@ -156,6 +179,15 @@ struct files {
     DeskGlobals globals;
     struct wl_seat *seat;
     struct wl_keyboard *wl_keyboard;
+    struct wl_pointer *pointer;
+    struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+    struct wp_cursor_shape_device_v1 *cursor_shape;
+    uint32_t pointer_serial;
+    double pointer_x, pointer_y;  /* Logical surface coordinates. */
+    int hover;                /* The divider under the pointer, or -1. */
+    int drag;                 /* The divider being dragged, or -1. */
+    uint32_t press_time;      /* For double-clicking a divider. */
+    int press_divider;
     DeskWindow window;
     DeskKeyboard keyboard;
     DeskRepeat repeat;

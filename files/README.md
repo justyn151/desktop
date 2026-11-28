@@ -46,6 +46,8 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Page Down, Page Up | A page down, up |
 | `J`, `K` | Scroll the preview down, up |
 | `z` | Hide or show the preview column |
+| `<`, `>` | Make the current column narrower, wider (against the preview, or the parent when the preview is hidden) |
+| `=` | Reset the column widths to 1 : 2 : 3 |
 | `.` | Show or hide hidden files |
 | `~` | Home |
 | `q`, Ctrl+Q | Quit |
@@ -54,7 +56,9 @@ Movement and preview scrolling keys repeat while held, at the compositor's rate.
 
 ## What it shows
 
-The window has three columns, about 1 : 2 : 3 of its width: the parent directory with the current one highlighted, the current directory, and a preview of the selected entry. When the window is narrower than 60 character cells the parent column goes, and under 40 the preview goes too.
+The window has three columns, 1 : 2 : 3 of its width to begin with: the parent directory with the current one highlighted, the current directory, and a preview of the selected entry. When the window is narrower than 60 character cells the parent column goes, and under 40 the preview goes too.
+
+The columns can be resized by dragging the dividers between them (the pointer turns into a resize arrow over one), or with `<` and `>`. Double-clicking a divider or pressing `=` goes back to 1 : 2 : 3. No column gets narrower than a tenth of the width. The widths are kept in `~/.local/state/files/state` (or under `$XDG_STATE_HOME`) for next time.
 
 Each row has an icon and the name. Where the current column is wide enough, the size (or a directory's entry count) and the date and time (`2026-11-28 14:03`) are on the right. They're always in the status line.
 
@@ -79,9 +83,13 @@ A file counts as text when its first 4 KiB have no NUL byte and almost no invali
 
 Previews are made on two worker threads, one for images and one for directories and text, so moving never waits for them, and a slow image doesn't hold up a directory. A preview appears when it's ready. Images are decoded into at most 64 MiB, so a larger JPEG is decoded at reduced size; a larger PNG shows an error. The last 16 previews are cached by path, modified time and size, so going back is instant and a changed file is previewed again.
 
+### Protected places
+
+files will only change things inside your home directory: that's the rule every file operation follows once they arrive in 0.4, so a slip can't delete the system. A directory counts as home by where it really is, so a symlink in home pointing at `/etc` is still protected. Running files as root lifts the rule. Outside home the status line shows a lock and `read-only`; as root it shows `root` in red.
+
 ### Status line
 
-On the left: the selected entry's permissions, owner and group, size (or entry count), modified time, and for a symlink `→ target`. On the right: the position in the list (`3/15`) and the free space on the current filesystem.
+On the left: the selected entry's permissions, owner and group, size (or entry count), modified time, and for a symlink `→ target`. On the right: `read-only` or `root` when that applies, the position in the list (`3/15`) and the free space on the current filesystem.
 
 ## Behaviour
 
@@ -109,3 +117,5 @@ On the left: the selected entry's permissions, owner and group, size (or entry c
 - [x] A text file's preview shows its start; a binary file shows its details.
 - [ ] Narrowing the window drops the parent column, then the preview.
 - [x] Directory, image, symlink, named pipe and empty-file previews draw as described above.
+- [ ] Dragging a divider resizes the columns, the pointer shows a resize arrow over it, and the widths come back after a restart.
+- [x] `/etc` shows `read-only` in the status line; home doesn't.

@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <linux/input-event-codes.h>
 #include <math.h>
 #include <poll.h>
 #include <stdio.h>
@@ -21,6 +22,7 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+#include "cursor-shape-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 #define FONT_POINTS 11.0      /* UI text size, in points at 96 dpi. */
@@ -36,6 +38,12 @@
 #define TAB_WIDTH 4
 #define PARENT_CELLS 60       /* Narrower than this, the parent column goes. */
 #define PREVIEW_CELLS 40      /* Narrower than this, the preview goes too. */
+#define MIN_COLUMN_SHARE 0.1  /* No column narrower than this share of the shown width. */
+#define RESIZE_STEP 0.05      /* < and > move a divider by this share of the width. */
+#define DIVIDER_GRAB 5        /* Logical pixels either side of a divider that grab it. */
+#define DOUBLE_CLICK_MS 400
+
+static const double default_weights[3] = {1, 2, 3};
 
 /* Nerd Font icons (Font Awesome and Octicons ranges of Symbols Nerd Font). */
 #define ICON_FOLDER 0xf07b
@@ -403,6 +411,94 @@ static void arm_refresh(struct files *files)
         files->refresh_armed = true;
 }
 
+/* Protection */
+
+/* Whether entries in directory may be created, renamed or removed. Root may
+   change anything; everyone else only what's really inside their home, with
+   symlinks resolved, so a slip can't delete the system. Every file
+   operation (0.4) asks this of the directories it changes. */
+static bool may_modify(const struct files *files, const char *directory)
+{
+    if (files->root)
+        return true;
+    if (!files->home_real || strcmp(files->home_real, "/") == 0)
+        return false;
+    char *real = realpath(directory, NULL);
+    if (!real)
+        return false;
+    size_t length = strlen(files->home_real);
+    bool inside = strncmp(real, files->home_real, length) == 0 && (real[length] == '/' || real[length] == 0);
+    free(real);
+    return inside;
+}
+
+/* State */
+
+/* $XDG_STATE_HOME/files/state, or ~/.local/state/files/state. */
+static char *state_path(void)
+{
+    const char *state = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
+    char *path = NULL;
+    int length = -1;
+    if (state && state[0] == '/')
+        length = asprintf(&path, "%s/files/state", state);
+    else if (home && home[0])
+        length = asprintf(&path, "%s/.local/state/files/state", home);
+    return length < 0 ? NULL : path;
+}
+
+static bool parse_weights(const char *text, double weights[3])
+{
+    double parsed[3];
+    char *end;
+    for (int i = 0; i < 3; ++i) {
+        parsed[i] = strtod(text, &end);
+        if (end == text || !(parsed[i] > 0) || parsed[i] > 100 || (i < 2 && *end != ':'))
+            return false;
+        text = end + (i < 2);
+    }
+    if (*end)
+        return false;
+    memcpy(weights, parsed, sizeof parsed);
+    return true;
+}
+
+static void state_entry(void *data, const char *section, const char *key, const char *value, int line)
+{
+    (void)line;
+    struct files *files = data;
+    if (key && strcmp(section, "layout") == 0 && strcmp(key, "columns") == 0)
+        parse_weights(value, files->weights);
+}
+
+static void load_state(struct files *files)
+{
+    memcpy(files->weights, default_weights, sizeof files->weights);
+    if (files->state_path)
+        desk_ini_load(files->state_path, state_entry, files);
+}
+
+/* Write the state atomically. Failing only loses the widths, so it's quiet. */
+static void save_state(struct files *files)
+{
+    if (!files->state_path)
+        return;
+    char *directory = parent_path(files->state_path);
+    if (!directory || desk_mkdirs(directory, 0700) != 0) {
+        free(directory);
+        return;
+    }
+    free(directory);
+    DeskAtomic atomic;
+    if (desk_atomic_open(&atomic, files->state_path, 0600) != 0)
+        return;
+    fprintf(atomic.file, "# Written by files. Column widths as parent : current : preview.\n[layout]\n"
+                         "columns = %.3f:%.3f:%.3f\n",
+            files->weights[0], files->weights[1], files->weights[2]);
+    desk_atomic_commit(&atomic, true);
+    desk_atomic_abort(&atomic); /* Frees what's left, after success or failure. */
+}
+
 /* Navigation */
 
 static void update_title(struct files *files)
@@ -435,6 +531,7 @@ static void load(struct files *files, const char *keep, size_t near)
     listing_read(&files->listing, files->path);
     listing_filter(&files->listing, files->show_hidden);
     load_parent(files);
+    files->writable = may_modify(files, files->path);
     struct statvfs volume;
     files->free_space = statvfs(files->path, &volume) == 0
                             ? (unsigned long long)volume.f_bavail * volume.f_frsize
@@ -594,6 +691,53 @@ static void toggle_hidden(struct files *files)
     desk_window_redraw(&files->window);
 }
 
+/* Resizing */
+
+/* Move divider (0: parent|current, 1: current|preview) to buffer x, keeping
+   the two columns' combined width. */
+static void move_divider(struct files *files, int divider, int x)
+{
+    const struct columns *columns = &files->columns;
+    int a = divider, b = divider + 1;
+    if (divider < 0 || divider > 1 || !columns->shown[a] || !columns->shown[b] || columns->inner <= 0)
+        return;
+    double sum = 0;
+    for (int i = 0; i < 3; ++i)
+        sum += columns->shown[i] ? files->weights[i] : 0;
+    double pair = files->weights[a] + files->weights[b], gap = columns->left[b] - columns->right[a];
+    double width = x - gap / 2 - columns->left[a];
+    double weight = width / columns->inner * sum, least = MIN_COLUMN_SHARE * sum;
+    if (weight < least)
+        weight = least;
+    if (weight > pair - least)
+        weight = pair - least;
+    if (pair - least < least)
+        return;
+    files->weights[a] = weight;
+    files->weights[b] = pair - weight;
+    desk_window_redraw(&files->window);
+}
+
+/* < and >: the current column narrower or wider, against the preview, or
+   against the parent when there's no preview. */
+static void resize_current(struct files *files, int direction)
+{
+    const struct columns *columns = &files->columns;
+    int step = (int)lround(columns->inner * RESIZE_STEP);
+    if (columns->divider[1] >= 0)
+        move_divider(files, 1, columns->divider[1] + direction * step);
+    else if (columns->divider[0] >= 0)
+        move_divider(files, 0, columns->divider[0] - direction * step);
+    save_state(files);
+}
+
+static void reset_columns(struct files *files)
+{
+    memcpy(files->weights, default_weights, sizeof files->weights);
+    save_state(files);
+    desk_window_redraw(&files->window);
+}
+
 /* Keys */
 
 /* Act on a key. Return whether it repeats while held. */
@@ -655,6 +799,15 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
             desk_window_redraw(&files->window);
         }
         return true;
+    case XKB_KEY_less:
+        resize_current(files, -1);
+        return true;
+    case XKB_KEY_greater:
+        resize_current(files, 1);
+        return true;
+    case XKB_KEY_equal:
+        reset_columns(files);
+        return false;
     case XKB_KEY_z:
         files->show_preview = !files->show_preview;
         desk_window_redraw(&files->window);
@@ -1554,6 +1707,13 @@ static void paint_status(struct files *files, DeskCanvas *canvas, const struct l
     }
     int right_x = x1 - layout->padding / 2 - desk_text_width(files->mono, right, strlen(right));
     desk_text_draw(files->mono, canvas, right_x, baseline, right, strlen(right), colors->foreground);
+    /* Root may change anything here; otherwise say when this place is protected. */
+    const char *mark = files->root ? "\xef\x80\xa3 root" : !files->writable ? "\xef\x80\xa3 read-only" : NULL;
+    if (mark) {
+        right_x -= layout->gap + desk_text_width(files->mono, mark, strlen(mark));
+        desk_text_draw(files->mono, canvas, right_x, baseline, mark, strlen(mark),
+                       files->root ? colors->urgent : colors->muted);
+    }
 
     struct entry *entry = cursor_entry(files);
     if (!entry)
@@ -1614,12 +1774,14 @@ static void paint(struct files *files, DeskCanvas *canvas)
     int cell = desk_char_width(files->mono, '0');
     int cells = canvas->width / (cell > 0 ? cell : 1);
     bool parent_shown = cells >= PARENT_CELLS, preview_shown = files->show_preview && cells >= PREVIEW_CELLS;
-    int weights[3] = {parent_shown ? 1 : 0, 2, preview_shown ? 3 : 0};
-    int total = weights[0] + weights[1] + weights[2], gaps = parent_shown + preview_shown;
+    double weights[3] = {parent_shown ? files->weights[0] : 0, files->weights[1],
+                         preview_shown ? files->weights[2] : 0};
+    double total = weights[0] + weights[1] + weights[2];
+    int gaps = parent_shown + preview_shown;
     int inner = canvas->width - 2 * layout.padding - gaps * layout.padding;
     int edges[3][2], x = layout.padding;
     for (int i = 0; i < 3; ++i) {
-        int width = inner * weights[i] / total;
+        int width = (int)lround(inner * weights[i] / total);
         edges[i][0] = x;
         edges[i][1] = x + width;
         if (weights[i])
@@ -1630,12 +1792,29 @@ static void paint(struct files *files, DeskCanvas *canvas)
     else
         edges[1][1] = canvas->width - layout.padding;
 
+    struct columns *columns = &files->columns;
+    *columns = (struct columns){
+        .shown = {parent_shown, true, preview_shown},
+        .divider = {parent_shown ? edges[0][1] + layout.padding / 2 : -1,
+                    preview_shown ? edges[1][1] + layout.padding / 2 : -1},
+        .inner = inner,
+    };
+    for (int i = 0; i < 3; ++i) {
+        columns->left[i] = edges[i][0];
+        columns->right[i] = edges[i][1];
+    }
+
     uint32_t rule = mix(colors->background, colors->muted, 70);
     int rule_width = scale >= 2 ? (int)scale : 1;
-    if (parent_shown)
-        desk_canvas_fill(canvas, edges[0][1] + layout.padding / 2, top, rule_width, bottom - top, rule);
-    if (preview_shown)
-        desk_canvas_fill(canvas, edges[1][1] + layout.padding / 2, top, rule_width, bottom - top, rule);
+    for (int i = 0; i < 2; ++i) {
+        if (columns->divider[i] < 0)
+            continue;
+        /* The divider under the pointer or being dragged stands out. */
+        bool active = files->drag == i || (files->drag < 0 && files->hover == i);
+        int width = active ? rule_width * 3 : rule_width;
+        desk_canvas_fill(canvas, columns->divider[i] - (width - rule_width) / 2, top, width, bottom - top,
+                         active ? colors->directory : rule);
+    }
     desk_canvas_fill(canvas, layout.padding, status_y - layout.padding / 4, canvas->width - 2 * layout.padding,
                      rule_width, rule);
 
@@ -1756,6 +1935,161 @@ static const struct wl_keyboard_listener keyboard_listener = {
     .repeat_info = keyboard_repeat_info,
 };
 
+/* Pointer: only the dividers for now; clicking entries comes in 0.5. */
+
+static void set_cursor(struct files *files)
+{
+    if (files->cursor_shape)
+        wp_cursor_shape_device_v1_set_shape(files->cursor_shape, files->pointer_serial,
+                                            files->drag >= 0 || files->hover >= 0
+                                                ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE
+                                                : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+}
+
+/* The pointer's x in buffer pixels. */
+static int pointer_buffer_x(const struct files *files)
+{
+    return (int)lround(files->pointer_x * desk_window_scale(&files->window));
+}
+
+static int divider_at(const struct files *files)
+{
+    int x = pointer_buffer_x(files), reach = (int)lround(DIVIDER_GRAB * desk_window_scale(&files->window));
+    for (int i = 0; i < 2; ++i) {
+        int divider = files->columns.divider[i];
+        if (divider >= 0 && abs(x - divider) <= reach)
+            return i;
+    }
+    return -1;
+}
+
+static void update_hover(struct files *files)
+{
+    int hover = divider_at(files);
+    if (hover != files->hover) {
+        files->hover = hover;
+        set_cursor(files);
+        desk_window_redraw(&files->window);
+    }
+}
+
+static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface,
+                          wl_fixed_t x, wl_fixed_t y)
+{
+    (void)pointer;
+    (void)surface;
+    struct files *files = data;
+    files->pointer_serial = serial;
+    files->pointer_x = wl_fixed_to_double(x);
+    files->pointer_y = wl_fixed_to_double(y);
+    files->hover = -2; /* Forces the cursor to be set. */
+    update_hover(files);
+}
+
+static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
+{
+    (void)pointer;
+    (void)serial;
+    (void)surface;
+    struct files *files = data;
+    if (files->drag >= 0)
+        save_state(files);
+    files->drag = -1;
+    files->hover = -1;
+    desk_window_redraw(&files->window);
+}
+
+static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y)
+{
+    (void)pointer;
+    (void)time;
+    struct files *files = data;
+    files->pointer_x = wl_fixed_to_double(x);
+    files->pointer_y = wl_fixed_to_double(y);
+    if (files->drag >= 0)
+        move_divider(files, files->drag, pointer_buffer_x(files));
+    else
+        update_hover(files);
+}
+
+static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
+                           uint32_t button, uint32_t state)
+{
+    (void)pointer;
+    (void)serial;
+    struct files *files = data;
+    if (button != BTN_LEFT)
+        return;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        int divider = divider_at(files);
+        if (divider < 0)
+            return;
+        if (divider == files->press_divider && time - files->press_time < DOUBLE_CLICK_MS) {
+            files->press_divider = -1;
+            reset_columns(files);
+            return;
+        }
+        files->press_divider = divider;
+        files->press_time = time;
+        files->drag = divider;
+    } else if (files->drag >= 0) {
+        files->drag = -1;
+        save_state(files);
+        update_hover(files);
+        desk_window_redraw(&files->window);
+    }
+}
+
+static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value)
+{
+    (void)data;
+    (void)pointer;
+    (void)time;
+    (void)axis;
+    (void)value;
+}
+
+static void pointer_frame(void *data, struct wl_pointer *pointer)
+{
+    (void)data;
+    (void)pointer;
+}
+
+static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source)
+{
+    (void)data;
+    (void)pointer;
+    (void)source;
+}
+
+static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis)
+{
+    (void)data;
+    (void)pointer;
+    (void)time;
+    (void)axis;
+}
+
+static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete)
+{
+    (void)data;
+    (void)pointer;
+    (void)axis;
+    (void)discrete;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_discrete,
+};
+
 /* Seat and registry */
 
 static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities)
@@ -1769,6 +2103,20 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
         desk_repeat_cancel(&files->repeat);
         wl_keyboard_release(files->wl_keyboard);
         files->wl_keyboard = NULL;
+    }
+    bool has_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
+    if (has_pointer && !files->pointer) {
+        files->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(files->pointer, &pointer_listener, files);
+        if (files->cursor_shape_manager)
+            files->cursor_shape = wp_cursor_shape_manager_v1_get_pointer(files->cursor_shape_manager, files->pointer);
+    } else if (!has_pointer && files->pointer) {
+        if (files->cursor_shape)
+            wp_cursor_shape_device_v1_destroy(files->cursor_shape);
+        files->cursor_shape = NULL;
+        wl_pointer_release(files->pointer);
+        files->pointer = NULL;
+        files->drag = files->hover = -1;
     }
 }
 
@@ -1790,7 +2138,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     struct files *files = data;
     if (desk_globals_bind(&files->globals, registry, name, interface, version))
         return;
-    if (strcmp(interface, wl_seat_interface.name) == 0 && !files->seat) {
+    if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
+        files->cursor_shape_manager = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+    } else if (strcmp(interface, wl_seat_interface.name) == 0 && !files->seat) {
         /* Version 5 adds wl_keyboard.release. */
         files->seat = wl_registry_bind(registry, name, &wl_seat_interface, version < 5 ? version : 5);
         wl_seat_add_listener(files->seat, &seat_listener, files);
@@ -1839,6 +2189,9 @@ static bool open_window(struct files *files)
         fprintf(stderr, "files: the compositor doesn't offer %s\n", missing);
         return false;
     }
+    /* The seat's capabilities may have arrived before the cursor shape manager. */
+    if (files->pointer && files->cursor_shape_manager && !files->cursor_shape)
+        files->cursor_shape = wp_cursor_shape_manager_v1_get_pointer(files->cursor_shape_manager, files->pointer);
     if (!desk_window_open(&files->window, &files->globals, "files", &window_listener, files)) {
         fprintf(stderr, "files: out of memory\n");
         return false;
@@ -1852,6 +2205,12 @@ static void close_window(struct files *files)
     desk_window_close(&files->window);
     if (files->wl_keyboard)
         wl_keyboard_release(files->wl_keyboard);
+    if (files->cursor_shape)
+        wp_cursor_shape_device_v1_destroy(files->cursor_shape);
+    if (files->pointer)
+        wl_pointer_release(files->pointer);
+    if (files->cursor_shape_manager)
+        wp_cursor_shape_manager_v1_destroy(files->cursor_shape_manager);
     if (files->seat)
         wl_seat_destroy(files->seat);
     desk_globals_finish(&files->globals);
@@ -1944,7 +2303,8 @@ static void usage(FILE *stream)
           "  -v, --version  Show the version\n"
           "\n"
           "Keys: j/k move, l enters, h goes up, g/G first/last, Ctrl+D/U half a page,\n"
-          "J/K scroll the preview, z hides it, . hidden files, ~ home, q quits.\n",
+          "J/K scroll the preview, z hides it, < and > resize the columns (= resets),\n"
+          ". hidden files, ~ home, q quits. Drag the dividers to resize with the mouse.\n",
           stream);
 }
 
@@ -2001,6 +2361,7 @@ int main(int argc, char **argv)
     struct files files = {
         .inotify = -1, .watch = -1, .parent_watch = -1, .refresh = -1, .done_fd = -1, .running = true,
         .show_preview = true, .parent_cursor = SIZE_MAX, .free_space = ULLONG_MAX,
+        .hover = -1, .drag = -1, .press_divider = -1, .root = geteuid() == 0,
         .palette_watch = {.fd = -1}, .repeat = {.fd = -1},
     };
     const char *home = getenv("HOME");
@@ -2010,10 +2371,16 @@ int main(int argc, char **argv)
         while (length > 1 && files.home[length - 1] == '/')
             files.home[--length] = 0;
     }
+    if (files.home)
+        files.home_real = realpath(files.home, NULL);
+    files.state_path = state_path();
+    load_state(&files);
     char *directory, *select = NULL;
     int status = start_at(optind < argc ? argv[optind] : files.home ? files.home : "/", &directory, &select);
     if (status) {
         free(files.home);
+        free(files.home_real);
+        free(files.state_path);
         return status;
     }
 
@@ -2056,5 +2423,7 @@ int main(int argc, char **argv)
     free(files.palette_path);
     free(files.path);
     free(files.home);
+    free(files.home_real);
+    free(files.state_path);
     return status;
 }

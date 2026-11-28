@@ -186,9 +186,22 @@ files [DIR]
 - The clipboard is shared with other applications as `text/uri-list` and `x-special/gnome-copied-files` through `wl_data_device`, so a copy in files can be pasted in a browser's upload dialog or another file manager. Pasting `text/uri-list` from elsewhere copies those files in.
 - Nothing is ever overwritten without asking, and a failed operation reports which file and why.
 
+### Protected places
+
+So a slip can't delete the system, files only changes things inside the user's own home directory. This is on top of the kernel's permissions: it also covers files the user happens to own elsewhere, such as in `/tmp` or on a mounted drive.
+
+- Every operation asks `may_modify` (in files.c since 0.2) of each directory whose entries it changes: the destination of a copy, move, paste or new file, and the source directory of a move, rename or trash. The directory is judged by where it really is (`realpath`), so a symlink inside home that points at `/etc` doesn't count as home.
+- Outside home the operation is refused before anything happens, with "/etc is protected: files only changes things inside your home directory". Copying *from* anywhere into home is fine.
+- Running files as root (`sudo files`, effective uid 0) lifts the rule. The status line then shows `root` in the urgent color, so it's never forgotten.
+- Recursive operations never follow symlinks and never cross onto another filesystem, like `rm --one-file-system`, so a bind mount or a link to `/` inside a directory being deleted can't take the system with it.
+- More writable places, such as a USB drive under `/run/media/$USER`, are an explicit opt-in in the config (0.5, `[safety] writable`). Home itself can't be removed from the list.
+- The status line already shows a lock and `read-only` outside home (0.2).
+
 ### Manual checks
 
-- Copying a large directory to a USB stick shows progress and can be cancelled midway, leaving no half-copied file.
+- Copying a large directory from a USB stick into home shows progress and can be cancelled midway, leaving no half-copied file.
+- Delete, Shift+Delete, paste and rename in `/etc` or `/tmp` are refused with a message naming the protected directory; run as root, they work and the status line says `root`.
+- Deleting a directory in home that contains a symlink to `/` removes the link, not what it points to.
 - Renaming, moving and trashing can each be undone with `u`.
 - A file trashed in files appears in another tool's trash view, and restoring it puts it back.
 
@@ -196,13 +209,14 @@ files [DIR]
 
 ## 0.5: Mouse, thumbnails, config and desktop integration
 
-- Mouse: click selects, double-click opens, the wheel scrolls the column under the pointer, click in another column moves there, right-click opens the "Open with" list. Drag and drop out of files (`text/uri-list`) and into it.
+- Mouse: the column dividers can be dragged since 0.2, and double-clicking one resets the widths. Click selects, double-click opens, the wheel scrolls the column under the pointer, click in another column moves there, right-click opens the "Open with" list. Drag and drop out of files (`text/uri-list`) and into it.
 - A grid view (`t`) of thumbnails for image directories. Thumbnails follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
 - Config through desk at `~/.config/files/files.conf`, written from a sample on first run:
 
   ```ini
   [layout]
-  # Column widths as parent : current : preview.
+  # Column widths as parent : current : preview, until they're dragged.
+  # Dragged widths are kept in ~/.local/state/files/state.
   columns = 1:2:3
   font_size = 11
 
@@ -215,6 +229,11 @@ files [DIR]
   enable = true
   # Largest file decoded for an image preview, in MiB.
   image_limit = 64
+
+  [safety]
+  # Places outside home that files may change, besides home itself.
+  # Root may change anything regardless.
+  writable =
 
   [open]
   # How terminal applications are started.

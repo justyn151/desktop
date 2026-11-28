@@ -31,7 +31,7 @@ Ground rules that apply to every phase:
 
 | What | Result |
 |---|---|
-| files 0.2 | Miller columns (parent, current, preview), previews of directories, images and text made on worker threads and cached, details for everything else, a status line; date and time on every entry. desk gained `desk_canvas_blit` |
+| files 0.2 | Miller columns (parent, current, preview), previews of directories, images and text made on worker threads and cached, details for everything else, a status line; date and time on every entry. Columns resize by dragging or `<`/`>`, kept between runs. Outside home is read-only unless root (the rule 0.4's operations follow). desk gained `desk_canvas_blit` |
 | files 0.1 | One directory: keyboard navigation, selection remembered per directory, live refresh, Nerd Font icons, palette colors. desk gained fonts with fallback (`-DDESK_FONT`), the keyboard and an xdg-shell window; view moved onto the last two. Key checks pending |
 | shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
 | view 0.1 | One image fitted to the window, sharp at any scale |
