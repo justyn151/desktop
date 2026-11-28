@@ -1086,6 +1086,64 @@ applygeom(Client *c)
 	wlr_scene_subsurface_tree_set_clip(&c->scene_surface->node, &clip);
 }
 
+static pid_t
+clientpid(Client *c)
+{
+	pid_t pid = 0;
+#ifdef XWAYLAND
+	if (client_is_x11(c))
+		return c->surface.xwayland->pid;
+#endif
+	if (c->type == XDGShell && c->surface.xdg->client)
+		wl_client_get_credentials(c->surface.xdg->client->client, &pid, NULL, NULL);
+	return pid;
+}
+
+/* The window of the app that started c's process moments ago, when it's
+   one of floatlaunchers: DESK_LAUNCHED_BY="name pid boottime-ms" in the
+   process's environment. */
+static Client *
+launcherof(Client *c)
+{
+	char path[64], name[64], buffer[65536], *at, *end;
+	long long launched, now;
+	long lpid;
+	pid_t pid = clientpid(c);
+	struct timespec ts;
+	size_t i, length;
+	FILE *f;
+	Client *w;
+
+	if (pid <= 0)
+		return NULL;
+	snprintf(path, sizeof(path), "/proc/%ld/environ", (long)pid);
+	if (!(f = fopen(path, "re")))
+		return NULL;
+	length = fread(buffer, 1, sizeof(buffer) - 1, f);
+	fclose(f);
+	buffer[length] = 0;
+	for (at = buffer, end = buffer + length; at < end; at += strlen(at) + 1) {
+		if (strncmp(at, "DESK_LAUNCHED_BY=", 17) != 0)
+			continue;
+		if (sscanf(at + 17, "%63s %ld %lld", name, &lpid, &launched) != 3)
+			return NULL;
+		clock_gettime(CLOCK_BOOTTIME, &ts);
+		now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+		if (now < launched || now - launched > floatlaunchms)
+			return NULL;
+		for (i = 0; i < LENGTH(floatlaunchers); i++) {
+			if (strcmp(name, floatlaunchers[i]) != 0)
+				continue;
+			wl_list_for_each(w, &clients, link) {
+				if (w != c && w->mon && !client_is_unmanaged(w) && clientpid(w) == lpid)
+					return w;
+			}
+		}
+		return NULL;
+	}
+	return NULL;
+}
+
 void
 applyrules(Client *c)
 {
@@ -1095,6 +1153,7 @@ applyrules(Client *c)
 	int i, wallpaper_browser;
 	const Rule *r;
 	Monitor *mon = selmon, *m;
+	Client *launcher;
 
 	appid = client_get_appid(c);
 	title = client_get_title(c);
@@ -1116,6 +1175,20 @@ applyrules(Client *c)
 	}
 
 	c->isfloating |= client_is_float_type(c);
+	if ((launcher = launcherof(c))) {
+		/* Over the window it was opened from, kept inside the screen. */
+		struct wlr_box *area;
+		mon = launcher->mon;
+		newtags = launcher->tags;
+		area = &mon->w;
+		c->isfloating = 1;
+		c->geom.width = MIN(c->geom.width, area->width);
+		c->geom.height = MIN(c->geom.height, area->height);
+		c->geom.x = launcher->geom.x + (launcher->geom.width - c->geom.width) / 2;
+		c->geom.y = launcher->geom.y + (launcher->geom.height - c->geom.height) / 2;
+		c->geom.x = MAX(area->x, MIN(c->geom.x, area->x + area->width - c->geom.width));
+		c->geom.y = MAX(area->y, MIN(c->geom.y, area->y + area->height - c->geom.height));
+	}
 	if (mon && c->type == XDGShell && c->isfloating && !c->isfullscreen
 			&& client_surface(c)->mapped && (wallpaper_browser || strcmp(appid, net_app_id) == 0)) {
 		if (wallpaper_browser) {

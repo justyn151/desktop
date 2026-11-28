@@ -2379,6 +2379,39 @@ static bool apps_split(const char *line, struct apps_argv *words)
     return ok;
 }
 
+static char spawn_mark[64];
+
+void desk_spawn_mark(const char *name)
+{
+    snprintf(spawn_mark, sizeof spawn_mark, "%s", name ? name : "");
+}
+
+/* environ for a child: without an inherited mark, with ours when set.
+   NULL when out of memory. */
+static char **spawn_environment(char *mark, size_t size)
+{
+    size_t count = 0;
+    while (environ[count])
+        ++count;
+    char **env = malloc((count + 2) * sizeof *env);
+    if (!env)
+        return NULL;
+    size_t used = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (strncmp(environ[i], "DESK_LAUNCHED_BY=", 17) != 0)
+            env[used++] = environ[i];
+    }
+    if (spawn_mark[0]) {
+        struct timespec now;
+        clock_gettime(CLOCK_BOOTTIME, &now);
+        snprintf(mark, size, "DESK_LAUNCHED_BY=%s %ld %lld", spawn_mark, (long)getpid(),
+                 (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000);
+        env[used++] = mark;
+    }
+    env[used] = NULL;
+    return env;
+}
+
 int desk_spawn(char *const argv[], const char *terminal, const char *directory)
 {
     struct apps_argv full = {0};
@@ -2406,8 +2439,13 @@ int desk_spawn(char *const argv[], const char *terminal, const char *directory)
             if (!error && directory)
                 error = posix_spawn_file_actions_addchdir_np(&actions, directory);
             pid_t child;
+            char mark[128];
+            char **env = error ? NULL : spawn_environment(mark, sizeof mark);
+            if (!error && !env)
+                error = ENOMEM;
             if (!error)
-                error = posix_spawnp(&child, full.argv[0], &actions, &attributes, full.argv, environ);
+                error = posix_spawnp(&child, full.argv[0], &actions, &attributes, full.argv, env);
+            free(env);
             posix_spawn_file_actions_destroy(&actions);
         }
         posix_spawnattr_destroy(&attributes);

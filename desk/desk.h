@@ -542,6 +542,10 @@ int desk_app_launch(const DeskApp *app, char *const paths[], size_t count, const
 /* Run argv (argv[0] looked up in PATH) the same way: detached, in directory,
    inside terminal when it isn't NULL. Return 0 or an errno value. */
 int desk_spawn(char *const argv[], const char *terminal, const char *directory);
+/* Mark what desk_spawn starts as launched by name: it gets
+   DESK_LAUNCHED_BY="name pid boottime-ms", which dwl reads to float a new
+   window over the launcher's when it maps soon after. */
+void desk_spawn_mark(const char *name);
 
 /* Make id the default for mime in $XDG_CONFIG_HOME/mimeapps.list (written
    atomically, other lines kept), and add it to the added associations.

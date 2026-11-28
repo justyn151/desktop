@@ -95,7 +95,8 @@ Double-click or Enter opens a file the way other Linux desktops do:
 1. Its type comes from shared-mime-info's database (`/usr/share/mime/globs2`) by name. Without shared-mime-info, files knows the common extensions itself. Failing both, it looks at the content: text, an ELF program, or unknown.
 2. The application is the default for that type in `mimeapps.list` (`~/.config/mimeapps.list` first, then the system's), then other associations listed there, then any application whose desktop entry (in `~/.local/share/applications` and `/usr/share/applications`) declares the type. Text types also get text/plain's applications.
 3. It starts in the file's directory, in its own session, so closing files doesn't close it. An application with `Terminal=true` (like mark) runs inside the terminal set in run's config (`[applications] terminal`), `deal -e` by default.
-4. Text that nothing claims opens in `editor` in that terminal. Anything else shows a line at the foot of the list saying nothing is set up to open it, until the next click or key.
+4. In dwl, what files opens floats over the files window, on its monitor and tags, instead of tiling beside or under it. files marks what it starts with `DESK_LAUNCHED_BY` (its name, its PID and the time), and dwl floats a new window whose process carries the mark, if it appears within 20 seconds and the files window is still there (`floatlaunchers` and `floatlaunchms` in dwl's `config.h`). An application that was already running and just opens another tab doesn't make a new window, so nothing changes for it.
+5. Text that nothing claims opens in `editor` in that terminal. Anything else shows a line at the foot of the list saying nothing is set up to open it, until the next click or key.
 
 Programs aren't run by double-clicking: an executable opens like any other file of its type. The right-click menu's Run runs it.
 

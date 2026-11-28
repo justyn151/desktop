@@ -23,6 +23,12 @@ static int log_level = WLR_ERROR;
 static const char net_app_id[] = "net";
 static const char wall_browser_app_id[] = "wall-browser";
 
+/* A window whose process was started by one of these (desk_spawn marks it
+   with DESK_LAUNCHED_BY) and maps within floatlaunchms floats, centered over
+   the launcher's window, on its monitor and tags. */
+static const char *const floatlaunchers[] = { "files" };
+static const int floatlaunchms = 20000;
+
 static const Rule rules[] = {
 	/* app_id             title       tags mask     isfloating   monitor */
 	{ "Gimp_EXAMPLE",     NULL,       0,            1,           -1 }, /* Start on currently visible tags floating, not tiled */

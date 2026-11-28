@@ -8318,6 +8318,7 @@ int main(int argc, char **argv)
     } else {
         files.trash_files = NULL;
     }
+    desk_spawn_mark("files"); /* What it opens floats over it, in dwl. */
     files.thumbnailer = thumbnailer_create(files.thumbs_dir); /* Without it, images show their icon. */
     files.worker = worker_create(); /* Without it, copying and deleting say so. */
     files.job_top = -1;
