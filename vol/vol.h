@@ -1,7 +1,7 @@
 #ifndef VOL_H
 #define VOL_H
 
-#define VOL_VERSION "0.1.0"
+#define VOL_VERSION "0.3.0"
 
 /* Exit statuses. */
 enum {
@@ -21,5 +21,11 @@ enum {
 #define VOL_TIMEOUT_MS 5000
 /* How long --follow waits before connecting again after losing the server. */
 #define VOL_RECONNECT_MS 1000
+
+/* The mixer: meters report this many peaks a second, the screen fades them on
+   this tick, and a lone Escape waits this long for the rest of a sequence. */
+#define MIXER_METER_RATE 25
+#define MIXER_TICK_MS 80
+#define MIXER_ESCAPE_MS 50
 
 #endif
