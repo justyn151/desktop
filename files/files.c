@@ -29,6 +29,7 @@
 
 #include "cursor-shape-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "viewporter-client-protocol.h"
 
 #define FONT_POINTS 11.0      /* UI text size, in points at 96 dpi. */
 #define ROW_SPACING 1.5       /* Row height as a multiple of the line height. */
@@ -4145,7 +4146,7 @@ static void cancel_job(struct files *files)
 
 /* The dialog */
 
-enum { DIALOG_DELETE, DIALOG_EMPTY_TRASH, DIALOG_CONFLICT };
+enum { DIALOG_DELETE, DIALOG_EMPTY_TRASH, DIALOG_CONFLICT, DIALOG_PROPERTIES };
 
 /* labels left to right; danger is drawn red (or -1); focus has Enter. */
 static void open_dialog(struct files *files, int action, char **paths, size_t count, const char *title,
@@ -4165,11 +4166,20 @@ static void open_dialog(struct files *files, int action, char **paths, size_t co
     desk_window_redraw(&files->window);
 }
 
+static void counter_stop(struct files *files);
+
 static void close_dialog(struct files *files)
 {
     struct dialog *dialog = &files->dialog;
+    if (dialog->action == DIALOG_PROPERTIES)
+        counter_stop(files);
     free_paths(dialog->paths, dialog->count);
     *dialog = (struct dialog){0};
+    /* A job may have a question that waited for this one. */
+    if (files->worker) {
+        uint64_t one = 1;
+        (void)!write(files->worker->event, &one, sizeof one);
+    }
     desk_window_redraw(&files->window);
 }
 
@@ -4294,6 +4304,310 @@ static void dialog_choose(struct files *files, int button)
         start_job(files, JOB_DELETE, items, used, NULL);
     }
     free_paths(paths, count);
+}
+
+/* Properties
+
+   Alt+Enter, or Properties in the menu: what the selection is, over the
+   window like the other dialogs. A folder's size, and how many files and
+   folders are in it, are counted on a thread while it's open; the
+   numbers grow as they come. */
+
+struct counter {
+    pthread_t thread;
+    int event;                      /* eventfd: the numbers moved, or it's done. */
+    char **paths;
+    size_t count;
+    _Atomic long long bytes;
+    _Atomic long files, folders;
+    _Atomic bool done, cancel;
+    uint64_t signalled_ms;
+};
+
+static void count_tree(struct counter *counter, int directory, const char *name, dev_t device, bool top)
+{
+    struct stat info;
+    if (atomic_load(&counter->cancel) || fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0)
+        return;
+    if (!S_ISDIR(info.st_mode)) {
+        atomic_fetch_add(&counter->files, 1);
+        if (S_ISREG(info.st_mode))
+            atomic_fetch_add(&counter->bytes, (long long)info.st_size);
+    } else {
+        if (!top)
+            atomic_fetch_add(&counter->folders, 1);
+        int fd = info.st_dev == device ? openat(directory, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
+        DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+        if (!dir && fd >= 0)
+            close(fd);
+        struct dirent *item;
+        while (dir && (item = readdir(dir))) {
+            if (strcmp(item->d_name, ".") != 0 && strcmp(item->d_name, "..") != 0)
+                count_tree(counter, dirfd(dir), item->d_name, device, false);
+        }
+        if (dir)
+            closedir(dir);
+    }
+    uint64_t now = now_ms();
+    if (now - counter->signalled_ms >= 150) {
+        counter->signalled_ms = now;
+        uint64_t one = 1;
+        (void)!write(counter->event, &one, sizeof one);
+    }
+}
+
+static void *counter_main(void *data)
+{
+    struct counter *counter = data;
+    for (size_t i = 0; i < counter->count && !atomic_load(&counter->cancel); ++i) {
+        char *parent = parent_path(counter->paths[i]);
+        int fd = parent ? open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+        struct stat info;
+        if (fd >= 0 && fstatat(fd, base_name(counter->paths[i]), &info, AT_SYMLINK_NOFOLLOW) == 0) {
+            /* A selected folder counts as one; what's in it is counted too. */
+            if (S_ISDIR(info.st_mode) && counter->count > 1)
+                atomic_fetch_add(&counter->folders, 1);
+            count_tree(counter, fd, base_name(counter->paths[i]), info.st_dev, true);
+        }
+        if (fd >= 0)
+            close(fd);
+        free(parent);
+    }
+    atomic_store(&counter->done, true);
+    uint64_t one = 1;
+    (void)!write(counter->event, &one, sizeof one);
+    return NULL;
+}
+
+static void counter_stop(struct files *files)
+{
+    struct counter *counter = files->counter;
+    if (!counter)
+        return;
+    atomic_store(&counter->cancel, true);
+    pthread_join(counter->thread, NULL);
+    close(counter->event);
+    free_paths(counter->paths, counter->count);
+    free(counter);
+    files->counter = NULL;
+}
+
+static void counter_start(struct files *files, char *const *paths, size_t count)
+{
+    counter_stop(files);
+    struct counter *counter = calloc(1, sizeof *counter);
+    if (!counter)
+        return;
+    counter->paths = calloc(count, sizeof *counter->paths);
+    for (size_t i = 0; counter->paths && i < count; ++i) {
+        if ((counter->paths[counter->count] = strdup(paths[i])))
+            ++counter->count;
+    }
+    counter->event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (!counter->paths || counter->event < 0 || pthread_create(&counter->thread, NULL, counter_main, counter) != 0) {
+        if (counter->event >= 0)
+            close(counter->event);
+        free_paths(counter->paths, counter->count);
+        free(counter);
+        return;
+    }
+    files->counter = counter;
+}
+
+static void counter_event(struct files *files)
+{
+    uint64_t count;
+    (void)!read(files->counter->event, &count, sizeof count);
+    desk_window_redraw(&files->window);
+}
+
+static void format_size(off_t size, char *out, size_t length);
+
+/* "1.2 MB (1,234,567 bytes)". */
+static void format_bytes(long long bytes, char *out, size_t length)
+{
+    char size[32], digits[32], grouped[48];
+    format_size((off_t)bytes, size, sizeof size);
+    snprintf(digits, sizeof digits, "%lld", bytes);
+    size_t n = strlen(digits), used = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (i && (n - i) % 3 == 0)
+            grouped[used++] = ',';
+        grouped[used++] = digits[i];
+    }
+    grouped[used] = 0;
+    if (bytes < 1000)
+        snprintf(out, length, "%s", grouped[0] ? grouped : "0");
+    else
+        snprintf(out, length, "%s (%s bytes)", size, grouped);
+    if (bytes < 1000)
+        snprintf(out + strlen(out), length - strlen(out), bytes == 1 ? " byte" : " bytes");
+}
+
+static void format_full_date(const struct timespec *when, char *out, size_t length)
+{
+    struct tm local;
+    time_t seconds = when->tv_sec;
+    if (!localtime_r(&seconds, &local) || !strftime(out, length, "%A, %d %B %Y, %H:%M:%S", &local))
+        snprintf(out, length, "?");
+}
+
+/* "rwxr-x--- (750)". */
+static void format_mode(mode_t mode, char *out, size_t length)
+{
+    char bits[10];
+    const char *letters = "rwxrwxrwx";
+    for (int i = 0; i < 9; ++i)
+        bits[i] = mode & (0400 >> i) ? letters[i] : '-';
+    if (mode & S_ISUID)
+        bits[2] = bits[2] == 'x' ? 's' : 'S';
+    if (mode & S_ISGID)
+        bits[5] = bits[5] == 'x' ? 's' : 'S';
+    if (mode & S_ISVTX)
+        bits[8] = bits[8] == 'x' ? 't' : 'T';
+    snprintf(out, length, "%.9s (%o)", bits, (unsigned)(mode & 07777));
+}
+
+#define PROPERTY_ROWS 12
+
+/* The dialog's rows, label and value, for what it was opened on. */
+static size_t property_rows(struct files *files, char labels[][24], char values[][PATH_MAX])
+{
+    const struct dialog *dialog = &files->dialog;
+    const struct counter *counter = files->counter;
+    size_t rows = 0;
+#define ROW(label, ...)                                                                                                \
+    do {                                                                                                               \
+        if (rows < PROPERTY_ROWS) {                                                                                    \
+            snprintf(labels[rows], 24, "%s", label);                                                                   \
+            snprintf(values[rows], PATH_MAX, __VA_ARGS__);                                                             \
+            ++rows;                                                                                                    \
+        }                                                                                                              \
+    } while (0)
+    char text[PATH_MAX], more[160];
+    bool counting = counter && !atomic_load(&counter->done);
+    long long bytes = counter ? atomic_load(&counter->bytes) : 0;
+    long nfiles = counter ? atomic_load(&counter->files) : 0, nfolders = counter ? atomic_load(&counter->folders) : 0;
+    snprintf(more, sizeof more, "%ld %s, %ld %s%s", nfiles, nfiles == 1 ? "file" : "files", nfolders,
+             nfolders == 1 ? "folder" : "folders", counting ? " — counting…" : "");
+
+    if (dialog->count != 1) {
+        size_t folders = 0;
+        bool same_place = true;
+        char *first = dialog->count ? parent_path(dialog->paths[0]) : NULL;
+        for (size_t i = 0; i < dialog->count; ++i) {
+            struct stat info;
+            folders += lstat(dialog->paths[i], &info) == 0 && S_ISDIR(info.st_mode);
+            char *parent = parent_path(dialog->paths[i]);
+            same_place = same_place && parent && first && strcmp(parent, first) == 0;
+            free(parent);
+        }
+        ROW("Selected", "%zu items: %zu %s, %zu %s", dialog->count, folders, folders == 1 ? "folder" : "folders",
+            dialog->count - folders, dialog->count - folders == 1 ? "other" : "others");
+        if (same_place && first) {
+            display_path(files, first, text, sizeof text);
+            ROW("Location", "%s", text);
+        }
+        free(first);
+        format_bytes(bytes, text, sizeof text);
+        ROW("Size", "%s", text);
+        ROW("Contents", "%s", more);
+        return rows;
+    }
+
+    const char *path = dialog->paths[0];
+    char *parent = parent_path(path);
+    int fd = parent ? open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+    struct entry entry = {.name = (char *)base_name(path), .total = TOTAL_NONE};
+    struct stat info;
+    struct statx extra;
+    bool have = fd >= 0 && fstatat(fd, entry.name, &info, AT_SYMLINK_NOFOLLOW) == 0;
+    bool born = fd >= 0 && statx(fd, entry.name, AT_SYMLINK_NOFOLLOW, STATX_BTIME, &extra) == 0 &&
+                (extra.stx_mask & STATX_BTIME);
+    if (have)
+        entry_stat(fd, &entry, DT_UNKNOWN);
+    if (!have) {
+        ROW("Error", "%s", strerror(errno));
+    } else {
+        char type[64];
+        entry_type(&entry, type, sizeof type);
+        ROW("Type", "%s%s", type, entry.link && !entry.directory && !entry.broken ? " (a link)" : "");
+        if (parent && strcmp(path, "/") != 0) {
+            display_path(files, parent, text, sizeof text);
+            ROW("Location", "%s", text);
+        }
+        if (entry.link) {
+            ssize_t length = readlinkat(fd, entry.name, text, sizeof text - 1);
+            text[length > 0 ? length : 0] = 0;
+            ROW("Link to", "%.4000s%s", text, entry.broken ? " (missing)" : "");
+        }
+        if (entry.directory && !entry.link) {
+            format_bytes(bytes, text, sizeof text);
+            ROW("Size", "%s", text);
+            ROW("Contents", "%s", more);
+        } else if (!entry.broken) {
+            format_bytes((long long)entry.size, text, sizeof text);
+            ROW("Size", "%s", text);
+        }
+        format_full_date(&info.st_mtim, text, sizeof text);
+        ROW("Modified", "%s", text);
+        format_full_date(&info.st_atim, text, sizeof text);
+        ROW("Accessed", "%s", text);
+        if (born) {
+            struct timespec birth = {.tv_sec = extra.stx_btime.tv_sec, .tv_nsec = extra.stx_btime.tv_nsec};
+            format_full_date(&birth, text, sizeof text);
+            ROW("Created", "%s", text);
+        }
+        struct passwd *user = getpwuid(info.st_uid);
+        struct group *group = getgrgid(info.st_gid);
+        char owner[64], group_name[64];
+        if (user)
+            snprintf(owner, sizeof owner, "%s", user->pw_name);
+        else
+            snprintf(owner, sizeof owner, "%ld", (long)info.st_uid);
+        if (group)
+            snprintf(group_name, sizeof group_name, "%s", group->gr_name);
+        else
+            snprintf(group_name, sizeof group_name, "%ld", (long)info.st_gid);
+        ROW("Owner", "%s, group %s", owner, group_name);
+        format_mode(entry.link ? entry.target_mode : info.st_mode, text, sizeof text);
+        ROW("Permissions", "%.100s%s", text,
+            access(path, W_OK) == 0 ? "" : may_modify(files, parent ? parent : path) ? " — read-only for you" : "");
+    }
+#undef ROW
+    if (fd >= 0)
+        close(fd);
+    free(parent);
+    return rows;
+}
+
+/* Alt+Enter: properties of the selection, or of path when given. */
+static void show_properties(struct files *files, const char *path)
+{
+    size_t count = 0;
+    char **paths = NULL;
+    if (path) {
+        paths = calloc(1, sizeof *paths);
+        if (paths && (paths[0] = strdup(path)))
+            count = 1;
+    } else {
+        paths = selected_paths(files, &count);
+    }
+    if (!count) {
+        free(paths);
+        return;
+    }
+    char title[300];
+    if (count == 1)
+        snprintf(title, sizeof title, "%s", base_name(paths[0])[0] ? base_name(paths[0]) : "/");
+    else
+        snprintf(title, sizeof title, "%zu items", count);
+    struct stat info;
+    bool counts = count > 1 || (lstat(paths[0], &info) == 0 && S_ISDIR(info.st_mode));
+    static const char *const labels[] = {"Close"};
+    open_dialog(files, DIALOG_PROPERTIES, paths, count, title, "", labels, 1, -1, 0);
+    if (counts)
+        counter_start(files, paths, count);
 }
 
 /* What a job did, once it's done: a line about it, and undo. */
@@ -4617,6 +4931,13 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         case XKB_KEY_Right: go_forward(files); return false;
         case XKB_KEY_Up: go_up(files); return false;
         case XKB_KEY_Home: go_home(files); return false;
+        case XKB_KEY_Return:
+        case XKB_KEY_KP_Enter:
+            if (selected_count(files))
+                show_properties(files, NULL);
+            else
+                show_properties(files, files->path);
+            return false;
         default: return false;
         }
     }
@@ -6057,8 +6378,16 @@ static void paint_dialog(struct files *files, DeskCanvas *canvas)
     int width = (int)lround(460 * scale);
     if (width > canvas->width - 2 * pad)
         width = canvas->width - 2 * pad;
+    static char labels[PROPERTY_ROWS][24], values[PROPERTY_ROWS][PATH_MAX];
+    size_t rows = dialog->action == DIALOG_PROPERTIES ? property_rows(files, labels, values) : 0;
+    if (rows)
+        width = (int)lround(560 * scale) < canvas->width - 2 * pad ? (int)lround(560 * scale) : canvas->width - 2 * pad;
     int height = pad + 2 * row + pad + (dialog->has_check ? row + pad / 2 : 0) + row + pad;
+    if (rows)
+        height += (int)rows * row - row + pad / 2;
     int left = (canvas->width - width) / 2, top = (canvas->height - height) / 3;
+    if (top + height > canvas->height)
+        top = canvas->height - height > 0 ? canvas->height - height : 0;
     uint32_t background = mix(colors->background, colors->muted, 25);
     desk_canvas_fill(canvas, left, top, width, height, background);
     outline(canvas, left, top, width, height, line, mix(colors->background, colors->muted, 110));
@@ -6067,6 +6396,21 @@ static void paint_dialog(struct files *files, DeskCanvas *canvas)
     draw_clipped(ui.font, canvas, left + pad, left + width - pad, top + pad + row + ui.baseline, dialog->message,
                  colors->muted);
     int y = top + pad + 2 * row + pad;
+    if (rows) {
+        /* Label and value pairs, under the name. */
+        y = top + pad + row + pad / 2;
+        int label_width = 0;
+        for (size_t i = 0; i < rows; ++i) {
+            int w = desk_text_width(ui.font, labels[i], strlen(labels[i]));
+            label_width = w > label_width ? w : label_width;
+        }
+        for (size_t i = 0; i < rows; ++i, y += row) {
+            draw_clipped(ui.font, canvas, left + pad, left + pad + label_width, y + ui.baseline, labels[i], colors->muted);
+            draw_clipped(ui.font, canvas, left + 2 * pad + label_width, left + width - pad, y + ui.baseline, values[i],
+                         colors->foreground);
+        }
+        y += pad;
+    }
     dialog->check_top = dialog->check_bottom = -1;
     if (dialog->has_check) {
         int box = row / 2, box_top = y + (row - box) / 2;
@@ -6795,11 +7139,68 @@ static void drag_source_send(void *data, struct wl_data_source *source, const ch
     free(text);
 }
 
+static void drag_icon_free(struct files *files)
+{
+    if (files->drag_viewport)
+        wp_viewport_destroy(files->drag_viewport);
+    files->drag_viewport = NULL;
+    if (files->drag_icon)
+        wl_surface_destroy(files->drag_icon);
+    files->drag_icon = NULL;
+    desk_buffer_pool_finish(&files->drag_buffers);
+}
+
+/* The badge under the pointer while dragging: the icon and the name, or
+   how many, a little below and right of the pointer. */
+static void paint_drag_icon(struct files *files, const struct entry *first, size_t count)
+{
+    double scale = desk_window_scale(&files->window);
+    struct layout ui = make_layout(files->font, files->italic, files->mono, scale);
+    const struct colors *colors = &files->colors;
+    int pad = ui.padding, line = scale >= 2 ? (int)scale : 1;
+    int offset = (int)lround(14 * scale);
+    char text[300];
+    if (count == 1)
+        snprintf(text, sizeof text, "%s", first->name);
+    else
+        snprintf(text, sizeof text, "%zu items", count);
+    int text_width = desk_text_width(ui.font, text, strlen(text));
+    int most = (int)lround(280 * scale);
+    int badge = pad / 2 + ui.icon_width + text_width + pad;
+    if (badge > most)
+        badge = most;
+    int badge_height = ui.row_height + pad / 2;
+    int width = offset + badge, height = offset + badge_height;
+    DeskBuffer *buffer = desk_buffer_get(&files->drag_buffers, files->globals.shm, width, height, WL_SHM_FORMAT_ARGB8888);
+    if (!buffer)
+        return;
+    memset(buffer->pixels, 0, (size_t)width * height * 4);
+    DeskCanvas canvas = desk_canvas(buffer->pixels, width, height);
+    uint32_t background = (0xe8u << 24) | (mix(colors->background, colors->muted, 40) & 0xffffff);
+    desk_canvas_fill(&canvas, offset, offset, badge, badge_height, background);
+    outline(&canvas, offset, offset, badge, badge_height, line, colors->directory);
+    int baseline = offset + pad / 4 + ui.baseline, x = offset + pad / 2;
+    draw_icon(ui.font, &canvas, x, x + ui.icon_width, baseline, count == 1 ? entry_icon(first) : ICON_FOLDER,
+              colors->directory);
+    x += ui.icon_width;
+    draw_clipped(ui.font, &canvas, x, offset + badge - pad / 2, baseline, text, colors->foreground);
+    if (files->drag_viewport) {
+        wp_viewport_set_destination(files->drag_viewport, (int)lround(width / scale) > 0 ? (int)lround(width / scale) : 1,
+                                    (int)lround(height / scale) > 0 ? (int)lround(height / scale) : 1);
+    } else {
+        wl_surface_set_buffer_scale(files->drag_icon, scale >= 2 ? (int)scale : 1);
+    }
+    wl_surface_attach(files->drag_icon, buffer->buffer, 0, 0);
+    wl_surface_damage_buffer(files->drag_icon, 0, 0, width, height);
+    wl_surface_commit(files->drag_icon);
+}
+
 static void drag_end(struct files *files, struct wl_data_source *source)
 {
     if (files->drag_source != source)
         return;
     wl_data_source_destroy(source);
+    drag_icon_free(files);
     files->drag_source = NULL;
     free_paths(files->drag_paths, files->drag_count);
     files->drag_paths = NULL;
@@ -6868,7 +7269,27 @@ static void start_drag(struct files *files)
     files->drag_source = source;
     files->drag_paths = paths;
     files->drag_count = count;
-    wl_data_device_start_drag(files->data_device, source, files->window.surface, NULL, files->input_serial);
+    drag_icon_free(files);
+    if (files->globals.compositor && files->globals.shm) {
+        files->drag_icon = wl_compositor_create_surface(files->globals.compositor);
+        if (files->globals.viewporter)
+            files->drag_viewport = wp_viewporter_get_viewport(files->globals.viewporter, files->drag_icon);
+    }
+    wl_data_device_start_drag(files->data_device, source, files->window.surface, files->drag_icon,
+                              files->input_serial);
+    if (files->drag_icon) {
+        const struct entry *first = cursor_entry(files);
+        if (!first || !first->selected) {
+            for (size_t i = 0; i < files->listing.shown_count; ++i) {
+                if (shown_entry(files, i)->selected) {
+                    first = shown_entry(files, i);
+                    break;
+                }
+            }
+        }
+        if (first)
+            paint_drag_icon(files, first, count);
+    }
     desk_window_redraw(&files->window);
 }
 
@@ -7101,6 +7522,7 @@ enum {
     MENU_CUT,
     MENU_COPY,
     MENU_PASTE,           /* Into the directory the menu is for. */
+    MENU_PROPERTIES,
     MENU_NOTHING,         /* A disabled line such as "No applications". */
 };
 
@@ -7424,6 +7846,7 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
         menu_separator(menu);
         menu_add(menu, MENU_REFRESH, 0, "Refresh");
         menu_add(menu, MENU_COPY_PATH, 0, "Copy path");
+        menu_add(menu, MENU_PROPERTIES, 0, "Properties");
     } else {
         menu_add(menu, MENU_OPEN, 0, "Open");
         if (directory) {
@@ -7466,6 +7889,8 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
         }
         menu_separator(menu);
         menu_add(menu, MENU_COPY_PATH, 0, "Copy path");
+        snprintf(menu_add(menu, MENU_PROPERTIES, 0, "Properties")->shortcut, sizeof menu->items[0].shortcut,
+                 context == CONTEXT_ENTRY ? "Alt+Enter" : "");
         if (directory) {
             bool bookmarked = is_bookmarked(files, path);
             if (!bookmarked)
@@ -7554,6 +7979,9 @@ static void menu_choose(struct files *files, struct menu *menu, int index, bool 
         break;
     case MENU_COPY_PATH:
         copy_text(files, path);
+        break;
+    case MENU_PROPERTIES:
+        show_properties(files, files->menu_context == CONTEXT_ENTRY ? NULL : path);
         break;
     case MENU_ADD_BOOKMARK:
     case MENU_REMOVE_BOOKMARK: {
@@ -8414,6 +8842,7 @@ static void close_window(struct files *files)
     drop_clear(files);
     if (files->drag_source)
         wl_data_source_destroy(files->drag_source);
+    drag_icon_free(files);
     free_paths(files->drag_paths, files->drag_count);
     free_suggestions(files);
     desk_text_free(&files->search.text);
@@ -8460,7 +8889,7 @@ static bool run(struct files *files)
             wl_display_cancel_read(display);
             return false;
         }
-        struct pollfd fds[9] = {
+        struct pollfd fds[10] = {
             {.fd = wl_display_get_fd(display), .events = POLLIN},
             {.fd = files->repeat.fd, .events = POLLIN},
             {.fd = files->inotify, .events = POLLIN},
@@ -8470,8 +8899,9 @@ static bool run(struct files *files)
             {.fd = files->sizer ? files->sizer->event : -1, .events = POLLIN},
             {.fd = files->thumbnailer ? files->thumbnailer->event : -1, .events = POLLIN},
             {.fd = files->worker ? files->worker->event : -1, .events = POLLIN},
+            {.fd = files->counter ? files->counter->event : -1, .events = POLLIN},
         };
-        if (poll(fds, 9, -1) < 0) {
+        if (poll(fds, 10, -1) < 0) {
             wl_display_cancel_read(display);
             if (errno == EINTR)
                 continue;
@@ -8514,6 +8944,8 @@ static bool run(struct files *files)
             thumbs_arrived(files);
         if (files->worker && fds[8].revents & POLLIN)
             jobs_event(files);
+        if (files->counter && fds[9].revents & POLLIN)
+            counter_event(files);
         if (files->mounts >= 0 && fds[5].revents & (POLLPRI | POLLERR)) {
             build_places(files); /* A drive came or went. */
             desk_window_redraw(&files->window);
@@ -8680,6 +9112,7 @@ int main(int argc, char **argv)
     thumbs_clear(&files);
     thumbnailer_destroy(files.thumbnailer);
     worker_destroy(files.worker);
+    counter_stop(&files);
     free(files.thumbs_dir);
     free(files.trash_dir);
     free(files.trash_files);

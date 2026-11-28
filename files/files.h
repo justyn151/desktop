@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.4.4"
+#define FILES_VERSION "0.4.5"
 
 /* Exit statuses. */
 enum {
@@ -193,6 +193,7 @@ struct undo {
     size_t count;
 };
 struct worker;
+struct counter;
 
 /* An image's thumbnail, as made for a box of size buffer pixels. Kept in
    a hash by path while the directory is shown. */
@@ -306,6 +307,10 @@ struct files {
     char *offer_files_type;   /* The files type the clipboard's offer has, or NULL. */
     /* Dragging files out: what's dragged, while the compositor carries it. */
     struct wl_data_source *drag_source;
+    struct wl_surface *drag_icon;         /* The badge under the pointer. */
+    struct wp_viewport *drag_viewport;
+    DeskBufferPool drag_buffers;
+    struct counter *counter;  /* Counting for Properties. */
     char **drag_paths;
     size_t drag_count;
     /* Something dragged over the window: where it would go. */

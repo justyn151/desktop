@@ -50,6 +50,7 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Ctrl+Shift+N | New folder |
 | Ctrl+C, Ctrl+X | Copy or cut the selection (for files and other file managers) |
 | Ctrl+V | Paste here: copies, or moves what was cut |
+| Alt+Enter | Properties of the selection (of the folder shown when nothing is selected) |
 | Ctrl+Z | Undo the last rename, new folder or file, move to the trash, copy or move |
 | Enter | Open: into a directory, or a file with its application (see Opening files) |
 | Backspace, Alt+Up | Up to the parent, with the directory you came from selected |
@@ -127,7 +128,8 @@ It's a popup the compositor places, so it flips or slides to stay on screen; a c
 - **Delete permanently** (Shift+Delete) asks first, over the window: "Delete report.pdf permanently?" with Cancel, which has the focus, and Delete. Tab or the arrows move between them, Enter picks, Escape cancels. Deleting never follows a symlink (a link to `/` inside a folder removes the link, not `/`) and never goes into another mounted file system, like `rm -r --one-file-system`. It runs in the background with the progress bar, like copying.
 - **Cut, Copy and Paste** (Ctrl+X, Ctrl+C, Ctrl+V) put the selection on the clipboard as files, in the forms other file managers use (`x-special/gnome-copied-files`, `text/uri-list`) and as their paths for text, and paste files copied or cut in other applications too. Paste copies into the folder shown, or the folder right-clicked; what was cut is moved, once.
 - **Copying, moving and deleting** run in the background, one job at a time, with a bar along the window's foot: what's being done, how many, the bytes, and a × that cancels. A copy is written to a hidden file beside its place and renamed into it when whole, so cancelling never leaves half a file. Modes and times are kept and symlinks are copied as links. A move on the same drive is a rename; across drives it's a copy, then the original goes once all of it arrived. Nothing goes inside itself, and copying never follows a link or goes into another mounted drive.
-- **Drag and drop** carries the selection out as files (the same types as Copy), so it drops into other file managers, browsers' upload boxes and the like. Over the window, the folder or place a drop would go into is lit, or the whole list for the folder shown; nothing lights where files may not change things, on the folder being dragged, or where the files already are. A drop goes through the same jobs as paste, and moves on the same drive unless Ctrl is held. There's no picture under the pointer yet.
+- **Drag and drop** carries the selection out as files (the same types as Copy), so it drops into other file managers, browsers' upload boxes and the like. Over the window, the folder or place a drop would go into is lit, or the whole list for the folder shown; nothing lights where files may not change things, on the folder being dragged, or where the files already are. A drop goes through the same jobs as paste, and moves on the same drive unless Ctrl is held. A badge follows the pointer while dragging: the file's icon and name, or how many.
+- **Properties** (Alt+Enter, or the last item of the right-click menu) shows over the window: type, location, link target, size, modified, accessed and created times, owner and group, and permissions (`rw-r--r-- (644)`). For a folder, or several items, the size and how many files and folders are inside are counted in the background while it's open, without crossing into other drives. Escape, Enter or Close closes it. It only shows; changing permissions isn't there yet.
 - **A name that's taken** stops the job with a question: Skip, Keep both (the copy becomes `notes (2).txt`) or Replace, or Merge for two folders, which goes through what's inside asking again. "Do this for all conflicts" answers the rest the same; Escape cancels the job. Pasting where the things already are makes copies beside them.
 - **Undo** (Ctrl+Z) reverses the last rename, new folder or file (only while it's still empty), move to the trash, copy (the copies go to the trash) or move (back where they were). One step; deleting permanently and merging can't be undone.
 
@@ -250,6 +252,8 @@ files will only change things inside your home directory (and your trash, wherev
 - [ ] Files copied in files paste in another file manager, and the other way round.
 - [ ] Dragging a file onto a folder moves it; onto the Trash trashes it; onto File system is refused; into another app (a browser upload) gives it the file.
 - [ ] In dwl, an image opened from files floats over files instead of under it.
+- [ ] Dragging shows a badge with the name (or "3 items") under the pointer.
+- [ ] Alt+Enter on a big folder counts up its size and contents; closing it stops the counting.
 - [ ] Narrowing the window hides the sidebar.
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
 - [ ] Images show thumbnails in the icon view, quickly on a second visit; a photo taken sideways shows upright; editing an image updates its thumbnail.
