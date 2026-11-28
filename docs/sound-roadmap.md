@@ -219,6 +219,8 @@ The checklists in a fresh session, a week of use, the agent's input fuzzed (D-Bu
 
 - **blue 0.1:** `blue/blue.c` and `blue.h` on desk Layer 0 and sd-bus, built like net (the same rows, colors, line cache and key handling), about 1,300 lines. Pulled forward from 0.3: the config file and the live wallpaper palette, since desk made them cheap. Matches are installed synchronously before `GetManagedObjects`, so no signal is missed; `NameOwnerChanged` for `org.bluez` starts over when bluetoothd restarts. Devices are allocated one by one so a pending Connect keeps its pointer, and freeing a device drops its call. "Known" means paired, bonded, trusted or connected. Power, the empty list and live changes are checked; connecting real headphones waits until you pair yours.
 
+- **blue 0.2:** searching, the pairing agent (`/org/blue/agent`, KeyboardDisplay, made the default agent), trust, rename, remove and visibility, as planned. The list became items (known devices, a Nearby heading, nearby devices) so headings can't be selected. Agent questions keep BlueZ's call (`sd_bus_message_ref`, method handler returns 1) until a key answers it; Display calls are answered at once and stay on screen until Pair returns. Search has no discovery filter for now: unnamed devices are hidden in the list instead, with a count. Checked: searching, rename and reset, remove's question, and that the agent refuses callers other than BlueZ. While testing, a test script's keys made the adapter visible and renamed the nearby TV for a moment; both were put back. Pairing a real device waits for yours.
+
 ## Bluetooth notes
 
 (Written during Stage 0.1.)
