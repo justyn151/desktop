@@ -21,13 +21,13 @@ Plan for Bluetooth and volume control, from the terminal stopgaps to two apps: `
 - **`blue` is a TUI over BlueZ's D-Bus API with sd-bus**, the same shape as `net` (a floating deal window opened from bar). That means no new library. It's separate from net and not a tab inside it, because net is NetworkManager only and already 4,600 lines.
 - **`vol` talks to PipeWire through libpulse, not libpipewire.** Setting a hardware device's volume correctly means changing its active Route, which WirePlumber's mixer API does and raw libpipewire leaves to the client. pipewire-pulse already does that work behind a small, stable, documented API with event subscription. libpulse is one library and it's already installed. `pa_mainloop` gets its own fd so it fits into the app's poll loop. Revisit if libpulse support gets dropped.
 - **The bar stays free of libpulse.** bar's volume module runs a command and shows the last line it printed. During the stopgap that command is a shell loop over `pactl subscribe`; from `vol` 0.1 on it's `vol --follow`. bar's Bluetooth module talks to BlueZ over sd-bus directly, the way the network module talks to NetworkManager.
-- **The volume popup (OSD) lives in `vol`**, as a layer-shell surface on desk. Brightness keys (Phase 6) reuse it later, so the popup code goes into desk once brightness needs it.
+- **The volume popup (OSD) belongs to `notify`, not `vol`** (decided 2026-11-28). `notify` draws popups anyway, and brightness keys (Phase 6) want the same thing, so one daemon draws all of them. vol 0.2 is skipped; see below.
 
 ### What desk gains
 
 | desk piece | Needed by | Phase 3 step it pre-empts |
 |---|---|---|
-| Layer-shell surface setup (anchor, margins, no input, exclusive zone 0) | vol 0.2 (OSD) | Step 4 (bar, run and wall still have their own) |
+| Layer-shell surface setup (anchor, margins, no input, exclusive zone 0) | Nothing here now that the OSD moved to `notify`; `notify` will need it | Step 4 (bar, run and wall still have their own) |
 | Terminal raw mode, alternate screen, key and mouse input decoding (`-DDESK_TERM`), if blue and vol share it without strain | blue 0.1, vol 0.3 | None yet. net and mark each have their own; blue and vol would be the third and fourth copies |
 
 ---
@@ -100,7 +100,7 @@ Done when the volume keys work and the bar shows the level. Then PLAN moves on t
 
 ## vol
 
-Audio and volume control, project 13. One `vol.c` and `vol.h` on desk Layer 0 (INI config, palette) plus libpulse, with Layer 1 and the font layer for the OSD.
+Audio and volume control, project 13. One `vol.c` and `vol.h` on desk Layer 0 (INI config, palette) plus libpulse. It has no Wayland surface of its own: the popup is `notify`'s.
 
 ### 0.1: Command line
 
@@ -121,17 +121,17 @@ Then replace the stopgaps: dwl's keys run `vol up`, `vol down`, `vol mute` and `
 
 Checks: each command against wpctl's view of the same sink; `--follow` survives `systemctl --user restart pipewire pipewire-pulse wireplumber` (reconnects, prints the current level again) and goes on printing when headphones become the default.
 
-### 0.2: The OSD
+### 0.2: The OSD (skipped, moved to notify)
 
-A popup when the volume changes: a layer-shell overlay at the bottom middle, with an icon, a level bar and the percent, faded out after 1.5 s. Muted shows a crossed-out icon in the muted color.
+Skipped on 2026-11-28: the popup is built with `notify` instead, so there is one daemon for every popup. Until then the bar's `Vol 30%` is the feedback for the keys.
 
-- `vol --osd` runs for the whole session, started from dwl's autostart. It subscribes like `--follow` and shows the popup on any change to the default sink's volume or mute, so the keys, the bar's scroll and other tools all trigger it.
-- It shows the device name when the default sink changes (headphones connecting).
-- It takes no input and has an exclusive zone of 0, so it never takes focus or moves windows.
-- Only one instance: a second `vol --osd` exits 0.
-- It uses the palette, and redraws when the wallpaper changes.
+What carries over to notify's roadmap:
 
-Checks: held keys update the popup smoothly without flicker; it appears on the focused output; it stays over full-screen windows; it doesn't steal keyboard focus from deal.
+- A popup at the bottom middle with a level bar and the percent, faded out after about 1.5 s. Muted is shown in the muted color. A new change replaces the open popup instead of stacking another (`x-canonical-private-synchronous` / `synchronous` hints, `int:value` for the level, as other volume OSDs send them).
+- It shows on any change to the default sink: keys, bar scrolling, other tools. Either vol sends the notification (`vol up --notify`) or a small `vol --follow`-like watcher does it so changes from other tools show too. Decide in notify's roadmap.
+- The device name when the default sink changes (headphones connecting).
+- No input and an exclusive zone of 0, on the focused output, above full-screen windows. Palette colors.
+- The same popup serves the brightness keys in Phase 6.
 
 ### 0.3: The mixer
 
@@ -199,7 +199,7 @@ The checklists in a fresh session, a week of use, the agent's input fuzzed (D-Bu
 ## Order
 
 1. Stage 0 now: 0.1 Bluetooth from the terminal, 0.2 volume keys, 0.3 the bar module. Then the browser.
-2. `vol` 0.1 and 0.2 next: they replace the stopgaps and give the OSD, the part used every day. They run alongside the 1.0 weeks of files, mark and view, which are mostly waiting on use.
+2. `vol` 0.1 replaces the stopgaps (done). 0.2, the OSD, is skipped and moves to `notify`.
 3. `blue` 0.1 to 0.3: until then, bluetoothctl works for the rare new pairing.
 4. `vol` 0.3 and 0.4, the mixer, then both 1.0s.
 
@@ -208,14 +208,14 @@ The checklists in a fresh session, a week of use, the agent's input fuzzed (D-Bu
 - **Media keys and headset buttons:** BlueZ turns AVRCP buttons into Play, Pause, Next and Previous key events, and so do the laptop's keys. Binding them needs an MPRIS client (`org.mpris.MediaPlayer2.*` on the session bus over sd-bus). That's a few lines in `vol` (`vol play-pause`, `vol next`), and `music` is the first player of our own to expose it.
 - **Bluetooth audio auto-switching:** WirePlumber can switch a headset to HFP when an app opens the mic and back afterwards (`bluetooth.autoswitch-to-headset-profile`). Decide after a week of calls whether to keep its default.
 - **Absolute volume over AVRCP** for headphones that support it, so `vol` changes the headphones' own volume. PipeWire does this already. Check it behaves and document it.
-- **notify:** "Headphones connected, 80% battery" and low-battery warnings, once `notify` exists.
+- **notify:** the volume popup (vol 0.2's plan, above), "Headphones connected, 80% battery" and low-battery warnings.
 
 ## As built
 
 - **Stage 0.2:** the four keys in `dwl/config.h` and `config.def.h` as argv arrays (`volupcmd` and the rest), documented in dwl's key table. The unused `volume-up_EXAMPLE` axis comment is gone.
 - **Stage 0.3:** bar's `[volume]` module. The command runs in its own process group (`POSIX_SPAWN_SETPGROUP`) so stopping it with `kill(-pid)` takes the `pactl | grep | while` pipeline with it. SIGCHLD now reaps every child with `waitpid(-1)`, since click and scroll commands aren't tracked. The right side is drawn in pieces (volume, then the rest) so the volume can have its own color; `text_advance` places the network's click area behind it. Checked with a second bar on screen: `Vol 30%`, `Vol muted` in the muted color, the network text aligned, and no `pactl` left after bar exits. Clicking and scrolling on it still need a check by hand.
 
-- **vol 0.1:** `vol/vol.c` and `vol.h` on desk Layer 0 (config path, INI) and libpulse, with `pa_mainloop` for now; the OSD in 0.2 needs it on vol's own poll loop. Commands as planned, plus `get` as a synonym for no command and `N%` accepted. The config is read but not written yet (0.4). `--follow` prints `No output` when there is no default sink, so bar shows that rather than a stale level. dwl's four keys and bar's `[volume]` defaults now call `vol`. The checks in `vol/README.md` pass except the ones that need a dwl restart. Once, a restart of PipeWire 0.2 s after a burst of changes came back at 1.00. Four more restarts came back right, so it was probably WirePlumber restoring a level saved before the burst; watch for it.
+- **vol 0.1:** `vol/vol.c` and `vol.h` on desk Layer 0 (config path, INI) and libpulse, with `pa_mainloop`, which is enough now that vol has no surface of its own. Commands as planned, plus `get` as a synonym for no command and `N%` accepted. The config is read but not written yet (0.4). `--follow` prints `No output` when there is no default sink, so bar shows that rather than a stale level. dwl's four keys and bar's `[volume]` defaults now call `vol`. The checks in `vol/README.md` pass except the ones that need a dwl restart. Once, a restart of PipeWire 0.2 s after a burst of changes came back at 1.00. Four more restarts came back right, so it was probably WirePlumber restoring a level saved before the burst; watch for it.
 
 ## Bluetooth notes
 
