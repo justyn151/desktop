@@ -892,6 +892,7 @@ static void build_places(struct files *files)
     struct place *places = NULL;
     size_t count = 0;
     if (files->home && is_directory(files->home)) {
+        add_place(&places, &count, "Places", NULL, 0);
         add_place(&places, &count, "Home", files->home, ICON_HOME);
         static const struct {
             const char *key, *fallback;
@@ -908,9 +909,11 @@ static void build_places(struct files *files)
             free(path);
         }
     }
+    if (!count)
+        add_place(&places, &count, "Places", NULL, 0);
+    add_place(&places, &count, "File system", "/", ICON_DISK);
     struct bookmark_places bookmarks = {&places, &count, false};
     each_bookmark(files, add_bookmark_place, &bookmarks);
-    add_place(&places, &count, "File system", "/", ICON_DISK);
     add_drives(&places, &count);
     places_free(files->places, files->place_count);
     files->places = places;

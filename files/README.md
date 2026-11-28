@@ -142,7 +142,7 @@ The two make one scale: zooming in past the biggest list switches to the smalles
 | File system | `/` |
 | Drives | Whatever is mounted under `/run/media`, `/media` or `/mnt`, by its mount point's name |
 
-The place you're in is highlighted. The list is made again whenever a directory loads, so a new `~/Music` shows up, and drives follow `/proc/self/mountinfo`, so one appears as soon as it's mounted and goes when it's unmounted.
+It has three groups: **Places** (home, its folders and the file system), **Bookmarks** and **Drives**, each under a heading, the last two only when they have something. The place you're in is highlighted. The list is made again whenever a directory loads, so a new `~/Music` shows up, and drives follow `/proc/self/mountinfo`, so one appears as soon as it's mounted and goes when it's unmounted.
 
 The sidebar is 180 pixels wide to begin with. Drag its edge (the pointer turns into a resize arrow) or use `<` and `>`; double-clicking the edge or `=` resets it. It's never narrower than 100 or wider than half the window, and it hides itself when the window is narrower than 60 character cells. Its width and whether it's shown are kept in `~/.local/state/files/state` (or under `$XDG_STATE_HOME`), with the view and zoom.
 
