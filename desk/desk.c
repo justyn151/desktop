@@ -2026,22 +2026,29 @@ const char *desk_mime_type(const DeskApps *apps, const char *path, const char *n
     struct stat info;
     if (path && stat(path, &info) == 0 && S_ISDIR(info.st_mode))
         return "inode/directory";
-    const char *best = NULL;
-    int best_weight = -1;
-    size_t best_length = 0;
-    for (size_t i = 0; apps && i < apps->glob_count; ++i) {
-        const DeskGlob *glob = &apps->globs[i];
-        size_t length = strlen(glob->pattern);
-        if (glob->weight < best_weight || (glob->weight == best_weight && length <= best_length))
-            continue;
-        if (fnmatch(glob->pattern, name, glob->case_sensitive ? 0 : FNM_CASEFOLD) == 0) {
-            best = glob->mime;
-            best_weight = glob->weight;
-            best_length = length;
+    /* Case-sensitive globs first, as the spec says: shared-mime-info lists
+       *.C:cs for C++ and *.c:cs for C, plus both again ignoring case. Then
+       the highest weight, then the longest pattern. */
+    for (int pass = 0; pass < 2; ++pass) {
+        const char *best = NULL;
+        int best_weight = -1;
+        size_t best_length = 0;
+        for (size_t i = 0; apps && i < apps->glob_count; ++i) {
+            const DeskGlob *glob = &apps->globs[i];
+            if (glob->case_sensitive != (pass == 0))
+                continue;
+            size_t length = strlen(glob->pattern);
+            if (glob->weight < best_weight || (glob->weight == best_weight && length <= best_length))
+                continue;
+            if (fnmatch(glob->pattern, name, pass == 0 ? 0 : FNM_CASEFOLD) == 0) {
+                best = glob->mime;
+                best_weight = glob->weight;
+                best_length = length;
+            }
         }
+        if (best)
+            return best;
     }
-    if (best)
-        return best;
     if (!apps || !apps->glob_count) {
         if (strcasecmp(name, "Makefile") == 0 || strcasecmp(name, "GNUmakefile") == 0)
             return "text/x-makefile";
