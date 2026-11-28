@@ -18,7 +18,7 @@ Ground rules that apply to every phase:
 **Next, in order:**
 
 1. Bluetooth: `bluetooth.service` is already enabled and running and PipeWire's Bluetooth plugin is loaded, so what's left is installing `rtkit`, pairing headphones from `bluetoothctl` and checking they come back after a reboot (Stage 0.1 of [docs/sound-roadmap.md](docs/sound-roadmap.md))
-2. Volume: Stages 0.2 and 0.3 and `vol` 0.1 are in and installed: the four audio keys run `vol` from dwl, and bar has a `[volume]` module fed by `vol --follow` (`Vol 30%`). Restart dwl to pick them up, then check the keys and scrolling the bar by hand. The volume popup (vol 0.2) is skipped and will come with `notify`. Next is `blue`, then vol's mixer, in the order the roadmap gives
+2. Volume: Stages 0.2 and 0.3 and `vol` 0.1 are in and installed: the four audio keys run `vol` from dwl, and bar has a `[volume]` module fed by `vol --follow` (`Vol 30%`). Restart dwl to pick them up, then check the keys and scrolling the bar by hand. The volume popup (vol 0.2) is skipped and will come with `notify`. `blue` 0.1 is in (known devices, connect, power); next is `blue` 0.2, pairing, then 0.3 and vol's mixer, in the order the roadmap gives
 3. A browser: none is installed. Install one, make it the default for `http`, `https` and `text/html` in `mimeapps.list`, and check its upload and download dialogs come up as files through the portal (the reason for files 0.6)
 4. `files` toward 1.0: live checks, a week of daily use, fuzzing the listing and the portal input, final README, tag `files-1.0.0`. After 1.0: dialogs as windows of their own that can be dragged. files is a mouse-first explorer, not a keyboard-first one.
 5. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
@@ -297,7 +297,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 30 proje
 | Gap | Current state | Route |
 |---|---|---|
 | Volume keys | Bound to `vol` 0.1 in dwl, level shown in bar; the popup comes with `notify` | `vol` + XF86Audio bindings in dwl, plan in [docs/sound-roadmap.md](docs/sound-roadmap.md). Stopgap: bind `wpctl` in `config.h` |
-| Bluetooth | `bluetooth.service` enabled and running, nothing paired. Pulled forward: next | `bluetoothctl` to start, then `blue` and a bar module ([docs/sound-roadmap.md](docs/sound-roadmap.md)) |
+| Bluetooth | `bluetooth.service` running; `blue` 0.1 lists, connects and powers; pairing (0.2) next | `bluetoothctl` to start, then `blue` and a bar module ([docs/sound-roadmap.md](docs/sound-roadmap.md)) |
 | Browser | None installed. Pulled forward: next | Install one, default for web links, file dialogs through the portal |
 | Brightness keys + OSD | Missing | backlight via logind `SetBrightness`, the popup through `notify` (shared with volume) |
 | Idle dim/lock/suspend | Missing | `ext-idle-notify-v1` (dwl supports it) → `lock` |
@@ -349,4 +349,4 @@ These are the pieces a laptop daily driver needs that aren't one of the 30 proje
 | 27 | `note` (working name) | Note-taking app in the spirit of Obsidian and Excalidraw, on its own markup language |
 | 28 | `todo` | To-do list; tasks with due dates, connected to `cal` later |
 | 29 | `cal` | Calendar with month, week and day views; shows `todo`'s due tasks once they're connected |
-| 30 | `blue` | Bluetooth manager TUI over BlueZ's D-Bus API: power, scan, pair, connect; roadmap in `docs/sound-roadmap.md` |
+| 30 | `blue` | Bluetooth manager TUI over BlueZ's D-Bus API: power, scan, pair, connect (0.1 done); roadmap in `docs/sound-roadmap.md` |

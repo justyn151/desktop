@@ -217,6 +217,8 @@ The checklists in a fresh session, a week of use, the agent's input fuzzed (D-Bu
 
 - **vol 0.1:** `vol/vol.c` and `vol.h` on desk Layer 0 (config path, INI) and libpulse, with `pa_mainloop`, which is enough now that vol has no surface of its own. Commands as planned, plus `get` as a synonym for no command and `N%` accepted. The config is read but not written yet (0.4). `--follow` prints `No output` when there is no default sink, so bar shows that rather than a stale level. dwl's four keys and bar's `[volume]` defaults now call `vol`. The checks in `vol/README.md` pass except the ones that need a dwl restart. Once, a restart of PipeWire 0.2 s after a burst of changes came back at 1.00. Four more restarts came back right, so it was probably WirePlumber restoring a level saved before the burst; watch for it.
 
+- **blue 0.1:** `blue/blue.c` and `blue.h` on desk Layer 0 and sd-bus, built like net (the same rows, colors, line cache and key handling), about 1,300 lines. Pulled forward from 0.3: the config file and the live wallpaper palette, since desk made them cheap. Matches are installed synchronously before `GetManagedObjects`, so no signal is missed; `NameOwnerChanged` for `org.bluez` starts over when bluetoothd restarts. Devices are allocated one by one so a pending Connect keeps its pointer, and freeing a device drops its call. "Known" means paired, bonded, trusted or connected. Power, the empty list and live changes are checked; connecting real headphones waits until you pair yours.
+
 ## Bluetooth notes
 
 (Written during Stage 0.1.)
