@@ -214,6 +214,8 @@ The standard ones, replacing 0.1's letter keys:
 
 ## 0.4: File operations
 
+Progress: selecting is in (0.4.0): Ctrl+click, Shift+click, Shift and Ctrl with the moving keys, Ctrl+A, the rubber band, and entries lighting up under the pointer. The selection survives refreshes and sorting; a search drops what it hides. The "Other application…" dialog from 0.3 is put off. Next: rename, new folder and trash, then copy and move with progress, the clipboard and dialogs, then drag and drop, undo and properties.
+
 ### Selecting
 
 - Click selects one entry, Ctrl+click adds or removes one, Shift+click selects the range from the last click. Dragging on empty space draws a rubber band that selects what it touches.
@@ -440,8 +442,8 @@ How applications pick up the portal (to confirm against the installed versions):
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | In progress: all but the Open with dialog |
-| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Done, but for the "Other application…" dialog (put off) |
+| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | In progress: selecting done |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Final |

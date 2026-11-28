@@ -38,8 +38,12 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 
 | Key | Action |
 |---|---|
-| Up, Down | Previous, next entry (a row of icons in the icon view) |
+| Up, Down | Previous, next entry (a row of icons in the icon view), selecting just it |
 | Left, Right | Previous, next icon in the icon view |
+| Shift with the moving keys | Select from where you started to there |
+| Ctrl with the moving keys | Move without changing the selection (an outline shows where) |
+| Ctrl+Space | Add the entry under the outline to the selection, or take it out |
+| Ctrl+A | Select everything shown |
 | Enter | Open: into a directory, or a file with its application (see Opening files) |
 | Backspace, Alt+Up | Up to the parent, with the directory you came from selected |
 | Alt+Left, Alt+Right | Back, forward through the directories visited |
@@ -57,7 +61,7 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Alt+1 … Alt+8, Alt+9 | That tab, the last tab |
 | Ctrl+F | Search |
 | Ctrl+L | Type a path (see below) |
-| Escape | Clear the search |
+| Escape | Clear the search; with no search, clear the selection |
 | Ctrl+1, Ctrl+2 | List, icons |
 | Ctrl+plus, Ctrl+minus, Ctrl+0 | Zoom in, out (switching view at either end), back to normal |
 | Ctrl+Q | Quit |
@@ -116,7 +120,11 @@ It's a popup the compositor places, so it flips or slides to stay on screen; a c
 | The empty part of the path | Type a path, as Ctrl+L |
 | The search field | Focuses it, with the cursor where you clicked; drag to select, double-click to select it all; its × clears it |
 | The list and icon buttons (right end) | Switch the view |
-| An entry | Selects it; double-click opens it (goes into a directory, or opens a file) |
+| An entry | Selects it alone; double-click opens it (goes into a directory, or opens a file). Entries light up under the pointer |
+| Ctrl+click an entry | Adds it to the selection, or takes it out |
+| Shift+click an entry | Selects from the last entry clicked to this one (with Ctrl, adds that range) |
+| The empty part of the list | Clears the selection |
+| Drag from empty space, or from beside a name in the list view | A rubber band: selects what it touches (with Ctrl or Shift, adds to the selection); scrolls when dragged past the top or bottom |
 | Right-click | The menu for an entry, a place, or the empty part of the list (see below) |
 | Middle-click on a directory, place or path piece | Opens it in a new tab behind this one |
 | The wheel over the entries | Scrolls them, three rows a notch (a row of icons in the icon view), without moving the selection. Touchpads scroll by distance |
@@ -225,5 +233,6 @@ files will only change things inside your home directory: that's the rule every 
 - [ ] Tabs open, close and switch by clicking, middle-click and keys, each keeping its place.
 - [ ] Typing in the search field filters as you type; its × clears it.
 - [ ] Shift+arrows and dragging select in the search field; Ctrl+C and Ctrl+V copy and paste, including from another app.
+- [ ] Rows and icons light up under the pointer. Ctrl+click, Shift+click, Shift+arrows, Ctrl+A and Escape select as described; a rubber band from empty space or beside a name selects what it touches, and scrolls past the edges.
 - [ ] Ctrl+L or a click on the empty part of the path gives a field; suggestions follow typing; Tab completes; Enter goes there; Escape or a click elsewhere puts the pieces back.
 - [ ] Ctrl+wheel zooms the list and the icons, crossing from one to the other at the ends, and the zoom comes back after a restart.

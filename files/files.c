@@ -357,6 +357,77 @@ static struct entry *cursor_entry(struct files *files)
     return files->cursor < listing->shown_count ? &listing->entries[listing->shown[files->cursor]] : NULL;
 }
 
+/* The selection */
+
+static struct entry *shown_entry(struct files *files, size_t index)
+{
+    return &files->listing.entries[files->listing.shown[index]];
+}
+
+static size_t selected_count(struct files *files)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < files->listing.shown_count; ++i)
+        count += shown_entry(files, i)->selected;
+    return count;
+}
+
+static void clear_selection(struct files *files)
+{
+    for (size_t i = 0; i < files->listing.count; ++i)
+        files->listing.entries[i].selected = false;
+}
+
+/* The cursor on index, and only it selected. */
+static void select_only(struct files *files, size_t index)
+{
+    clear_selection(files);
+    if (index < files->listing.shown_count) {
+        files->cursor = index;
+        shown_entry(files, index)->selected = true;
+    }
+    files->anchor = files->cursor;
+}
+
+/* Select from the anchor to index, adding to what's selected or not. */
+static void select_range(struct files *files, size_t index, bool add)
+{
+    if (!add)
+        clear_selection(files);
+    size_t from = files->anchor < index ? files->anchor : index, to = files->anchor < index ? index : files->anchor;
+    for (size_t i = from; i <= to && i < files->listing.shown_count; ++i)
+        shown_entry(files, i)->selected = true;
+    files->cursor = index;
+}
+
+static int compare_strings(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* The names selected in old, sorted, for carrying the selection over a
+   reread; NULL when none are. */
+static char **selected_names(const struct listing *old, size_t *count)
+{
+    *count = 0;
+    for (size_t i = 0; i < old->count; ++i)
+        *count += old->entries[i].selected;
+    if (!*count)
+        return NULL;
+    char **names = malloc(*count * sizeof *names);
+    if (!names) {
+        *count = 0;
+        return NULL;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < old->count; ++i) {
+        if (old->entries[i].selected)
+            names[used++] = old->entries[i].name;
+    }
+    qsort(names, used, sizeof *names, compare_strings);
+    return names;
+}
+
 /* Find a shown entry by name. */
 static bool find_shown(const struct listing *listing, const char *name, size_t *index)
 {
@@ -1135,10 +1206,18 @@ static void filter(struct files *files)
 
 /* Replace the listing with path's, keeping the cursor on keep (a name) when
    it's still there, else near the old position. */
-static void load(struct files *files, const char *keep, size_t near)
+static void load(struct files *files, const char *keep, size_t near, bool same)
 {
     struct listing old = files->listing;
     listing_read(&files->listing, files->path);
+    /* Rereading: what was selected stays selected. */
+    size_t selected = 0;
+    char **names = same ? selected_names(&old, &selected) : NULL;
+    for (size_t i = 0; names && i < files->listing.count; ++i) {
+        const char *name = files->listing.entries[i].name;
+        files->listing.entries[i].selected = bsearch(&name, names, selected, sizeof *names, compare_strings) != NULL;
+    }
+    free(names);
     /* Rereading the same directory: show the sizes summed last time until
        the new ones come in. */
     if (files->sized_path && strcmp(files->sized_path, files->path) == 0) {
@@ -1160,6 +1239,10 @@ static void load(struct files *files, const char *keep, size_t near)
         files->cursor = near < files->listing.shown_count ? near
                       : files->listing.shown_count ? files->listing.shown_count - 1
                                                    : 0;
+    files->anchor = files->cursor;
+    files->band_pending = files->banding = false;
+    if (!same)
+        select_only(files, files->cursor);
 }
 
 /* Show directory path (taken over), selecting select or what was selected
@@ -1179,7 +1262,7 @@ static void enter(struct files *files, char *path, const char *select)
     files->typed[0] = 0;
     files->notice[0] = 0;
     struct memory *memory = find_memory(files, path);
-    load(files, select ? select : memory ? memory->name : NULL, 0);
+    load(files, select ? select : memory ? memory->name : NULL, 0, false);
     watch_directory(files);
     if (files->window.toplevel)
         update_title(files);
@@ -1396,7 +1479,7 @@ static void refresh(struct files *files)
 {
     struct entry *entry = cursor_entry(files);
     char *keep = entry ? strdup(entry->name) : NULL;
-    load(files, keep, files->cursor);
+    load(files, keep, files->cursor, true);
     free(keep);
     desk_window_redraw(&files->window);
 }
@@ -1441,7 +1524,9 @@ static size_t line_count(const struct files *files)
     return (files->listing.shown_count + per_line - 1) / per_line;
 }
 
-static void move_cursor(struct files *files, long delta)
+/* Move the cursor: alone it selects just that entry, with Shift it
+   selects from the anchor, with Ctrl it leaves the selection be. */
+static void move_cursor(struct files *files, long delta, unsigned mods)
 {
     size_t count = files->listing.shown_count;
     if (!count)
@@ -1451,11 +1536,14 @@ static void move_cursor(struct files *files, long delta)
         target = 0;
     if (target >= (long)count)
         target = (long)count - 1;
-    if ((size_t)target != files->cursor || files->free_scroll) {
+    if (mods & DESK_MOD_SHIFT)
+        select_range(files, (size_t)target, mods & DESK_MOD_CTRL);
+    else if (mods & DESK_MOD_CTRL)
         files->cursor = (size_t)target;
-        files->free_scroll = false;
-        desk_window_redraw(&files->window);
-    }
+    else
+        select_only(files, (size_t)target);
+    files->free_scroll = false;
+    desk_window_redraw(&files->window);
 }
 
 /* A page of lines, in entries. */
@@ -1493,6 +1581,15 @@ static void refilter(struct files *files)
         if (listing->shown[i] >= old)
             break;
     }
+    /* What's no longer shown leaves the selection. */
+    for (size_t i = 0; i < listing->count; ++i)
+        listing->entries[i].was_selected = listing->entries[i].selected;
+    clear_selection(files);
+    for (size_t i = 0; i < listing->shown_count; ++i)
+        shown_entry(files, i)->selected = shown_entry(files, i)->was_selected;
+    if (!selected_count(files))
+        select_only(files, files->cursor);
+    files->anchor = files->cursor;
     files->free_scroll = false;
     desk_window_redraw(&files->window);
 }
@@ -1506,6 +1603,7 @@ static void resort(struct files *files)
     filter(files);
     if (!select_name(files, keep))
         files->cursor = 0;
+    files->anchor = files->cursor;
     free(keep);
     desk_window_redraw(&files->window);
 }
@@ -1697,7 +1795,9 @@ static void tab_load(struct files *files, size_t index)
     if (tab->search) {
         desk_text_set(&files->search.text, tab->search);
         refilter(files);
-        select_name(files, tab->selected);
+        size_t index;
+        if (find_shown(&files->listing, tab->selected, &index))
+            select_only(files, index);
     }
     free(tab->selected);
     free(tab->search);
@@ -2229,6 +2329,31 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         case XKB_KEY_KP_Subtract: zoom(files, -1); return true;
         case XKB_KEY_0:
         case XKB_KEY_KP_0: zoom(files, 0); return false;
+        case XKB_KEY_a:
+        case XKB_KEY_A:
+            for (size_t i = 0; i < files->listing.shown_count; ++i)
+                shown_entry(files, i)->selected = true;
+            desk_window_redraw(&files->window);
+            return false;
+        case XKB_KEY_space:
+            if (cursor_entry(files)) {
+                cursor_entry(files)->selected = !cursor_entry(files)->selected;
+                files->anchor = files->cursor;
+                desk_window_redraw(&files->window);
+            }
+            return false;
+        default: break;
+        }
+        /* Ctrl with the moving keys moves the cursor without selecting. */
+        switch (sym) {
+        case XKB_KEY_Down: move_cursor(files, line, mods); return true;
+        case XKB_KEY_Up: move_cursor(files, -line, mods); return true;
+        case XKB_KEY_Right: if (icons) move_cursor(files, 1, mods); return icons;
+        case XKB_KEY_Left: if (icons) move_cursor(files, -1, mods); return icons;
+        case XKB_KEY_Home: move_cursor(files, -(long)files->listing.shown_count, mods); return false;
+        case XKB_KEY_End: move_cursor(files, (long)files->listing.shown_count, mods); return false;
+        case XKB_KEY_Page_Down: move_cursor(files, page(files), mods); return true;
+        case XKB_KEY_Page_Up: move_cursor(files, -page(files), mods); return true;
         default: return false;
         }
     }
@@ -2250,18 +2375,18 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         return false;
     switch (sym) {
     case XKB_KEY_Down:
-        move_cursor(files, line);
+        move_cursor(files, line, mods);
         return true;
     case XKB_KEY_Up:
-        move_cursor(files, -line);
+        move_cursor(files, -line, mods);
         return true;
     case XKB_KEY_Right:
         if (icons)
-            move_cursor(files, 1);
+            move_cursor(files, 1, mods);
         return icons;
     case XKB_KEY_Left:
         if (icons)
-            move_cursor(files, -1);
+            move_cursor(files, -1, mods);
         return icons;
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
@@ -2271,16 +2396,16 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         go_up(files);
         return true;
     case XKB_KEY_Home:
-        move_cursor(files, -(long)files->listing.shown_count);
+        move_cursor(files, -(long)files->listing.shown_count, mods);
         return false;
     case XKB_KEY_End:
-        move_cursor(files, (long)files->listing.shown_count);
+        move_cursor(files, (long)files->listing.shown_count, mods);
         return false;
     case XKB_KEY_Page_Down:
-        move_cursor(files, page(files));
+        move_cursor(files, page(files), mods);
         return true;
     case XKB_KEY_Page_Up:
-        move_cursor(files, -page(files));
+        move_cursor(files, -page(files), mods);
         return true;
     case XKB_KEY_F5:
         refresh(files);
@@ -2289,7 +2414,13 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         toggle_sidebar(files);
         return false;
     case XKB_KEY_Escape:
-        search_clear(files);
+        /* First the search, then the selection (the cursor stays). */
+        if (field_text(&files->search)[0]) {
+            search_clear(files);
+        } else {
+            clear_selection(files);
+            desk_window_redraw(&files->window);
+        }
         return false;
     default:
         return false;
@@ -2339,7 +2470,7 @@ static void type_to_select(struct files *files, const char *text, size_t length)
     for (size_t step = 0; step < count; ++step) {
         size_t index = (start + step) % count;
         if (starts_with(listing->entries[listing->shown[index]].name, prefix)) {
-            files->cursor = index;
+            select_only(files, index);
             files->free_scroll = false;
             desk_window_redraw(&files->window);
             return;
@@ -2776,13 +2907,47 @@ static void paint_header(struct files *files, DeskCanvas *canvas, const struct l
 }
 
 /* One row of the list between x0 and x1, in the columns laid out. */
+static void outline(DeskCanvas *canvas, int x, int y, int width, int height, int line, uint32_t color);
+
+/* How an entry is marked: selected, under the pointer, and whether the
+   cursor's outline shows (when it isn't simply the one selected). */
+struct marks {
+    bool selected, hovered, focused;
+};
+
+static struct marks entry_marks(struct files *files, size_t index, size_t selected)
+{
+    const struct entry *entry = shown_entry(files, index);
+    return (struct marks){
+        .selected = entry->selected,
+        .hovered = hovering(files, TARGET_ROW, index) && !files->banding,
+        .focused = index == files->cursor && (!entry->selected || selected > 1),
+    };
+}
+
+/* Behind an entry: the selection, or a lighter shade under the pointer, and
+   the cursor's outline. */
+static void draw_marks(struct files *files, DeskCanvas *canvas, struct marks marks, int x, int y, int w, int h)
+{
+    const struct colors *colors = &files->colors;
+    if (marks.selected)
+        desk_canvas_fill(canvas, x, y, w, h,
+                         marks.hovered ? mix(colors->selection_background, colors->foreground, 18)
+                                       : colors->selection_background);
+    else if (marks.hovered)
+        desk_canvas_fill(canvas, x, y, w, h, mix(colors->background, colors->muted, 45));
+    if (marks.focused)
+        outline(canvas, x, y, w, h, desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1,
+                mix(colors->background, colors->directory, 150));
+}
+
 static void draw_row(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct entry *entry,
-                     int x0, int x1, int y, bool selected)
+                     int x0, int x1, int y, struct marks marks)
 {
     const struct colors *colors = &files->colors;
     const struct panes *panes = &files->panes;
-    if (selected)
-        desk_canvas_fill(canvas, x0, y, x1 - x0, layout->row_height, colors->selection_background);
+    bool selected = marks.selected;
+    draw_marks(files, canvas, marks, x0, y, x1 - x0, layout->row_height);
     uint32_t color = entry_color(files, entry, selected);
     int baseline = y + layout->baseline, inner = layout->padding / 2;
     draw_icon(layout->font, canvas, x0 + inner / 2, x0 + inner / 2 + layout->icon_width, baseline,
@@ -2836,10 +3001,11 @@ static void paint_list(struct files *files, DeskCanvas *canvas, const struct lay
                        int y, int rows)
 {
     struct listing *listing = &files->listing;
+    size_t selected = selected_count(files);
     for (int row = 0; row < rows && files->top + (size_t)row < listing->shown_count; ++row) {
         size_t index = files->top + (size_t)row;
         draw_row(files, canvas, layout, &listing->entries[listing->shown[index]], x0, x1,
-                 y + row * layout->row_height, index == files->cursor);
+                 y + row * layout->row_height, entry_marks(files, index, selected));
     }
 }
 
@@ -2867,19 +3033,18 @@ static void paint_icons(struct files *files, DeskCanvas *canvas, const struct la
     int icon = (int)lround(desk_font_size(files->icon_font));
     DeskFontMetrics icon_metrics = desk_font_metrics(files->icon_font);
     int icon_baseline = pad + (icon - (icon_metrics.ascent + icon_metrics.descent)) / 2 + icon_metrics.ascent;
-    size_t per_line = (size_t)panes->columns;
+    size_t per_line = (size_t)panes->columns, selected_total = selected_count(files);
     for (int row = 0; row < rows; ++row) {
         for (size_t column = 0; column < per_line; ++column) {
             size_t index = (files->top + (size_t)row) * per_line + column;
             if (index >= listing->shown_count)
                 return;
             struct entry *entry = &listing->entries[listing->shown[index]];
-            bool selected = index == files->cursor;
+            struct marks marks = entry_marks(files, index, selected_total);
+            bool selected = marks.selected;
             int left = x0 + (int)column * tile, top = y + row * panes->line_height;
             uint32_t color = entry_color(files, entry, selected);
-            if (selected)
-                desk_canvas_fill(canvas, left + pad / 2, top, tile - pad, panes->line_height - pad / 2,
-                                 files->colors.selection_background);
+            draw_marks(files, canvas, marks, left + pad / 2, top, tile - pad, panes->line_height - pad / 2);
             draw_icon(files->icon_font, canvas, left, left + tile, top + icon_baseline, entry_icon(entry),
                       selected ? color : entry->broken ? color : entry->hidden ? files->colors.muted
                                                                                : files->colors.directory);
@@ -3386,6 +3551,18 @@ static void paint(struct files *files, DeskCanvas *canvas)
         paint_icons(files, &area, &ui, panes->list_left, top, panes->rows + 1);
     else
         paint_list(files, &area, &list, panes->list_left, panes->list_right, top, panes->rows + 1);
+    if (files->banding) {
+        /* The rubber band, from content pixels to the view's. */
+        int shift = panes->entries_top - (int)files->top * panes->line_height;
+        int x0 = files->band_x0 < files->band_x1 ? files->band_x0 : files->band_x1;
+        int x1 = files->band_x0 < files->band_x1 ? files->band_x1 : files->band_x0;
+        int y0 = (files->band_y0 < files->band_y1 ? files->band_y0 : files->band_y1) + shift;
+        int y1 = (files->band_y0 < files->band_y1 ? files->band_y1 : files->band_y0) + shift;
+        int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+        DeskCanvas band = area;
+        desk_canvas_clip(&band, panes->list_left, panes->entries_top, panes->list_right, bottom);
+        outline(&band, x0, y0, x1 - x0 + 1, y1 - y0 + 1, line, files->colors.directory);
+    }
     paint_notice(files, &area, &ui, bottom);
 }
 
@@ -4427,7 +4604,11 @@ static void context_click(struct files *files, struct target target)
 {
     int x = (int)lround(files->pointer_x), y = (int)lround(files->pointer_y);
     if (target.kind == TARGET_ROW) {
-        files->cursor = target.index;
+        /* On the selection it stays; elsewhere that entry alone is selected. */
+        if (shown_entry(files, target.index)->selected)
+            files->cursor = target.index;
+        else
+            select_only(files, target.index);
         files->free_scroll = false;
         desk_window_redraw(&files->window);
         struct entry *entry = cursor_entry(files);
@@ -4468,10 +4649,10 @@ static void context_key(struct files *files)
     free(path);
 }
 
-/* Everything clickable lights up under the pointer except entries. */
+/* Everything clickable lights up under the pointer, entries too. */
 static bool shows_hover(enum target_kind kind)
 {
-    return kind != TARGET_NONE && kind != TARGET_ROW && kind != TARGET_SEARCH && kind != TARGET_PATH;
+    return kind != TARGET_NONE && kind != TARGET_SEARCH && kind != TARGET_PATH;
 }
 
 static void update_hover(struct files *files, bool force)
@@ -4514,9 +4695,132 @@ static void go_to_place(struct files *files, size_t index)
         go_to(files, path, NULL);
 }
 
+/* Where the list's content is, in its own pixels: y from the first line. */
+static int content_y(const struct files *files)
+{
+    return pointer_buffer_y(files) - files->panes.entries_top + (int)files->top * files->panes.line_height;
+}
+
+/* Whether the pointer is on an entry's name (and icon) in the list view,
+   where a drag will move it, rather than the rest of the row, where a drag
+   draws a rubber band. */
+static bool on_name(struct files *files, size_t index)
+{
+    if (files->view == VIEW_ICONS)
+        return true;
+    struct layout list = make_layout(files->list_font, files->list_italic, files->list_mono,
+                                     desk_window_scale(&files->window));
+    const struct entry *entry = shown_entry(files, index);
+    int right = files->panes.list_left + list.padding / 2 + list.icon_width +
+                desk_text_width(entry->link ? list.italic : list.font, entry->name, strlen(entry->name)) +
+                list.padding / 2;
+    if (right > files->panes.column_right[COLUMN_NAME])
+        right = files->panes.column_right[COLUMN_NAME];
+    return pointer_buffer_x(files) < right;
+}
+
+/* A press on an entry (index), or the list's empty space ((size_t)-1). A
+   plain click selects the entry alone, Ctrl+click adds or removes it,
+   Shift+click selects from the last one clicked; on empty space a plain
+   click clears the selection. A drag from empty space, or from beside a
+   name in the list view, draws a rubber band. */
+static void press_entries(struct files *files, size_t index, unsigned mods)
+{
+    bool ctrl = mods & DESK_MOD_CTRL, shift = mods & DESK_MOD_SHIFT;
+    for (size_t i = 0; i < files->listing.count; ++i)
+        files->listing.entries[i].was_selected = files->listing.entries[i].selected;
+    files->band_add = ctrl || shift;
+    if (index == (size_t)-1) {
+        if (!ctrl && !shift)
+            clear_selection(files);
+    } else if (shift) {
+        select_range(files, index, ctrl);
+    } else if (ctrl) {
+        shown_entry(files, index)->selected = !shown_entry(files, index)->selected;
+        files->cursor = files->anchor = index;
+    } else if (!shown_entry(files, index)->selected || !on_name(files, index)) {
+        select_only(files, index);
+    } else {
+        /* On a selected name: kept for a drag; alone selected when it's a click. */
+        files->cursor = files->anchor = index;
+    }
+    files->free_scroll = false;
+    files->band_pending = true;
+    files->press_on_name = index != (size_t)-1 && on_name(files, index);
+    files->band_x0 = files->band_x1 = pointer_buffer_x(files);
+    files->band_y0 = files->band_y1 = content_y(files);
+    desk_window_redraw(&files->window);
+}
+
+/* The rubber band moved: what it touches is selected, on top of what was
+   with Ctrl or Shift. */
+static void band_select(struct files *files)
+{
+    const struct panes *panes = &files->panes;
+    int left = files->band_x0 < files->band_x1 ? files->band_x0 : files->band_x1;
+    int right = files->band_x0 < files->band_x1 ? files->band_x1 : files->band_x0;
+    int top = files->band_y0 < files->band_y1 ? files->band_y0 : files->band_y1;
+    int bottom = files->band_y0 < files->band_y1 ? files->band_y1 : files->band_y0;
+    size_t per_line = columns(files);
+    long last = -1;
+    for (size_t i = 0; i < files->listing.shown_count; ++i) {
+        struct entry *entry = shown_entry(files, i);
+        int line_top = (int)(i / per_line) * panes->line_height, line_bottom = line_top + panes->line_height;
+        int tile_left = panes->list_left + (int)(i % per_line) * panes->tile_width;
+        bool touched = top < line_bottom && bottom > line_top &&
+                       (files->view != VIEW_ICONS || (left < tile_left + panes->tile_width && right > tile_left));
+        entry->selected = touched || (files->band_add && entry->was_selected);
+        if (touched)
+            last = (long)i;
+    }
+    if (last >= 0)
+        files->cursor = files->anchor = (size_t)last;
+}
+
+/* The pointer moved with the button down on the list. */
+static void band_drag(struct files *files)
+{
+    int x = pointer_buffer_x(files), y = content_y(files);
+    if (files->press_on_name)
+        return; /* Dragging files comes next. */
+    if (!files->banding) {
+        int reach = (int)lround(4 * desk_window_scale(&files->window));
+        if (abs(x - files->band_x0) < reach && abs(y - files->band_y0) < reach)
+            return;
+        files->banding = true;
+    }
+    /* Past the top or bottom: scroll a line toward it. */
+    const struct panes *panes = &files->panes;
+    int buffer_y = pointer_buffer_y(files);
+    if (buffer_y < panes->entries_top && files->top > 0)
+        --files->top;
+    else if (buffer_y > panes->entries_top + panes->rows * panes->line_height &&
+             (long)files->top + panes->rows < (long)line_count(files))
+        ++files->top;
+    files->free_scroll = true;
+    files->band_x1 = x;
+    files->band_y1 = content_y(files);
+    band_select(files);
+    desk_window_redraw(&files->window);
+}
+
+static void band_end(struct files *files)
+{
+    if (!files->banding && files->band_pending && files->press_on_name && !files->band_add) {
+        /* A click on a selected name, not a drag: that entry alone. */
+        int reach = (int)lround(4 * desk_window_scale(&files->window));
+        if (abs(pointer_buffer_x(files) - files->band_x0) < reach && abs(content_y(files) - files->band_y0) < reach &&
+            files->cursor < files->listing.shown_count)
+            select_only(files, files->cursor);
+    }
+    files->band_pending = files->banding = false;
+    desk_window_redraw(&files->window);
+}
+
 static void click(struct files *files, uint32_t time)
 {
     struct target target = target_at(files);
+    unsigned mods = desk_keyboard_mods(&files->keyboard);
     bool twice = target.kind != TARGET_NONE && target.kind == files->press.kind &&
                  target.index == files->press.index && time - files->press_time < DOUBLE_CLICK_MS;
     files->press = target;
@@ -4553,13 +4857,12 @@ static void click(struct files *files, uint32_t time)
         go_to_place(files, target.index);
         break;
     case TARGET_ROW:
-        if (twice) {
+        if (twice && !(mods & (DESK_MOD_CTRL | DESK_MOD_SHIFT))) {
+            select_only(files, target.index);
             go_in(files);
-        } else {
-            files->cursor = target.index;
-            files->free_scroll = false;
-            desk_window_redraw(&files->window);
+            break;
         }
+        press_entries(files, target.index, mods);
         break;
     case TARGET_TAB:
         switch_tab(files, target.index);
@@ -4604,6 +4907,9 @@ static void click(struct files *files, uint32_t time)
         }
         break;
     case TARGET_NONE:
+        if (in_list(files) && pointer_buffer_y(files) >= files->panes.entries_top &&
+            !empty_message(files, &(uint32_t){0}))
+            press_entries(files, (size_t)-1, mods);
         break;
     }
     /* Whatever moved under the pointer. */
@@ -4689,6 +4995,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
         resize_column(files, files->resizing);
     else if (files->selecting)
         field_drag(files);
+    else if (files->band_pending)
+        band_drag(files);
     else
         update_hover(files, false);
 }
@@ -4732,6 +5040,9 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
         click(files, time);
     } else if (files->selecting) {
         files->selecting = NULL;
+        update_hover(files, true);
+    } else if (files->band_pending) {
+        band_end(files);
         update_hover(files, true);
     } else if (files->drag || files->resizing) {
         files->drag = false;

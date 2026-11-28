@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.3.2"
+#define FILES_VERSION "0.4.0"
 
 /* Exit statuses. */
 enum {
@@ -45,6 +45,8 @@ struct entry {
     long long total;       /* A directory's contents in bytes, or a TOTAL_ value. */
     bool directory;        /* A directory, or a link to one. */
     bool link, broken, hidden, executable;
+    bool selected;         /* In the selection. */
+    bool was_selected;     /* Before a Ctrl rubber band started, which adds to it. */
 };
 
 /* The current directory's entries, sorted, and the ones shown. */
@@ -307,6 +309,13 @@ struct files {
     double pointer_x, pointer_y;  /* Logical surface coordinates. */
     struct target hover;      /* What the pointer is over. */
     bool drag;                /* The divider is being dragged. */
+    size_t anchor;            /* Where Shift+click and Shift+arrows select from: index into listing.shown. */
+    /* The rubber band: a press where it may start, then the drag. Its corners
+       are in list content pixels (y counted from the first line, not the
+       view), so it holds still while the list scrolls under it. */
+    bool band_pending, banding, band_add;
+    bool press_on_name;       /* The press was on a name: a drag will move it (0.4), not draw a band. */
+    int band_x0, band_y0, band_x1, band_y1;
     struct target press;      /* The last click, for telling a double-click... */
     uint32_t press_time;      /* ...by its time. */
     double scroll_pixels;     /* Touchpad scrolling not yet a whole row. */
