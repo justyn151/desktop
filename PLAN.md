@@ -31,7 +31,7 @@ Ground rules that apply to every phase:
 
 | What | Result |
 |---|---|
-| files 0.2 | Miller columns (parent, current, preview), previews of directories, images and text made on worker threads and cached, details for everything else, a status line; date and time on every entry. Columns resize by dragging or `<`/`>`, kept between runs. Outside home is read-only unless root (the rule 0.4's operations follow). desk gained `desk_canvas_blit` |
+| files 0.2 | Miller columns (parent, current, preview), previews of directories, images and text made on worker threads and cached, details for everything else; date and time on every entry. A toolbar with back, forward and up and a clickable path replaced the status line, and the mouse works: click, double-click, wheel, side buttons. Columns resize by dragging or `<`/`>`, kept between runs. Outside home is read-only unless root (the rule 0.4's operations follow). desk gained `desk_canvas_blit` |
 | files 0.1 | One directory: keyboard navigation, selection remembered per directory, live refresh, Nerd Font icons, palette colors. desk gained fonts with fallback (`-DDESK_FONT`), the keyboard and an xdg-shell window; view moved onto the last two. Key checks pending |
 | shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
 | view 0.1 | One image fitted to the window, sharp at any scale |
@@ -237,10 +237,10 @@ A graphical file manager with Miller columns (parent, current, preview) and H/J/
 | Version | Milestone | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Miller columns, previews of directories, images and text, status line | Done (live key checks pending) |
+| 0.2 | Miller columns, previews of directories, images and text, toolbar with back, forward and the path, mouse | Done (live key and mouse checks pending) |
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
-| 0.5 | Mouse and drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
+| 0.5 | Right-click, drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Not started |
 

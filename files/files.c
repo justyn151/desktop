@@ -18,7 +18,6 @@
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -263,7 +262,8 @@ static int listing_read(struct listing *listing, const char *path)
         listing->error = error;
         return error;
     }
-    qsort(listing->entries, listing->count, sizeof *listing->entries, entry_order);
+    if (listing->count)
+        qsort(listing->entries, listing->count, sizeof *listing->entries, entry_order);
     listing->shown = malloc((listing->count ? listing->count : 1) * sizeof *listing->shown);
     if (!listing->shown) {
         listing_free(listing);
@@ -532,30 +532,107 @@ static void load(struct files *files, const char *keep, size_t near)
     listing_filter(&files->listing, files->show_hidden);
     load_parent(files);
     files->writable = may_modify(files, files->path);
-    struct statvfs volume;
-    files->free_space = statvfs(files->path, &volume) == 0
-                            ? (unsigned long long)volume.f_bavail * volume.f_frsize
-                            : ULLONG_MAX;
     if (!select_name(files, keep))
         files->cursor = near < files->listing.shown_count ? near
                       : files->listing.shown_count ? files->listing.shown_count - 1
                                                    : 0;
 }
 
-/* Go to directory path (taken over), selecting select or what was selected
-   there last time. */
-static void go_to(struct files *files, char *path, const char *select)
+/* Show directory path (taken over), selecting select or what was selected
+   there last time, without touching the history. */
+static void enter(struct files *files, char *path, const char *select)
 {
     remember(files);
     free(files->path);
     files->path = path;
     files->top = 0;
+    files->free_scroll = false;
+    files->press.kind = TARGET_NONE; /* A click there and one here aren't a double-click. */
     struct memory *memory = find_memory(files, path);
     load(files, select ? select : memory ? memory->name : NULL, 0);
     watch_directory(files);
     if (files->window.toplevel)
         update_title(files);
     desk_window_redraw(&files->window);
+}
+
+static bool history_push(struct history *history, char *path)
+{
+    if (history->count == HISTORY_LIMIT) {
+        free(history->paths[0]);
+        memmove(history->paths, history->paths + 1, (history->count - 1) * sizeof *history->paths);
+        --history->count;
+    }
+    if (history->count == history->capacity) {
+        size_t capacity = history->capacity ? history->capacity * 2 : 16;
+        char **paths = realloc(history->paths, capacity * sizeof *paths);
+        if (!paths)
+            return false;
+        history->paths = paths;
+        history->capacity = capacity;
+    }
+    history->paths[history->count++] = path;
+    return true;
+}
+
+static void history_clear(struct history *history)
+{
+    for (size_t i = 0; i < history->count; ++i)
+        free(history->paths[i]);
+    history->count = 0;
+}
+
+static void history_free(struct history *history)
+{
+    history_clear(history);
+    free(history->paths);
+    *history = (struct history){0};
+}
+
+/* Go to directory path (taken over), remembering where we were for back. */
+static void go_to(struct files *files, char *path, const char *select)
+{
+    if (files->path && strcmp(files->path, path) != 0) {
+        char *here = strdup(files->path);
+        if (here && !history_push(&files->back, here))
+            free(here);
+        history_clear(&files->forward);
+    }
+    enter(files, path, select);
+}
+
+static bool is_directory(const char *path)
+{
+    struct stat info;
+    return stat(path, &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+/* Back (from back, onto forward) or forward (the other way), skipping
+   directories that have gone since. */
+static void travel(struct files *files, struct history *from, struct history *to)
+{
+    while (from->count) {
+        char *path = from->paths[--from->count];
+        if (!is_directory(path)) {
+            free(path);
+            continue;
+        }
+        char *here = strdup(files->path);
+        if (here && !history_push(to, here))
+            free(here);
+        enter(files, path, NULL);
+        return;
+    }
+}
+
+static void go_back(struct files *files)
+{
+    travel(files, &files->back, &files->forward);
+}
+
+static void go_forward(struct files *files)
+{
+    travel(files, &files->forward, &files->back);
 }
 
 static void go_up(struct files *files)
@@ -592,8 +669,7 @@ static void go_home(struct files *files)
 static void go_to_existing(struct files *files)
 {
     char *path = strdup(files->path);
-    struct stat info;
-    while (path && strcmp(path, "/") != 0 && (stat(path, &info) != 0 || !S_ISDIR(info.st_mode))) {
+    while (path && strcmp(path, "/") != 0 && !is_directory(path)) {
         char *parent = parent_path(path);
         free(path);
         path = parent;
@@ -651,8 +727,36 @@ static void move_cursor(struct files *files, long delta)
         target = 0;
     if (target >= (long)count)
         target = (long)count - 1;
-    if ((size_t)target != files->cursor) {
+    if ((size_t)target != files->cursor || files->free_scroll) {
         files->cursor = (size_t)target;
+        files->free_scroll = false;
+        desk_window_redraw(&files->window);
+    }
+}
+
+/* The wheel: move the view by rows without moving the selection. */
+static void scroll_rows(struct files *files, long rows)
+{
+    long last_top = (long)files->listing.shown_count - files->page_rows;
+    long top = (long)files->top + rows;
+    if (top > last_top)
+        top = last_top;
+    if (top < 0)
+        top = 0;
+    if ((size_t)top != files->top) {
+        files->top = (size_t)top;
+        files->free_scroll = true;
+        desk_window_redraw(&files->window);
+    }
+}
+
+static void scroll_preview(struct files *files, long rows)
+{
+    long scroll = files->preview_scroll + rows;
+    if (scroll < 0)
+        scroll = 0;
+    if (scroll != files->preview_scroll) {
+        files->preview_scroll = scroll; /* Painting stops it at the end. */
         desk_window_redraw(&files->window);
     }
 }
@@ -751,7 +855,15 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         default: return false;
         }
     }
-    if (mods & (DESK_MOD_ALT | DESK_MOD_LOGO))
+    if (mods & DESK_MOD_ALT) {
+        switch (sym) {
+        case XKB_KEY_Left: go_back(files); return false;
+        case XKB_KEY_Right: go_forward(files); return false;
+        case XKB_KEY_Up: go_up(files); return false;
+        default: return false;
+        }
+    }
+    if (mods & DESK_MOD_LOGO)
         return false;
     switch (sym) {
     case XKB_KEY_j:
@@ -790,15 +902,14 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         move_cursor(files, -(files->page_rows > 1 ? files->page_rows - 1 : 1));
         return true;
     case XKB_KEY_J:
-        files->preview_scroll++;
-        desk_window_redraw(&files->window);
+        scroll_preview(files, 1);
         return true;
     case XKB_KEY_K:
-        if (files->preview_scroll > 0) {
-            files->preview_scroll--;
-            desk_window_redraw(&files->window);
-        }
+        scroll_preview(files, -1);
         return true;
+    case XKB_KEY_minus:
+        go_back(files);
+        return false;
     case XKB_KEY_less:
         resize_current(files, -1);
         return true;
@@ -1382,6 +1493,14 @@ static size_t keep_visible(size_t top, size_t cursor, size_t count, int rows)
     return top;
 }
 
+/* After the wheel: only keep the list filling the column. */
+static size_t clamp_top(size_t top, size_t count, int rows)
+{
+    if (count <= (size_t)rows)
+        return 0;
+    return top > count - (size_t)rows ? count - (size_t)rows : top;
+}
+
 /* The first row that puts the cursor in the middle, for side columns. */
 static size_t centered_top(size_t cursor, size_t count, int rows)
 {
@@ -1660,8 +1779,11 @@ static void paint_preview(struct files *files, DeskCanvas *canvas, const struct 
             long last = listing->shown_count > (size_t)rows ? (long)listing->shown_count - rows : 0;
             if (base + files->preview_scroll > last)
                 files->preview_scroll = last > base ? last - base : 0;
-            paint_list(files, &clipped, layout, listing, cursor, (size_t)(base + files->preview_scroll), x0, x1,
-                       y, rows, false, false, true);
+            files->columns.preview_listing = true;
+            files->columns.preview_y = y;
+            files->columns.preview_top = (size_t)(base + files->preview_scroll);
+            paint_list(files, &clipped, layout, listing, cursor, files->columns.preview_top, x0, x1, y, rows,
+                       false, false, true);
         }
     } else if (S_ISREG(entry->target_mode)) {
         struct preview *preview = preview_get(files, path, entry, x1 - x0, y1 - y);
@@ -1688,62 +1810,166 @@ static void paint_preview(struct files *files, DeskCanvas *canvas, const struct 
     free(path);
 }
 
-/* Bottom line: the entry's mode, owner, size, time and link target on the
-   left; position and free space on the right. */
-static void paint_status(struct files *files, DeskCanvas *canvas, const struct layout *layout, int x0, int x1,
-                         int y)
+/* Toolbar */
+
+#define ICON_BACK 0xf060
+#define ICON_FORWARD 0xf061
+#define ICON_UP 0xf062
+#define ICON_HOME 0xf015
+#define CRUMB_SEPARATOR "\xe2\x80\xba" /* › */
+#define ELLIPSIS "\xe2\x80\xa6"
+
+static bool hovering(const struct files *files, enum target_kind kind, size_t index)
+{
+    return files->drag < 0 && files->hover.kind == kind && files->hover.index == index;
+}
+
+static bool button_enabled(const struct files *files, int button)
+{
+    switch (button) {
+    case BUTTON_BACK: return files->back.count > 0;
+    case BUTTON_FORWARD: return files->forward.count > 0;
+    default: return strcmp(files->path, "/") != 0;
+    }
+}
+
+/* Split the path into crumbs: home (when inside it) or /, then each
+   directory. Returns whether the first crumb is home. */
+static bool make_crumbs(struct files *files)
+{
+    struct toolbar *bar = &files->toolbar;
+    const char *path = files->path;
+    size_t length = strlen(path), home_length = files->home ? strlen(files->home) : 0;
+    bool home = home_length > 1 && strncmp(path, files->home, home_length) == 0 &&
+                (path[home_length] == 0 || path[home_length] == '/');
+    size_t needed = 1;
+    for (size_t i = 1; i < length; ++i)
+        needed += path[i] == '/';
+    needed += 1;
+    if (needed > bar->crumb_capacity) {
+        struct crumb *crumbs = realloc(bar->crumbs, needed * sizeof *crumbs);
+        if (!crumbs) {
+            bar->crumb_count = 0;
+            return false;
+        }
+        bar->crumbs = crumbs;
+        bar->crumb_capacity = needed;
+    }
+    size_t count = 0, at = home ? home_length : 1;
+    bar->crumbs[count++] = (struct crumb){.left = -1, .right = -1, .start = 0, .end = at};
+    while (at < length) {
+        if (path[at] == '/')
+            ++at;
+        size_t end = at;
+        while (end < length && path[end] != '/')
+            ++end;
+        if (end > at)
+            bar->crumbs[count++] = (struct crumb){.left = -1, .right = -1, .start = at, .end = end};
+        at = end;
+    }
+    bar->crumb_count = count;
+    return home;
+}
+
+static void draw_icon(struct files *files, DeskCanvas *canvas, int left, int right, int baseline, uint32_t code,
+                      uint32_t color)
+{
+    char text[4];
+    size_t length;
+    encode_utf8(code, text, &length);
+    int width = desk_char_width(files->font, code);
+    desk_text_draw(files->font, canvas, left + (right - left - width) / 2, baseline, text, length, color);
+}
+
+/* Back, forward and up buttons, then the path as crumbs to click, with a
+   lock at the end where nothing may be changed. */
+static void paint_toolbar(struct files *files, DeskCanvas *canvas, const struct layout *layout, int top)
 {
     const struct colors *colors = &files->colors;
-    int baseline = y + layout->baseline;
-    char right[96], free_text[32] = "";
-    if (files->free_space != ULLONG_MAX) {
-        format_size((off_t)(files->free_space > (unsigned long long)INT64_MAX ? INT64_MAX : files->free_space),
-                    free_text, sizeof free_text);
-        snprintf(right, sizeof right, "%zu/%zu   %s free",
-                 files->listing.shown_count ? files->cursor + 1 : 0, files->listing.shown_count, free_text);
-    } else {
-        snprintf(right, sizeof right, "%zu/%zu", files->listing.shown_count ? files->cursor + 1 : 0,
-                 files->listing.shown_count);
-    }
-    int right_x = x1 - layout->padding / 2 - desk_text_width(files->mono, right, strlen(right));
-    desk_text_draw(files->mono, canvas, right_x, baseline, right, strlen(right), colors->foreground);
-    /* Root may change anything here; otherwise say when this place is protected. */
-    const char *mark = files->root ? "\xef\x80\xa3 root" : !files->writable ? "\xef\x80\xa3 read-only" : NULL;
-    if (mark) {
-        right_x -= layout->gap + desk_text_width(files->mono, mark, strlen(mark));
-        desk_text_draw(files->mono, canvas, right_x, baseline, mark, strlen(mark),
-                       files->root ? colors->urgent : colors->muted);
+    struct toolbar *bar = &files->toolbar;
+    int height = layout->row_height, baseline = top + layout->baseline, space = layout->padding / 2;
+    uint32_t hover_color = mix(colors->background, colors->muted, 80);
+    bar->top = top;
+    bar->bottom = top + height;
+
+    static const uint32_t icons[BUTTON_COUNT] = {ICON_BACK, ICON_FORWARD, ICON_UP};
+    int x = layout->padding;
+    for (int i = 0; i < BUTTON_COUNT; ++i) {
+        bool enabled = button_enabled(files, i);
+        bar->button_left[i] = x;
+        bar->button_right[i] = x + height;
+        if (enabled && hovering(files, TARGET_BUTTON, (size_t)i))
+            desk_canvas_fill(canvas, x, top, height, height, hover_color);
+        draw_icon(files, canvas, x, x + height, baseline, icons[i],
+                  enabled ? colors->foreground : mix(colors->background, colors->muted, 110));
+        x += height + space / 2;
     }
 
-    struct entry *entry = cursor_entry(files);
-    if (!entry)
+    bar->path_left = x + space;
+    bar->path_right = canvas->width - layout->padding;
+    desk_canvas_fill(canvas, bar->path_left, top, bar->path_right - bar->path_left, height,
+                     mix(colors->background, colors->muted, 35));
+
+    int right = bar->path_right - space;
+    const char *mark = files->root ? "\xef\x80\xa3 root" : !files->writable ? "\xef\x80\xa3 read-only" : NULL;
+    if (mark) {
+        right -= desk_text_width(files->font, mark, strlen(mark));
+        desk_text_draw(files->font, canvas, right, baseline, mark, strlen(mark),
+                       files->root ? colors->urgent : colors->muted);
+        right -= layout->gap;
+    }
+
+    bool home = make_crumbs(files);
+    size_t count = bar->crumb_count;
+    if (!count)
         return;
-    char mode[11], owner[160], size[48], date[32], left[PATH_MAX + 320];
-    format_mode(entry->mode, mode);
-    format_owner(entry->owner, entry->group, owner, sizeof owner);
-    if (entry->directory) {
-        count_items(files, entry);
-        long items = files->show_hidden ? entry->items : entry->items - entry->hidden_items;
-        if (entry->items == COUNT_UNREADABLE)
-            snprintf(size, sizeof size, "unreadable");
-        else
-            snprintf(size, sizeof size, "%ld %s", items, items == 1 ? "entry" : "entries");
-    } else {
-        format_size(entry->size, size, sizeof size);
+    const char *path = files->path;
+    int pad = space, separator = desk_text_width(files->font, CRUMB_SEPARATOR, strlen(CRUMB_SEPARATOR));
+    int ellipsis = desk_text_width(files->font, ELLIPSIS, strlen(ELLIPSIS)) + 2 * pad;
+    int widths[count];
+    for (size_t i = 0; i < count; ++i) {
+        const struct crumb *crumb = &bar->crumbs[i];
+        int width = i == 0 && home ? desk_char_width(files->font, ICON_HOME)
+                                   : desk_text_width(files->font, path + crumb->start, crumb->end - crumb->start);
+        widths[i] = width + 2 * pad;
     }
-    format_date(&entry->modified, date, sizeof date);
-    int length = snprintf(left, sizeof left, "%s  %s  %s  %s", mode, owner, size, date);
-    if (entry->link && length > 0 && (size_t)length < sizeof left - 8) {
-        char *path = join_path(files->path, entry->name);
-        strcat(left, "  → ");
-        size_t used = strlen(left);
-        ssize_t target = path ? readlink(path, left + used, sizeof left - used - 1) : -1;
-        left[target >= 0 ? used + (size_t)target : used] = 0;
-        free(path);
+    /* From the right: as many as fit, the rest behind an ellipsis that goes
+       to the last one hidden. */
+    int room = right - (bar->path_left + space / 2);
+    size_t first = count - 1;
+    int used = widths[first];
+    while (first > 0) {
+        int more = separator + widths[first - 1] + (first - 1 > 0 ? separator + ellipsis : 0);
+        if (used + more > room)
+            break;
+        used += separator + widths[--first];
     }
+
     DeskCanvas clipped = *canvas;
-    desk_canvas_clip(&clipped, x0, y, right_x - layout->gap, y + layout->row_height);
-    desk_text_draw(files->mono, &clipped, x0 + layout->padding / 2, baseline, left, strlen(left), colors->muted);
+    desk_canvas_clip(&clipped, bar->path_left, top, right, top + height);
+    x = bar->path_left + space / 2;
+    for (size_t i = first > 0 ? first - 1 : 0; i < count; ++i) {
+        struct crumb *crumb = &bar->crumbs[i];
+        bool hidden = i < first, last = i == count - 1;
+        int width = hidden ? ellipsis : widths[i];
+        crumb->left = x;
+        crumb->right = x + width;
+        if (!last && hovering(files, TARGET_CRUMB, i))
+            desk_canvas_fill(&clipped, x, top, width, height, hover_color);
+        if (hidden)
+            desk_text_draw(files->font, &clipped, x + pad, baseline, ELLIPSIS, strlen(ELLIPSIS), colors->muted);
+        else if (i == 0 && home)
+            draw_icon(files, &clipped, x, x + width, baseline, ICON_HOME, colors->foreground);
+        else
+            desk_text_draw(files->font, &clipped, x + pad, baseline, path + crumb->start,
+                           crumb->end - crumb->start, colors->foreground);
+        x += width;
+        if (!last) {
+            desk_text_draw(files->font, &clipped, x, baseline, CRUMB_SEPARATOR, strlen(CRUMB_SEPARATOR),
+                           colors->muted);
+            x += separator;
+        }
+    }
 }
 
 static void paint(struct files *files, DeskCanvas *canvas)
@@ -1763,13 +1989,14 @@ static void paint(struct files *files, DeskCanvas *canvas)
     layout.baseline = (layout.row_height - (metrics.ascent + metrics.descent)) / 2 + metrics.ascent;
     desk_canvas_fill(canvas, 0, 0, canvas->width, canvas->height, colors->background);
 
-    /* The status line at the bottom, the columns above it. */
-    int status_y = canvas->height - layout.row_height - layout.padding / 2;
-    int top = layout.padding, bottom = status_y - layout.padding / 2;
+    /* The toolbar at the top, the columns below it. */
+    paint_toolbar(files, canvas, &layout, layout.padding / 2);
+    int top = files->toolbar.bottom + layout.padding, bottom = canvas->height - layout.padding / 2;
     int rows = (bottom - top) / layout.row_height;
     if (rows < 1)
         rows = 1;
     files->page_rows = rows;
+    files->row_height = layout.row_height;
 
     int cell = desk_char_width(files->mono, '0');
     int cells = canvas->width / (cell > 0 ? cell : 1);
@@ -1798,6 +2025,9 @@ static void paint(struct files *files, DeskCanvas *canvas)
         .divider = {parent_shown ? edges[0][1] + layout.padding / 2 : -1,
                     preview_shown ? edges[1][1] + layout.padding / 2 : -1},
         .inner = inner,
+        .top = top,
+        .rows = rows,
+        .parent_top = centered_top(files->parent_cursor, files->parent.shown_count, rows),
     };
     for (int i = 0; i < 3; ++i) {
         columns->left[i] = edges[i][0];
@@ -1810,25 +2040,25 @@ static void paint(struct files *files, DeskCanvas *canvas)
         if (columns->divider[i] < 0)
             continue;
         /* The divider under the pointer or being dragged stands out. */
-        bool active = files->drag == i || (files->drag < 0 && files->hover == i);
+        bool active = files->drag == i || hovering(files, TARGET_DIVIDER, (size_t)i);
         int width = active ? rule_width * 3 : rule_width;
         desk_canvas_fill(canvas, columns->divider[i] - (width - rule_width) / 2, top, width, bottom - top,
                          active ? colors->directory : rule);
     }
-    desk_canvas_fill(canvas, layout.padding, status_y - layout.padding / 4, canvas->width - 2 * layout.padding,
-                     rule_width, rule);
 
     if (parent_shown) {
         DeskCanvas clipped = *canvas;
         desk_canvas_clip(&clipped, edges[0][0], top, edges[0][1], bottom);
-        paint_list(files, &clipped, &layout, &files->parent, files->parent_cursor,
-                   centered_top(files->parent_cursor, files->parent.shown_count, rows), edges[0][0], edges[0][1],
-                   top, rows, false, false, false);
+        paint_list(files, &clipped, &layout, &files->parent, files->parent_cursor, columns->parent_top,
+                   edges[0][0], edges[0][1], top, rows, false, false, false);
     }
 
     DeskCanvas current = *canvas;
     desk_canvas_clip(&current, edges[1][0], top, edges[1][1], bottom);
-    files->top = keep_visible(files->top, files->cursor, files->listing.shown_count, rows);
+    if (files->free_scroll)
+        files->top = clamp_top(files->top, files->listing.shown_count, rows);
+    else
+        files->top = keep_visible(files->top, files->cursor, files->listing.shown_count, rows);
     int name_room = edges[1][1] - edges[1][0] - layout.icon_width - layout.padding;
     bool details = name_room > 2 * (layout.size_width + layout.gap + layout.date_width);
     paint_list(files, &current, &layout, &files->listing, files->cursor, files->top, edges[1][0], edges[1][1], top,
@@ -1836,7 +2066,6 @@ static void paint(struct files *files, DeskCanvas *canvas)
 
     if (preview_shown)
         paint_preview(files, canvas, &layout, cursor_entry(files), edges[2][0], edges[2][1], top, bottom);
-    paint_status(files, canvas, &layout, layout.padding, canvas->width - layout.padding, status_y);
 }
 
 static void draw(void *data, DeskWindow *window)
@@ -1935,26 +2164,35 @@ static const struct wl_keyboard_listener keyboard_listener = {
     .repeat_info = keyboard_repeat_info,
 };
 
-/* Pointer: only the dividers for now; clicking entries comes in 0.5. */
+/* Pointer */
+
+#define WHEEL_ROWS 3 /* Rows a wheel notch scrolls. */
 
 static void set_cursor(struct files *files)
 {
     if (files->cursor_shape)
         wp_cursor_shape_device_v1_set_shape(files->cursor_shape, files->pointer_serial,
-                                            files->drag >= 0 || files->hover >= 0
+                                            files->drag >= 0 || files->hover.kind == TARGET_DIVIDER
                                                 ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE
                                                 : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
 }
 
-/* The pointer's x in buffer pixels. */
+/* The pointer in buffer pixels. */
 static int pointer_buffer_x(const struct files *files)
 {
     return (int)lround(files->pointer_x * desk_window_scale(&files->window));
 }
 
+static int pointer_buffer_y(const struct files *files)
+{
+    return (int)lround(files->pointer_y * desk_window_scale(&files->window));
+}
+
 static int divider_at(const struct files *files)
 {
     int x = pointer_buffer_x(files), reach = (int)lround(DIVIDER_GRAB * desk_window_scale(&files->window));
+    if (pointer_buffer_y(files) < files->columns.top)
+        return -1;
     for (int i = 0; i < 2; ++i) {
         int divider = files->columns.divider[i];
         if (divider >= 0 && abs(x - divider) <= reach)
@@ -1963,14 +2201,188 @@ static int divider_at(const struct files *files)
     return -1;
 }
 
-static void update_hover(struct files *files)
+/* The column under the pointer (0 parent, 1 current, 2 preview), or -1. */
+static int column_at(const struct files *files)
 {
-    int hover = divider_at(files);
-    if (hover != files->hover) {
-        files->hover = hover;
-        set_cursor(files);
-        desk_window_redraw(&files->window);
+    const struct columns *columns = &files->columns;
+    int x = pointer_buffer_x(files), y = pointer_buffer_y(files);
+    if (y < columns->top)
+        return -1;
+    for (int i = 0; i < 3; ++i) {
+        if (columns->shown[i] && x >= columns->left[i] && x < columns->right[i])
+            return i;
     }
+    return -1;
+}
+
+static struct target target_at(const struct files *files)
+{
+    const struct toolbar *bar = &files->toolbar;
+    const struct columns *columns = &files->columns;
+    int x = pointer_buffer_x(files), y = pointer_buffer_y(files);
+    if (y >= bar->top && y < bar->bottom) {
+        for (int i = 0; i < BUTTON_COUNT; ++i) {
+            if (x >= bar->button_left[i] && x < bar->button_right[i])
+                return (struct target){TARGET_BUTTON, (size_t)i};
+        }
+        for (size_t i = 0; i < bar->crumb_count; ++i) {
+            const struct crumb *crumb = &bar->crumbs[i];
+            if (crumb->left >= 0 && x >= crumb->left && x < crumb->right)
+                return (struct target){TARGET_CRUMB, i};
+        }
+        return (struct target){TARGET_NONE, 0};
+    }
+    int divider = divider_at(files);
+    if (divider >= 0)
+        return (struct target){TARGET_DIVIDER, (size_t)divider};
+    int column = column_at(files);
+    if (column < 0 || files->row_height <= 0)
+        return (struct target){TARGET_NONE, 0};
+    long row = (y - columns->top) / files->row_height;
+    if (row >= columns->rows)
+        return (struct target){TARGET_NONE, 0};
+    if (column == 0) {
+        size_t index = columns->parent_top + (size_t)row;
+        if (index < files->parent.shown_count)
+            return (struct target){TARGET_PARENT, index};
+    } else if (column == 1) {
+        size_t index = files->top + (size_t)row;
+        if (index < files->listing.shown_count)
+            return (struct target){TARGET_CURRENT, index};
+    } else if (columns->preview_listing && y >= columns->preview_y) {
+        return (struct target){TARGET_PREVIEW,
+                               columns->preview_top + (size_t)((y - columns->preview_y) / files->row_height)};
+    }
+    return (struct target){TARGET_NONE, 0};
+}
+
+/* Toolbar pieces and dividers light up under the pointer; rows don't. */
+static bool shows_hover(enum target_kind kind)
+{
+    return kind == TARGET_BUTTON || kind == TARGET_CRUMB || kind == TARGET_DIVIDER;
+}
+
+static void update_hover(struct files *files, bool force)
+{
+    struct target hover = target_at(files);
+    if (!force && hover.kind == files->hover.kind && hover.index == files->hover.index)
+        return;
+    bool was_divider = files->hover.kind == TARGET_DIVIDER;
+    if (shows_hover(hover.kind) || shows_hover(files->hover.kind))
+        desk_window_redraw(&files->window);
+    files->hover = hover;
+    if (force || was_divider != (hover.kind == TARGET_DIVIDER))
+        set_cursor(files);
+}
+
+/* A crumb: its directory, with the one we came through selected. */
+static void go_to_crumb(struct files *files, size_t index)
+{
+    const struct toolbar *bar = &files->toolbar;
+    if (index + 1 >= bar->crumb_count)
+        return; /* The current directory. */
+    const struct crumb *next = &bar->crumbs[index + 1];
+    char *path = strndup(files->path, bar->crumbs[index].end);
+    char *select = strndup(files->path + next->start, next->end - next->start);
+    if (path && select)
+        go_to(files, path, select);
+    else
+        free(path);
+    free(select);
+}
+
+/* A row of the parent column: a directory beside this one goes there; a
+   file goes up with it selected. */
+static void click_parent(struct files *files, size_t index)
+{
+    if (index >= files->parent.shown_count || index == files->parent_cursor)
+        return;
+    const struct entry *entry = &files->parent.entries[files->parent.shown[index]];
+    char *parent = parent_path(files->path);
+    if (!parent)
+        return;
+    if (entry->directory) {
+        char *path = join_path(parent, entry->name);
+        free(parent);
+        if (path)
+            go_to(files, path, NULL);
+    } else {
+        char *name = strdup(entry->name);
+        if (name)
+            go_to(files, parent, name);
+        else
+            free(parent);
+        free(name);
+    }
+}
+
+/* A row of a previewed directory: go in with it selected. */
+static void click_preview(struct files *files, size_t index)
+{
+    struct entry *entry = cursor_entry(files);
+    if (!entry || !entry->directory || entry->broken)
+        return;
+    char *path = join_path(files->path, entry->name);
+    if (!path)
+        return;
+    struct preview *preview = preview_get(files, path, entry, 0, 0);
+    char *name = NULL;
+    if (preview && preview->kind == PREVIEW_DIRECTORY && index < preview->listing.shown_count)
+        name = strdup(preview->listing.entries[preview->listing.shown[index]].name);
+    if (name)
+        go_to(files, path, name);
+    else
+        free(path);
+    free(name);
+}
+
+static void click(struct files *files, uint32_t time)
+{
+    struct target target = target_at(files);
+    bool twice = target.kind != TARGET_NONE && target.kind == files->press.kind &&
+                 target.index == files->press.index && time - files->press_time < DOUBLE_CLICK_MS;
+    files->press = target;
+    files->press_time = time;
+    switch (target.kind) {
+    case TARGET_BUTTON:
+        if (target.index == BUTTON_BACK)
+            go_back(files);
+        else if (target.index == BUTTON_FORWARD)
+            go_forward(files);
+        else
+            go_up(files);
+        break;
+    case TARGET_CRUMB:
+        go_to_crumb(files, target.index);
+        break;
+    case TARGET_DIVIDER:
+        if (twice) {
+            files->press.kind = TARGET_NONE;
+            reset_columns(files);
+        } else {
+            files->drag = (int)target.index;
+        }
+        break;
+    case TARGET_PARENT:
+        click_parent(files, target.index);
+        break;
+    case TARGET_CURRENT:
+        if (twice) {
+            go_in(files);
+        } else {
+            files->cursor = target.index;
+            files->free_scroll = false;
+            desk_window_redraw(&files->window);
+        }
+        break;
+    case TARGET_PREVIEW:
+        click_preview(files, target.index);
+        break;
+    case TARGET_NONE:
+        break;
+    }
+    /* Whatever moved under the pointer. */
+    update_hover(files, false);
 }
 
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface,
@@ -1982,8 +2394,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     files->pointer_serial = serial;
     files->pointer_x = wl_fixed_to_double(x);
     files->pointer_y = wl_fixed_to_double(y);
-    files->hover = -2; /* Forces the cursor to be set. */
-    update_hover(files);
+    update_hover(files, true);
 }
 
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
@@ -1995,7 +2406,8 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     if (files->drag >= 0)
         save_state(files);
     files->drag = -1;
-    files->hover = -1;
+    files->hover = (struct target){TARGET_NONE, 0};
+    files->scroll_pixels = 0;
     desk_window_redraw(&files->window);
 }
 
@@ -2009,7 +2421,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     if (files->drag >= 0)
         move_divider(files, files->drag, pointer_buffer_x(files));
     else
-        update_hover(files);
+        update_hover(files, false);
 }
 
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
@@ -2018,41 +2430,58 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     (void)pointer;
     (void)serial;
     struct files *files = data;
-    if (button != BTN_LEFT)
-        return;
-    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        int divider = divider_at(files);
-        if (divider < 0)
-            return;
-        if (divider == files->press_divider && time - files->press_time < DOUBLE_CLICK_MS) {
-            files->press_divider = -1;
-            reset_columns(files);
-            return;
-        }
-        files->press_divider = divider;
-        files->press_time = time;
-        files->drag = divider;
+    bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+    if (button == BTN_SIDE || button == BTN_BACK) {
+        if (pressed)
+            go_back(files);
+    } else if (button == BTN_EXTRA || button == BTN_FORWARD) {
+        if (pressed)
+            go_forward(files);
+    } else if (button != BTN_LEFT) {
+        /* Right-click opens "Open with" in 0.5. */
+    } else if (pressed) {
+        click(files, time);
     } else if (files->drag >= 0) {
         files->drag = -1;
         save_state(files);
-        update_hover(files);
+        update_hover(files, true);
         desk_window_redraw(&files->window);
     }
 }
 
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value)
 {
-    (void)data;
     (void)pointer;
     (void)time;
-    (void)axis;
-    (void)value;
+    struct files *files = data;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        files->scroll_pixels += wl_fixed_to_double(value);
 }
 
+/* Apply the frame's scrolling to the column under the pointer: notches
+   by WHEEL_ROWS, touchpads by distance. */
 static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
-    (void)data;
     (void)pointer;
+    struct files *files = data;
+    long rows = 0;
+    if (files->scroll_steps) {
+        rows = (long)files->scroll_steps * WHEEL_ROWS;
+        files->scroll_pixels = 0;
+    } else if (files->row_height > 0) {
+        double row = files->row_height / desk_window_scale(&files->window);
+        rows = (long)(files->scroll_pixels / row);
+        files->scroll_pixels -= rows * row;
+    }
+    files->scroll_steps = 0;
+    if (!rows)
+        return;
+    int column = column_at(files);
+    if (column == 1)
+        scroll_rows(files, rows);
+    else if (column == 2)
+        scroll_preview(files, rows);
+    update_hover(files, false);
 }
 
 static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source)
@@ -2064,18 +2493,19 @@ static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t
 
 static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis)
 {
-    (void)data;
     (void)pointer;
     (void)time;
-    (void)axis;
+    struct files *files = data;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        files->scroll_pixels = 0;
 }
 
 static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete)
 {
-    (void)data;
     (void)pointer;
-    (void)axis;
-    (void)discrete;
+    struct files *files = data;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        files->scroll_steps += discrete;
 }
 
 static const struct wl_pointer_listener pointer_listener = {
@@ -2116,7 +2546,8 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
         files->cursor_shape = NULL;
         wl_pointer_release(files->pointer);
         files->pointer = NULL;
-        files->drag = files->hover = -1;
+        files->drag = -1;
+        files->hover = (struct target){TARGET_NONE, 0};
     }
 }
 
@@ -2303,8 +2734,9 @@ static void usage(FILE *stream)
           "  -v, --version  Show the version\n"
           "\n"
           "Keys: j/k move, l enters, h goes up, g/G first/last, Ctrl+D/U half a page,\n"
-          "J/K scroll the preview, z hides it, < and > resize the columns (= resets),\n"
-          ". hidden files, ~ home, q quits. Drag the dividers to resize with the mouse.\n",
+          "Alt+Left/Right or - back and forward, J/K scroll the preview, z hides it,\n"
+          "< and > resize the columns (= resets), . hidden files, ~ home, q quits.\n"
+          "The mouse clicks, double-clicks, scrolls and drags the column dividers.\n",
           stream);
 }
 
@@ -2360,8 +2792,7 @@ int main(int argc, char **argv)
 
     struct files files = {
         .inotify = -1, .watch = -1, .parent_watch = -1, .refresh = -1, .done_fd = -1, .running = true,
-        .show_preview = true, .parent_cursor = SIZE_MAX, .free_space = ULLONG_MAX,
-        .hover = -1, .drag = -1, .press_divider = -1, .root = geteuid() == 0,
+        .show_preview = true, .parent_cursor = SIZE_MAX, .drag = -1, .root = geteuid() == 0,
         .palette_watch = {.fd = -1}, .repeat = {.fd = -1},
     };
     const char *home = getenv("HOME");
@@ -2415,6 +2846,9 @@ int main(int argc, char **argv)
     listing_free(&files.listing);
     listing_free(&files.parent);
     free(files.preview_path);
+    free(files.toolbar.crumbs);
+    history_free(&files.back);
+    history_free(&files.forward);
     for (size_t i = 0; i < files.memory_count; ++i) {
         free(files.memories[i].path);
         free(files.memories[i].name);

@@ -6,7 +6,7 @@ Implementation plan for files, the graphical file manager, from 0.1 to 1.0. It e
 
 files is one `files.c` and one `files.h`, built on `desk/` from its first commit, the same way view and shot were. It's a normal xdg-shell window (app ID `files`), so dwl tiles it like any other client.
 
-The model is Miller columns, as in ranger or lf but drawn as a real window: the parent directory on the left, the current one in the middle, a preview of the selected entry on the right. `h` goes up, `l` goes in (or opens a file), `j` and `k` move. Everything works from the keyboard first; the mouse comes along in 0.5.
+The model is Miller columns, as in ranger or lf but drawn as a real window: the parent directory on the left, the current one in the middle, a preview of the selected entry on the right. `h` goes up, `l` goes in (or opens a file), `j` and `k` move. Everything works from the keyboard first; the mouse works too since 0.2, and right-click and drag and drop come in 0.5.
 
 files has two jobs. It's the file manager, and it's also the file picker for every other application: the dialog a browser opens to upload a file or ask where a download goes, and any "Open…" or "Save as…" dialog. The picker is the same window and keys with a choose bar added (0.6). Applications reach it through the `org.freedesktop.impl.portal.FileChooser` portal backend, so there's one way to move around the filesystem instead of a GTK dialog with keys of its own.
 
@@ -116,7 +116,8 @@ files [DIR]
   - Text (UTF-8, by sniffing the first 4 KiB): the first screenful in `monospace`, tabs expanded, no highlighting.
   - Markdown: as text in 0.2. Rendering it through mark's layout is a later, optional step, only if mark's code can be shared without copying it.
   - Anything else: its type, size, permissions, owner and modified time.
-- A status line at the bottom: the selected entry's permissions, owner, size and modified time on the left, position (`12/340`) and free space on the right.
+- A toolbar at the top (replacing the status line 0.2 first had): back, forward and up buttons, and the path as pieces to click, with `read-only` or `root` at its end. Back and forward keep the last 100 directories (Alt+Left, Alt+Right, `-`, the mouse's side buttons).
+- The mouse came forward from 0.5: click selects, double-click enters a directory, a click in the parent or preview column goes there, and the wheel scrolls the column under the pointer without moving the selection.
 
 ### Controls
 
@@ -150,7 +151,6 @@ files [DIR]
 | `n`, `N` | With a kept filter, next and previous match instead of hiding the rest |
 | `:` or Ctrl+L | Type a path, with Tab completion; `~` expands |
 | `'` then a letter | Jump to a bookmark; `m` then a letter sets one (`~/.config/files/bookmarks`) |
-| `-` | Back to the previous directory |
 | `s` | Sort: name, modified, size, type, cycling; `S` reverses |
 
 ### Manual checks
@@ -180,7 +180,7 @@ files [DIR]
 
 ### Design
 
-- Copy, move and delete run in a worker thread with a progress line in the status bar (files, bytes, current name) and can be cancelled. Moves within a filesystem are `renameat2`; across filesystems, copy then remove. Copies use `copy_file_range` and keep modes and times. Symlinks are copied as links.
+- Copy, move and delete run in a worker thread with a progress line under the toolbar (files, bytes, current name) and can be cancelled. Moves within a filesystem are `renameat2`; across filesystems, copy then remove. Copies use `copy_file_range` and keep modes and times. Symlinks are copied as links.
 - Name conflicts ask once per operation: replace, skip, rename (`name (2).ext`), with "apply to all".
 - The trash follows the freedesktop spec (`~/.local/share/Trash/files` and `info`, `$topdir/.Trash-$uid` on other filesystems), so other tools see the same trash. `T` opens the trash as a directory, where `p` restores.
 - The clipboard is shared with other applications as `text/uri-list` and `x-special/gnome-copied-files` through `wl_data_device`, so a copy in files can be pasted in a browser's upload dialog or another file manager. Pasting `text/uri-list` from elsewhere copies those files in.
@@ -192,15 +192,15 @@ So a slip can't delete the system, files only changes things inside the user's o
 
 - Every operation asks `may_modify` (in files.c since 0.2) of each directory whose entries it changes: the destination of a copy, move, paste or new file, and the source directory of a move, rename or trash. The directory is judged by where it really is (`realpath`), so a symlink inside home that points at `/etc` doesn't count as home.
 - Outside home the operation is refused before anything happens, with "/etc is protected: files only changes things inside your home directory". Copying *from* anywhere into home is fine.
-- Running files as root (`sudo files`, effective uid 0) lifts the rule. The status line then shows `root` in the urgent color, so it's never forgotten.
+- Running files as root (`sudo files`, effective uid 0) lifts the rule. The end of the path then shows `root` in the urgent color, so it's never forgotten.
 - Recursive operations never follow symlinks and never cross onto another filesystem, like `rm --one-file-system`, so a bind mount or a link to `/` inside a directory being deleted can't take the system with it.
 - More writable places, such as a USB drive under `/run/media/$USER`, are an explicit opt-in in the config (0.5, `[safety] writable`). Home itself can't be removed from the list.
-- The status line already shows a lock and `read-only` outside home (0.2).
+- The end of the path already shows a lock and `read-only` outside home (0.2).
 
 ### Manual checks
 
 - Copying a large directory from a USB stick into home shows progress and can be cancelled midway, leaving no half-copied file.
-- Delete, Shift+Delete, paste and rename in `/etc` or `/tmp` are refused with a message naming the protected directory; run as root, they work and the status line says `root`.
+- Delete, Shift+Delete, paste and rename in `/etc` or `/tmp` are refused with a message naming the protected directory; run as root, they work and the path bar says `root`.
 - Deleting a directory in home that contains a symlink to `/` removes the link, not what it points to.
 - Renaming, moving and trashing can each be undone with `u`.
 - A file trashed in files appears in another tool's trash view, and restoring it puts it back.
@@ -209,7 +209,7 @@ So a slip can't delete the system, files only changes things inside the user's o
 
 ## 0.5: Mouse, thumbnails, config and desktop integration
 
-- Mouse: the column dividers can be dragged since 0.2, and double-clicking one resets the widths. Click selects, double-click opens, the wheel scrolls the column under the pointer, click in another column moves there, right-click opens the "Open with" list. Drag and drop out of files (`text/uri-list`) and into it.
+- Mouse: since 0.2 the dividers drag, clicks select, double-clicks enter directories, the wheel scrolls, and the toolbar's buttons and path work. Left for 0.5: double-click opens files (through 0.3's opener), right-click opens the "Open with" list. Drag and drop out of files (`text/uri-list`) and into it.
 - A grid view (`t`) of thumbnails for image directories. Thumbnails follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
 - Config through desk at `~/.config/files/files.conf`, written from a sample on first run:
 
@@ -379,9 +379,9 @@ How applications pick up the portal (to confirm against the installed versions):
 | Version | Theme | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Miller columns, previews of directories, images and text, status line | Done (live key checks pending) |
+| 0.2 | Miller columns, previews of directories, images and text, toolbar with back, forward and the path, mouse | Done (live key and mouse checks pending) |
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
-| 0.5 | Mouse and drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
+| 0.5 | Right-click, drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend for browsers and other apps | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Final |

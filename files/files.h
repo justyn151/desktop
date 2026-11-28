@@ -11,7 +11,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.2.0"
+#define FILES_VERSION "0.2.1"
 
 /* Exit statuses. */
 enum {
@@ -109,13 +109,59 @@ struct worker {
 };
 
 /* Where the columns were drawn in the last frame, in buffer pixels, so the
-   dividers between them can be dragged. */
+   dividers between them can be dragged and rows clicked. */
 struct columns {
     bool shown[3];          /* Parent, current, preview. */
     int left[3], right[3];
     int divider[2];         /* x of parent|current and current|preview, -1 when absent. */
     int inner;              /* The width the shown columns share. */
+    int top, rows;          /* The first row's y, and how many fit. */
+    size_t parent_top;      /* First row shown in the parent column. */
+    bool preview_listing;   /* The preview is a directory's listing... */
+    int preview_y;          /* ...drawn from this y... */
+    size_t preview_top;     /* ...starting at this row. */
 };
+
+/* One piece of the path in the toolbar: a directory to go to. */
+struct crumb {
+    int left, right;        /* Buffer x, as drawn. */
+    size_t start, end;      /* Its name is path[start, end); its path the first end bytes. */
+};
+
+enum { BUTTON_BACK, BUTTON_FORWARD, BUTTON_UP, BUTTON_COUNT };
+
+/* The toolbar as drawn: buttons, then the path box. */
+struct toolbar {
+    int top, bottom;
+    int button_left[BUTTON_COUNT], button_right[BUTTON_COUNT];
+    int path_left, path_right;
+    struct crumb *crumbs;
+    size_t crumb_count, crumb_capacity;
+};
+
+/* What is under the pointer. */
+enum target_kind {
+    TARGET_NONE,
+    TARGET_BUTTON,          /* index: BUTTON_ */
+    TARGET_CRUMB,           /* index into toolbar.crumbs */
+    TARGET_DIVIDER,         /* index: 0 or 1 */
+    TARGET_PARENT,          /* index: a row of the parent column */
+    TARGET_CURRENT,         /* index: a row of the current column */
+    TARGET_PREVIEW,         /* index: a row of the previewed listing, or SIZE_MAX elsewhere */
+};
+
+struct target {
+    enum target_kind kind;
+    size_t index;
+};
+
+/* Directories visited, for back and forward. */
+struct history {
+    char **paths;           /* Oldest first. */
+    size_t count, capacity;
+};
+
+#define HISTORY_LIMIT 100
 
 struct wl_pointer;
 struct wp_cursor_shape_manager_v1;
@@ -135,11 +181,13 @@ struct files {
     bool show_hidden;
     struct listing parent;    /* The parent directory, for the left column. */
     size_t parent_cursor;     /* The current directory in it, or SIZE_MAX. */
-    unsigned long long free_space; /* Bytes available here, or ULLONG_MAX when unknown. */
+    bool free_scroll;         /* Scrolled with the wheel: the cursor may be off screen. */
+    struct history back, forward;
 
     bool show_preview;
     double weights[3];        /* Column widths as parent : current : preview. */
     struct columns columns;
+    struct toolbar toolbar;
     char *state_path;         /* Remembers the column widths between runs. */
 
     /* Changing files is allowed only inside home (home_real, symlinks
@@ -184,10 +232,13 @@ struct files {
     struct wp_cursor_shape_device_v1 *cursor_shape;
     uint32_t pointer_serial;
     double pointer_x, pointer_y;  /* Logical surface coordinates. */
-    int hover;                /* The divider under the pointer, or -1. */
+    struct target hover;      /* What the pointer is over. */
     int drag;                 /* The divider being dragged, or -1. */
-    uint32_t press_time;      /* For double-clicking a divider. */
-    int press_divider;
+    struct target press;      /* The last click, for telling a double-click... */
+    uint32_t press_time;      /* ...by its time. */
+    double scroll_pixels;     /* Touchpad scrolling not yet a whole row. */
+    int scroll_steps;         /* Wheel notches in this pointer frame. */
+    int row_height;           /* Buffer pixels, from the last frame. */
     DeskWindow window;
     DeskKeyboard keyboard;
     DeskRepeat repeat;
