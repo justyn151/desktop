@@ -76,12 +76,10 @@ static const struct bar_config bar_defaults = {
     .volume_enabled = true,
     .volume_muted_color = 0x887d69u,
     .volume_custom_text = "Vol",
-    .volume_command = "sh -c 'v() { wpctl get-volume @DEFAULT_AUDIO_SINK@; }; v; "
-                      "pactl subscribe | grep --line-buffered -E \"on (sink|server)\" | "
-                      "while read -r _; do v; done'",
-    .volume_middle_click = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
-    .volume_scroll_up = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
-    .volume_scroll_down = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-",
+    .volume_command = "vol --follow",
+    .volume_middle_click = "vol mute",
+    .volume_scroll_up = "vol up",
+    .volume_scroll_down = "vol down",
 };
 
 #endif

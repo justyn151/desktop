@@ -176,7 +176,7 @@ and that the wallpaper utility’s `--colors` command prints the palette.
 | Super + Minus/Equal | Decrease or increase each gap by 2 pixels |
 | Super + Shift + G | Toggle gaps |
 | Super + Shift + R | Restore the configured gap sizes and enabled setting |
-| Volume Up/Down | Raise or lower the default output by 5% (`wpctl`, stops at 100%); held keys repeat |
+| Volume Up/Down | Raise or lower the default output by `vol`'s step, 5% by default, stopping at 100%; held keys repeat |
 | Mute | Toggle mute on the default output |
 | Mic Mute | Toggle mute on the default input |
 

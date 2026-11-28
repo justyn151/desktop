@@ -9,6 +9,7 @@
 /view/view
 /files/files
 /mark/mark
+/vol/vol
 /lead/editor
 /dwl/dwl-*.tar.gz
 *.o

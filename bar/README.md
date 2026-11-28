@@ -92,11 +92,13 @@ The volume indicator doesn't talk to the sound server itself. bar starts
 pipe, and shows the last line it printed. `Volume: 0.30` becomes `Vol 30%`
 and `Volume: 0.30 [MUTED]` becomes `Vol muted` in `muted_color` (the
 palette's muted role under `[theme] source = wallpaper`); any other line is
-shown as it is. The default command prints `wpctl get-volume` once and again
-on every sink or server event from `pactl subscribe`, which is the stopgap
-until `vol --follow` (see [docs/sound-roadmap.md](../docs/sound-roadmap.md)).
-It runs through `sh -c`, so pipelines work here, unlike in the click
-commands. If the command exits, the indicator disappears and the command is
+shown as it is. The default command is `vol --follow`, and the click and
+scroll defaults are `vol mute`, `vol up` and `vol down`, so `vol` must be on
+the session's `PATH` (see [../vol/README.md](../vol/README.md)). Without
+`vol`, a `wpctl` loop does the same:
+`sh -c 'v() { wpctl get-volume @DEFAULT_AUDIO_SINK@; }; v; pactl subscribe | grep --line-buffered -E "on (sink|server)" | while read -r _; do v; done'`.
+Like every bar command, it is split on whitespace and quotes rather than run
+by a shell, which is why the loop needs `sh -c`. If the command exits, the indicator disappears and the command is
 started again after a second, backing off to 30 seconds while it keeps
 exiting early. Reloading with a different command restarts it; bar stops the
 whole group when it exits.

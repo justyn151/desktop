@@ -215,6 +215,8 @@ The checklists in a fresh session, a week of use, the agent's input fuzzed (D-Bu
 - **Stage 0.2:** the four keys in `dwl/config.h` and `config.def.h` as argv arrays (`volupcmd` and the rest), documented in dwl's key table. The unused `volume-up_EXAMPLE` axis comment is gone.
 - **Stage 0.3:** bar's `[volume]` module. The command runs in its own process group (`POSIX_SPAWN_SETPGROUP`) so stopping it with `kill(-pid)` takes the `pactl | grep | while` pipeline with it. SIGCHLD now reaps every child with `waitpid(-1)`, since click and scroll commands aren't tracked. The right side is drawn in pieces (volume, then the rest) so the volume can have its own color; `text_advance` places the network's click area behind it. Checked with a second bar on screen: `Vol 30%`, `Vol muted` in the muted color, the network text aligned, and no `pactl` left after bar exits. Clicking and scrolling on it still need a check by hand.
 
+- **vol 0.1:** `vol/vol.c` and `vol.h` on desk Layer 0 (config path, INI) and libpulse, with `pa_mainloop` for now; the OSD in 0.2 needs it on vol's own poll loop. Commands as planned, plus `get` as a synonym for no command and `N%` accepted. The config is read but not written yet (0.4). `--follow` prints `No output` when there is no default sink, so bar shows that rather than a stale level. dwl's four keys and bar's `[volume]` defaults now call `vol`. The checks in `vol/README.md` pass except the ones that need a dwl restart. Once, a restart of PipeWire 0.2 s after a burst of changes came back at 1.00. Four more restarts came back right, so it was probably WirePlumber restoring a level saved before the burst; watch for it.
+
 ## Bluetooth notes
 
 (Written during Stage 0.1.)

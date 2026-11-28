@@ -132,11 +132,11 @@ static const char *termcmd[] = { "deal", NULL };
 static const char *menucmd[] = { "run", NULL };
 static const char *shotcmd[] = { "shot", "-r", NULL };
 static const char *filescmd[] = { "files", NULL };
-/* Audio keys: the stopgap until vol 0.1 (docs/sound-roadmap.md) */
-static const char *volupcmd[]   = { "wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "5%+", NULL };
-static const char *voldowncmd[] = { "wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-", NULL };
-static const char *volmutecmd[] = { "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle", NULL };
-static const char *micmutecmd[] = { "wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle", NULL };
+/* Audio keys: vol changes the default output or input (docs/sound-roadmap.md) */
+static const char *volupcmd[]   = { "vol", "up", NULL };
+static const char *voldowncmd[] = { "vol", "down", NULL };
+static const char *volmutecmd[] = { "vol", "mute", NULL };
+static const char *micmutecmd[] = { "vol", "--source", "mute", NULL };
 
 static const Key keys[] = {
 	/* modifier                  key                  function          argument */
