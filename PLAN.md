@@ -18,7 +18,7 @@ Ground rules that apply to every phase:
 **Next, in order:**
 
 1. Bluetooth: `bluetooth.service` is already enabled and running and PipeWire's Bluetooth plugin is loaded, so what's left is installing `rtkit`, pairing headphones from `bluetoothctl` and checking they come back after a reboot (Stage 0.1 of [docs/sound-roadmap.md](docs/sound-roadmap.md))
-2. Volume: Stages 0.2 and 0.3 and `vol` 0.1 are in and installed: the four audio keys run `vol` from dwl, and bar has a `[volume]` module fed by `vol --follow` (`Vol 30%`). Restart dwl to pick them up, then check the keys and scrolling the bar by hand. The volume popup (vol 0.2) is skipped and will come with `notify`. `blue` 0.1–0.3 are in (devices, connect, power, searching, pairing as BlueZ's agent, the bar module and dwl rule); vol's mixer (0.3) is in, as a window like files (`vol mixer`); next is its config, desktop entry, dwl rule and bar click (0.4)
+2. Volume: Stages 0.2 and 0.3 and `vol` 0.1 are in and installed: the four audio keys run `vol` from dwl, and bar has a `[volume]` module fed by `vol --follow` (`Vol 30%`). Restart dwl to pick them up, then check the keys and scrolling the bar by hand. The volume popup (vol 0.2) is skipped and will come with `notify`. `blue` 0.1–0.3 are in (devices, connect, power, searching, pairing as BlueZ's agent, the bar module and dwl rule); vol's mixer (0.3) is in, as a window like files (`vol mixer`), with its config, desktop entry, dwl rule and bar click (0.4); next are the 1.0 checks for blue and vol
 3. A browser: none is installed. Install one, make it the default for `http`, `https` and `text/html` in `mimeapps.list`, and check its upload and download dialogs come up as files through the portal (the reason for files 0.6)
 4. `files` toward 1.0: live checks, a week of daily use, fuzzing the listing and the portal input, final README, tag `files-1.0.0`. After 1.0: dialogs as windows of their own that can be dragged. files is a mouse-first explorer, not a keyboard-first one.
 5. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
@@ -332,7 +332,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 30 proje
 | 10 | `lock` | Screen locker on `ext-session-lock-v1` |
 | 11 | `notify` | Notification daemon (`org.freedesktop.Notifications`), also the volume and brightness popups |
 | 12 | `clip` | Clipboard manager and history |
-| 13 | `vol` | Audio and volume control: command line and mixer over libpulse (0.3 done), its popup through `notify`; roadmap in `docs/sound-roadmap.md` |
+| 13 | `vol` | Audio and volume control: command line and mixer over libpulse (0.4 done), its popup through `notify`; roadmap in `docs/sound-roadmap.md` |
 | 14 | `power` | Session and power controls: logout, suspend, reboot, shutdown |
 | 15 | `mount` | Storage and removable-device manager (udisks2) |
 | 16 | `view` | Image viewer |

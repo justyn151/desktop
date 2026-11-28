@@ -83,6 +83,7 @@ static const struct bar_config bar_defaults = {
     .volume_muted_color = 0x887d69u,
     .volume_custom_text = "Vol",
     .volume_command = "vol --follow",
+    .volume_click = "vol mixer",
     .volume_middle_click = "vol mute",
     .volume_scroll_up = "vol up",
     .volume_scroll_down = "vol down",

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=vol
+GenericName=Volume Mixer
+Comment=Change the volume of outputs, inputs and applications
+Exec=vol mixer
+Icon=multimedia-volume-control
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;Settings;
+Keywords=sound;audio;volume;mixer;speaker;microphone;headphones;

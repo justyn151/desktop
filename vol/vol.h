@@ -1,7 +1,7 @@
 #ifndef VOL_H
 #define VOL_H
 
-#define VOL_VERSION "0.3.0"
+#define VOL_VERSION "0.4.0"
 
 /* Exit statuses. */
 enum {
@@ -26,6 +26,5 @@ enum {
    this tick, and a lone Escape waits this long for the rest of a sequence. */
 #define MIXER_METER_RATE 25
 #define MIXER_TICK_MS 80
-#define MIXER_ESCAPE_MS 50
 
 #endif

@@ -22,6 +22,7 @@ static int log_level = WLR_ERROR;
 
 static const char net_app_id[] = "net";
 static const char blue_app_id[] = "blue";
+static const char vol_app_id[] = "vol";
 static const char wall_browser_app_id[] = "wall-browser";
 
 /* A window whose process was started by one of these (desk_spawn marks it
@@ -36,6 +37,7 @@ static const Rule rules[] = {
 	{ "firefox_EXAMPLE",  NULL,       1 << 8,       0,           -1 }, /* Start on ONLY tag "9" */
 	{ net_app_id,         NULL,       0,            1,           -1 },
 	{ blue_app_id,        NULL,       0,            1,           -1 },
+	{ vol_app_id,         NULL,       0,            1,           -1 },
 	{ wall_browser_app_id, NULL,      0,            1,           -1 },
 	{ "view",             NULL,       0,            1,           -1 }, /* Floats at the image's size */
 	{ "files-picker",     NULL,       0,            1,           -1 }, /* files as a file dialog, centered */

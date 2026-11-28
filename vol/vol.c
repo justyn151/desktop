@@ -12,6 +12,7 @@
 #include "cursor-shape-v1-client-protocol.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <linux/input-event-codes.h>
 #include <locale.h>
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
@@ -34,7 +36,11 @@ enum mute_change { MUTE_TOGGLE, MUTE_ON, MUTE_OFF };
 
 struct config {
     int step, max;
+    int start_view;         /* The mixer's first view: 0 Output to 3 Devices. */
+    bool show_monitors;     /* List outputs' monitors under Input. */
 };
+
+static const char *const start_views[] = {"output", "input", "playback", "devices"};
 
 struct device {
     char name[256];
@@ -100,11 +106,36 @@ static bool parse_int(const char *text, int min, int max, int *value)
     return true;
 }
 
+static void mixer_entry(struct config_parse *parse, const char *key, const char *value, int line)
+{
+    if (!strcmp(key, "start_view")) {
+        for (int i = 0; i < 4; i++)
+            if (!strcmp(value, start_views[i])) {
+                parse->config->start_view = i;
+                return;
+            }
+        fprintf(stderr, "vol: %s:%d: start_view must be output, input, playback or devices\n", parse->path, line);
+    } else if (!strcmp(key, "show_monitors")) {
+        if (!strcmp(value, "true"))
+            parse->config->show_monitors = true;
+        else if (!strcmp(value, "false"))
+            parse->config->show_monitors = false;
+        else
+            fprintf(stderr, "vol: %s:%d: show_monitors must be true or false\n", parse->path, line);
+    } else {
+        fprintf(stderr, "vol: %s:%d: unknown key %s\n", parse->path, line, key);
+    }
+}
+
 static void config_entry(void *data, const char *section, const char *key, const char *value, int line)
 {
     struct config_parse *parse = data;
     if (!key) {
         fprintf(stderr, "vol: %s:%d: expected key = value\n", parse->path, line);
+        return;
+    }
+    if (!strcmp(section, "mixer")) {
+        mixer_entry(parse, key, value, line);
         return;
     }
     if (strcmp(section, "volume")) {
@@ -509,6 +540,7 @@ struct node {
     bool muted, has_volume, corked;
     uint32_t sink;          /* Sink inputs: where they play. */
     uint32_t monitor;       /* Sinks: their monitor source, for the meter. */
+    bool is_monitor;        /* Sources: an output's monitor ([mixer] show_monitors). */
 };
 
 struct nodes {
@@ -860,7 +892,7 @@ static void sync_meters(struct mixer *mixer)
         if (source == PA_INVALID_INDEX || find_meter(mixer, source))
             continue;
         mixer->meters = grow(mixer->meters, mixer->meter_count + 1, sizeof *mixer->meters);
-        mixer->meters[mixer->meter_count++] = open_meter(mixer, source, monitor);
+        mixer->meters[mixer->meter_count++] = open_meter(mixer, source, monitor || nodes->items[j].is_monitor);
     }
 }
 
@@ -951,10 +983,12 @@ static void got_source_entry(pa_context *context, const pa_source_info *info, in
         list_done(mixer);
         return;
     }
-    /* An output's monitor is a source too, but not an input anyone means. */
-    if (info->monitor_of_sink != PA_INVALID_INDEX)
+    /* An output's monitor is a source too, but not an input anyone means,
+       unless asked for. */
+    if (info->monitor_of_sink != PA_INVALID_INDEX && !mixer->config.show_monitors)
         return;
     struct node *node = add_node(&mixer->next.sources);
+    node->is_monitor = info->monitor_of_sink != PA_INVALID_INDEX;
     node->index = info->index;
     copy_text(node->name, sizeof node->name, info->name);
     copy_text(node->label, sizeof node->label, info->description ? info->description : info->name);
@@ -1490,7 +1524,7 @@ static void paint_node(struct mixer *mixer, DeskCanvas *canvas, const struct lay
     }
 
     /* Mute, the slider and the percentage. */
-    uint32_t code = mixer->view == VIEW_INPUT ? (node->muted ? ICON_MIC_OFF : ICON_MIC) :
+    uint32_t code = mixer->view == VIEW_INPUT && !node->is_monitor ? (node->muted ? ICON_MIC_OFF : ICON_MIC) :
                     (node->muted ? ICON_SPEAKER_OFF : ICON_SPEAKER);
     if (hovering(mixer, TARGET_MUTE, row))
         desk_canvas_fill(canvas, left, line2 - ui->padding / 4, icon, ui->line + ui->padding / 2,
@@ -2387,13 +2421,30 @@ static int run_mixer(const struct config *config, bool source)
 {
     struct mixer mixer = {
         .config = *config,
-        .view = source ? VIEW_INPUT : VIEW_OUTPUT,
+        .view = source ? VIEW_INPUT : (enum view)config->start_view,
         .palette_watch = {.fd = -1},
         .repeat = {.fd = -1},
         .status = EXIT_OK,
         .running = true,
     };
     setlocale(LC_CTYPE, "");
+    /* One mixer at a time: a second click on bar doesn't open another. */
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    int lock = -1;
+    if (runtime && *runtime) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/vol-mixer.lock", runtime);
+        lock = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (lock >= 0 && flock(lock, LOCK_EX | LOCK_NB) < 0) {
+            close(lock);
+            if (errno != EWOULDBLOCK)
+                lock = -1;
+            else {
+                fputs("vol: the mixer is already open\n", stderr);
+                return EXIT_OK;
+            }
+        }
+    }
     mixer.palette_path = desk_palette_path();
     if (mixer.palette_path && !desk_watch_open(&mixer.palette_watch, mixer.palette_path))
         mixer.palette_watch.fd = -1;
@@ -2476,6 +2527,8 @@ done:
     close_window(&mixer);
     desk_watch_close(&mixer.palette_watch);
     free(mixer.palette_path);
+    if (lock >= 0)
+        close(lock);
     return mixer.signal ? 128 + mixer.signal : mixer.status;
 }
 
@@ -2503,7 +2556,8 @@ static void usage(FILE *out)
           "  -h, --help               show this help\n"
           "  -v, --version            show the version\n"
           "\n"
-          "up stops at [volume] max (100 by default) in ~/.config/vol/vol.conf.\n", out);
+          "up stops at [volume] max (100 by default) in ~/.config/vol/vol.conf;\n"
+          "[mixer] start_view picks the mixer's first view.\n", out);
 }
 
 /* "30" or "30%". */

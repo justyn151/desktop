@@ -2,8 +2,7 @@
 
 Audio and volume control: a command line that reads and changes the default
 output or input and follows it for bar, and a mixer window for every output,
-input, playing stream and sound card. The popup comes with `notify`; config and the
-bar click come in 0.4. The plan is in
+input, playing stream and sound card. The popup comes with `notify`. The plan is in
 [docs/sound-roadmap.md](../docs/sound-roadmap.md).
 
 vol talks to PipeWire through `pipewire-pulse` with libpulse. Changes go to
@@ -86,6 +85,11 @@ devices appear when headphones connect, a card's profile change adds or
 removes its outputs and inputs. If the server goes away the mixer says so
 and reconnects every second.
 
+Only one mixer opens at a time: `vol mixer` while one is open says so and
+exits, so a double click on bar doesn't open two. bar's `[volume] click`
+runs `vol mixer` by default, `vol.desktop` puts it in launchers as "Volume
+Mixer", and dwl floats and centers app ID `vol`.
+
 The colors are the wallpaper's palette when wall has made one, and change
 while the mixer is open; the defaults otherwise.
 
@@ -97,6 +101,10 @@ while the mixer is open; the defaults otherwise.
 [volume]
 step = 5     # percent for up and down without N, 1 to 100
 max = 100    # where up stops, 1 to 150
+
+[mixer]
+start_view = output     # output, input, playback or devices; -s still opens Input
+show_monitors = false   # list outputs' monitors under Input too
 ```
 
 Unknown keys and bad values are reported on stderr and the defaults kept.
@@ -117,6 +125,15 @@ dwl's volume keys and bar's `[volume]` defaults call `vol`, so it must be on
 the session's `PATH`.
 
 ## Checks
+
+Config and integration (0.4):
+
+- [x] `start_view = playback` opens on Playback; `-s` still opens Input
+- [x] `show_monitors = true` lists the monitor under Input with its meter
+- [x] Bad values and unknown keys are reported with file and line
+- [x] A second `vol mixer` says the mixer is open and exits 0
+- [ ] After restarting dwl: a click on bar's `Vol` opens the mixer floating
+      and centered; `vol.desktop` shows up in the launcher
 
 Mixer (0.3), checked with two temporary null outputs and noise played into
 one, driven by a virtual pointer:

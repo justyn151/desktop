@@ -106,9 +106,9 @@ whole group when it exits.
 
 Scrolling over the indicator runs `scroll_up` or `scroll_down` once per
 wheel step (five at most per event), middle click runs `middle_click`
-(mute by default), and left click runs `click`, empty until `vol` has a
-mixer. These are fire-and-forget: they can overlap, unlike the network
-command.
+(mute by default), and left click runs `click`, `vol mixer` by default.
+These are fire-and-forget: they can overlap, unlike the network command;
+`vol mixer` itself refuses to open a second window.
 
 The Bluetooth indicator follows BlueZ on the system bus, for the first
 adapter. It is hidden when `bluetooth.service` isn't running or there is no

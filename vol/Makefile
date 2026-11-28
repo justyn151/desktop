@@ -4,6 +4,7 @@ WAYLAND_SCANNER ?= wayland-scanner
 WAYLAND_PROTOCOLS_DIR ?= $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols)
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share
 
 PACKAGES = libpulse wayland-client xkbcommon freetype2 fontconfig
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
@@ -64,8 +65,9 @@ clean:
 
 install: vol
 	install -Dm755 vol "$(DESTDIR)$(BINDIR)/vol"
+	install -Dm644 vol.desktop "$(DESTDIR)$(DATADIR)/applications/vol.desktop"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/vol"
+	rm -f "$(DESTDIR)$(BINDIR)/vol" "$(DESTDIR)$(DATADIR)/applications/vol.desktop"
 
 .PHONY: all clean install uninstall
