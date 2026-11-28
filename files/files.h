@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.4.1"
+#define FILES_VERSION "0.4.2"
 
 /* Exit statuses. */
 enum {
@@ -131,6 +131,8 @@ enum target_kind {
     TARGET_HEADING,         /* index: COLUMN_, sorts by it */
     TARGET_PATH,            /* The path box: its empty part, or the field while typing a path */
     TARGET_SUGGESTION,      /* index into suggestions */
+    TARGET_RENAME,          /* The field a name is being edited in */
+    TARGET_DIALOG_BUTTON,   /* index: 0 Cancel, 1 the button that does it */
     TARGET_COLUMN_EDGE,     /* index: the COLUMN_ to its right, resized by dragging */
 };
 
@@ -157,6 +159,29 @@ struct tab {
     struct history back, forward;
     int left, right;        /* As drawn, buffer x. */
     int close_left, close_right;
+};
+
+/* A question over the window, such as "Delete 3 items permanently?",
+   answered with Cancel or the button that does it. Nothing else can be
+   used while it's open. */
+struct dialog {
+    bool open;
+    int action;             /* What the button does: a DIALOG_ value in files.c. */
+    char title[300], message[300];
+    char confirm[32];       /* The button's label. */
+    int focus;              /* 0 Cancel, 1 the button. Cancel to start with. */
+    char **paths;           /* What it acts on. */
+    size_t count;
+    /* As drawn, for clicks. */
+    int button_left[2], button_right[2], button_top, button_bottom;
+};
+
+/* The last change, for Ctrl+Z. */
+enum undo_kind { UNDO_NONE, UNDO_RENAME, UNDO_CREATE, UNDO_TRASH };
+struct undo {
+    enum undo_kind kind;
+    char **from, **to;      /* Rename: from[0] to to[0]. Create: to[0]. Trash: each from[i] went to to[i]. */
+    size_t count;
 };
 
 /* An image's thumbnail, as made for a box of size buffer pixels. Kept in
@@ -194,6 +219,7 @@ struct menu_item {
     bool separator;         /* A line between groups, not an item. */
     bool submenu;           /* Opens another menu to the right. */
     bool check, checked;    /* Shows a check mark when checked. */
+    char shortcut[24];      /* Its key, shown on the right, or "". */
 };
 
 #define MENU_ITEMS 40
@@ -252,6 +278,16 @@ struct files {
     struct thumb *thumbs[THUMB_BUCKETS];
     size_t thumb_count;
     char *thumbs_dir;         /* ~/.cache/thumbnails, the freedesktop cache. */
+    char *trash_dir;          /* ~/.local/share/Trash, the freedesktop trash: files/ and info/. */
+    char *trash_files;        /* Its files/, which is where the Trash place goes. */
+    char *trash_real;         /* trash_dir with links resolved: always yours to change. */
+    bool renaming;            /* An entry's name is being edited, in rename_field. */
+    struct field rename_field;
+    char *rename_name;        /* The entry's name as it was. */
+    bool rename_created;      /* It was just made by New folder or New file. */
+    int rename_top, rename_bottom; /* The field as drawn, or -1. */
+    struct dialog dialog;
+    struct undo undo;
     char *sized_path;         /* The directory whose sizes it's summing. */
     char typed[64];           /* Type to select: what's been typed lately... */
     uint64_t typed_at;        /* ...and when, monotonic ms. */

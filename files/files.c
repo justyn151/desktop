@@ -529,6 +529,10 @@ static bool may_modify(const struct files *files, const char *directory)
         return false;
     size_t length = strlen(files->home_real);
     bool inside = strncmp(real, files->home_real, length) == 0 && (real[length] == '/' || real[length] == 0);
+    /* Your own trash, wherever $XDG_DATA_HOME puts it. */
+    size_t trash = files->trash_real ? strlen(files->trash_real) : 0;
+    if (trash && strncmp(real, files->trash_real, trash) == 0 && (real[trash] == '/' || real[trash] == 0))
+        inside = true;
     free(real);
     return inside;
 }
@@ -986,6 +990,8 @@ static void build_places(struct files *files)
     if (!count)
         add_place(&places, &count, "Places", NULL, 0);
     add_place(&places, &count, "File system", "/", ICON_DISK);
+    if (files->trash_files && is_directory(files->trash_files))
+        add_place(&places, &count, "Trash", files->trash_files, 0xf1f8);
     struct bookmark_places bookmarks = {&places, &count, false};
     each_bookmark(files, add_bookmark_place, &bookmarks);
     add_drives(&places, &count);
@@ -1810,6 +1816,7 @@ static void thumbs_arrived(struct files *files)
 
 static const char *field_text(const struct field *field);
 static void stop_path_edit(struct files *files);
+static void stop_rename(struct files *files);
 static int pointer_buffer_x(const struct files *files);
 
 static void update_title(struct files *files)
@@ -1870,6 +1877,8 @@ static void load(struct files *files, const char *keep, size_t near, bool same)
 static void enter(struct files *files, char *path, const char *select)
 {
     remember(files);
+    if (files->renaming)
+        stop_rename(files);
     if (!files->path || strcmp(files->path, path) != 0)
         thumbs_clear(files);
     free(files->path);
@@ -2919,6 +2928,776 @@ static int path_key(struct files *files, uint32_t key, xkb_keysym_t sym, unsigne
     return repeats;
 }
 
+/* Changing files
+
+   Everything here changes only what may_modify allows: inside home, unless
+   files runs as root. */
+
+static void close_menus(struct files *files);
+
+static void protected_notice(struct files *files, const char *directory)
+{
+    char shown[PATH_MAX];
+    display_path(files, directory, shown, sizeof shown);
+    notify(files, "%s is protected: files only changes things inside your home directory", shown);
+}
+
+static bool in_trash(const struct files *files)
+{
+    return files->trash_files && strcmp(files->path, files->trash_files) == 0;
+}
+
+static void free_paths(char **paths, size_t count)
+{
+    for (size_t i = 0; paths && i < count; ++i)
+        free(paths[i]);
+    free(paths);
+}
+
+/* The selected entries' paths, in order. */
+static char **selected_paths(struct files *files, size_t *count)
+{
+    *count = 0;
+    size_t total = selected_count(files);
+    char **paths = total ? calloc(total, sizeof *paths) : NULL;
+    for (size_t i = 0; paths && i < files->listing.shown_count; ++i) {
+        const struct entry *entry = shown_entry(files, i);
+        if (entry->selected && (paths[*count] = join_path(files->path, entry->name)))
+            ++*count;
+    }
+    return paths;
+}
+
+/* Undo */
+
+static void undo_forget(struct files *files)
+{
+    struct undo *undo = &files->undo;
+    free_paths(undo->from, undo->count);
+    free_paths(undo->to, undo->count);
+    *undo = (struct undo){0};
+}
+
+/* Remember a change (taking over the arrays) for Ctrl+Z. */
+static void undo_set(struct files *files, enum undo_kind kind, char **from, char **to, size_t count)
+{
+    undo_forget(files);
+    files->undo = (struct undo){kind, from, to, count};
+}
+
+static char **one_path(const char *path)
+{
+    char **paths = calloc(1, sizeof *paths);
+    if (paths && !(paths[0] = strdup(path))) {
+        free(paths);
+        paths = NULL;
+    }
+    return paths;
+}
+
+/* rename, refusing to replace anything. */
+static int move_no_replace(const char *from, const char *to)
+{
+    if (renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0)
+        return 0;
+    if (errno != EINVAL && errno != ENOSYS)
+        return errno;
+    /* A file system without RENAME_NOREPLACE: check, then rename. */
+    struct stat info;
+    if (lstat(to, &info) == 0)
+        return EEXIST;
+    return rename(from, to) == 0 ? 0 : errno;
+}
+
+/* Reread the directory with name, if there, alone selected. */
+static void refresh_selecting(struct files *files, const char *name)
+{
+    load(files, name, files->cursor, true);
+    size_t index;
+    if (name && find_shown(&files->listing, name, &index))
+        select_only(files, index);
+    files->free_scroll = false;
+    desk_window_redraw(&files->window);
+}
+
+/* Renaming */
+
+/* Edit the name of the entry at index in place: all of it for a directory,
+   the part before the extension for a file. */
+static void start_rename(struct files *files, size_t index, bool created)
+{
+    if (index >= files->listing.shown_count)
+        return;
+    if (!files->writable) {
+        protected_notice(files, files->path);
+        return;
+    }
+    const struct entry *entry = shown_entry(files, index);
+    free(files->rename_name);
+    files->rename_name = strdup(entry->name);
+    if (!files->rename_name || !desk_text_set(&files->rename_field.text, entry->name))
+        return;
+    const char *dot = strrchr(entry->name, '.');
+    files->rename_field.text.anchor = 0;
+    files->rename_field.text.cursor = !entry->directory && dot && dot != entry->name ? (size_t)(dot - entry->name)
+                                                                                    : strlen(entry->name);
+    files->rename_field.scroll = 0;
+    files->renaming = true;
+    files->rename_created = created;
+    search_focus(files, false);
+    stop_path_edit(files);
+    select_only(files, index);
+    files->free_scroll = false;
+    desk_window_redraw(&files->window);
+}
+
+static void stop_rename(struct files *files)
+{
+    files->renaming = false;
+    if (files->selecting == &files->rename_field)
+        files->selecting = NULL;
+    free(files->rename_name);
+    files->rename_name = NULL;
+    desk_window_redraw(&files->window);
+}
+
+/* Enter, Tab or a click elsewhere: rename to what's typed. A name that
+   can't be used says why and keeps the field open. */
+static void finish_rename(struct files *files)
+{
+    if (!files->renaming)
+        return;
+    const char *name = field_text(&files->rename_field);
+    if (!name[0] || strcmp(name, files->rename_name) == 0) {
+        stop_rename(files);
+        return;
+    }
+    if (strchr(name, '/')) {
+        notify(files, "A name can't contain /");
+        return;
+    }
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        notify(files, "%s can't be used as a name", name);
+        return;
+    }
+    char *from = join_path(files->path, files->rename_name), *to = join_path(files->path, name);
+    int error = from && to ? move_no_replace(from, to) : ENOMEM;
+    if (error) {
+        if (error == EEXIST)
+            notify(files, "%s already exists", name);
+        else
+            notify(files, "Couldn't rename %s: %s", files->rename_name, strerror(error));
+        free(from);
+        free(to);
+        return;
+    }
+    if (files->rename_created) {
+        /* Undoing a new folder named on creation removes it by its new name. */
+        free(from);
+        undo_set(files, UNDO_CREATE, NULL, one_path(to), 1);
+        free(to);
+    } else {
+        char **froms = calloc(1, sizeof *froms), **tos = calloc(1, sizeof *tos);
+        if (froms && tos) {
+            froms[0] = from;
+            tos[0] = to;
+            undo_set(files, UNDO_RENAME, froms, tos, 1);
+        } else {
+            free(from);
+            free(to);
+            free(froms);
+            free(tos);
+        }
+    }
+    char *kept = strdup(name);
+    stop_rename(files);
+    refresh_selecting(files, kept);
+    free(kept);
+}
+
+/* Keys while a name is edited. */
+static int rename_key(struct files *files, uint32_t key, xkb_keysym_t sym, unsigned mods)
+{
+    switch (sym) {
+    case XKB_KEY_Escape:
+        stop_rename(files);
+        return 0;
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+    case XKB_KEY_Tab:
+        finish_rename(files);
+        return 0;
+    case XKB_KEY_Up:
+    case XKB_KEY_Down:
+    case XKB_KEY_Page_Up:
+    case XKB_KEY_Page_Down:
+        return 0;
+    default:
+        break;
+    }
+    bool changed;
+    return field_key(files, &files->rename_field, key, sym, mods, &changed);
+}
+
+/* New folder, New file: made as "New folder" (or "New folder 2"...), then
+   named in place. */
+static void create_item(struct files *files, bool folder)
+{
+    if (!files->writable) {
+        protected_notice(files, files->path);
+        return;
+    }
+    const char *base = folder ? "New folder" : "New file";
+    char name[64];
+    int error = EEXIST;
+    for (int n = 1; n < 1000 && error == EEXIST; ++n) {
+        if (n == 1)
+            snprintf(name, sizeof name, "%s", base);
+        else
+            snprintf(name, sizeof name, "%s %d", base, n);
+        char *path = join_path(files->path, name);
+        if (!path)
+            return;
+        if (folder) {
+            error = mkdir(path, 0777) == 0 ? 0 : errno;
+        } else {
+            int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+            error = fd >= 0 ? 0 : errno;
+            if (fd >= 0)
+                close(fd);
+        }
+        if (!error)
+            undo_set(files, UNDO_CREATE, NULL, one_path(path), 1);
+        free(path);
+    }
+    if (error) {
+        notify(files, "Couldn't make %s: %s", folder ? "a folder" : "a file", strerror(error));
+        return;
+    }
+    search_clear(files); /* Or it might not show. */
+    refresh_selecting(files, name);
+    size_t index;
+    if (find_shown(&files->listing, name, &index))
+        start_rename(files, index, true);
+}
+
+/* The trash */
+
+static char *trash_directory(const char *home)
+{
+    const char *data = getenv("XDG_DATA_HOME");
+    char *path = NULL;
+    if (data && data[0] == '/') {
+        if (asprintf(&path, "%s/Trash", data) < 0)
+            path = NULL;
+    } else if (home && asprintf(&path, "%s/.local/share/Trash", home) < 0) {
+        path = NULL;
+    }
+    return path;
+}
+
+/* The .trashinfo file for a name in the trash. */
+static char *trash_info_path(const struct files *files, const char *name)
+{
+    char *path = NULL;
+    if (asprintf(&path, "%s/info/%s.trashinfo", files->trash_dir, name) < 0)
+        return NULL;
+    return path;
+}
+
+/* Move path into the trash, as the freedesktop spec says: an info file
+   with where it came from and when, then the file itself, under a name
+   not yet used there. Sets *trashed to where it went. */
+static int trash_one(struct files *files, const char *path, char **trashed)
+{
+    *trashed = NULL;
+    if (!files->trash_dir)
+        return ENOENT;
+    struct stat item, trash;
+    if (lstat(path, &item) != 0)
+        return errno;
+    char *info_dir = NULL;
+    if (asprintf(&info_dir, "%s/info", files->trash_dir) < 0)
+        return ENOMEM;
+    char *files_dir = strdup(files->trash_files);
+    if (!files_dir) {
+        free(info_dir);
+        return ENOMEM;
+    }
+    make_private_directories(info_dir);
+    make_private_directories(files_dir);
+    free(info_dir);
+    free(files_dir);
+    if (stat(files->trash_files, &trash) != 0)
+        return errno;
+    if (item.st_dev != trash.st_dev)
+        return EXDEV; /* Only the home trash, on home's drive, for now. */
+
+    char *uri = path_uri(path);
+    if (!uri)
+        return ENOMEM;
+    char date[32];
+    time_t now = time(NULL);
+    strftime(date, sizeof date, "%Y-%m-%dT%H:%M:%S", localtime(&now));
+    const char *name = base_name(path), *dot = strrchr(name, '.');
+    size_t stem = dot && dot != name ? (size_t)(dot - name) : strlen(name);
+    int error = EEXIST;
+    for (int n = 1; n < 10000 && error == EEXIST; ++n) {
+        char *candidate = NULL;
+        if (n == 1 ? asprintf(&candidate, "%s", name) < 0
+                   : asprintf(&candidate, "%.*s.%d%s", (int)stem, name, n, name + stem) < 0) {
+            error = ENOMEM;
+            break;
+        }
+        char *info = trash_info_path(files, candidate), *target = join_path(files->trash_files, candidate);
+        free(candidate);
+        int fd = info && target ? open(info, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600) : -1;
+        struct stat taken;
+        if (fd < 0) {
+            error = info && target ? errno : ENOMEM;
+        } else if (lstat(target, &taken) == 0) {
+            close(fd);
+            unlink(info);
+            error = EEXIST;
+        } else {
+            dprintf(fd, "[Trash Info]\nPath=%s\nDeletionDate=%s\n", uri + strlen("file://"), date);
+            error = close(fd) == 0 ? 0 : errno;
+            if (!error && rename(path, target) != 0)
+                error = errno;
+            if (error)
+                unlink(info);
+            else
+                *trashed = target, target = NULL;
+        }
+        free(info);
+        free(target);
+    }
+    free(uri);
+    return error;
+}
+
+/* Where an item in the trash came from, from its info file. */
+static char *trash_origin(const struct files *files, const char *name)
+{
+    char *info = trash_info_path(files, name);
+    FILE *file = info ? fopen(info, "re") : NULL;
+    free(info);
+    if (!file)
+        return NULL;
+    char *line = NULL, *origin = NULL;
+    size_t capacity = 0;
+    ssize_t length;
+    while (!origin && (length = getline(&line, &capacity, file)) > 0) {
+        while (length && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+            line[--length] = 0;
+        if (strncmp(line, "Path=", 5) == 0 && line[5] == '/') {
+            char *uri = NULL;
+            if (asprintf(&uri, "file://%s", line + 5) >= 0)
+                origin = uri_path(uri, strlen(uri));
+            free(uri);
+        }
+    }
+    free(line);
+    fclose(file);
+    return origin;
+}
+
+/* Delete, outside the trash: move the selection there. */
+static void trash_selection(struct files *files)
+{
+    size_t count;
+    char **paths = selected_paths(files, &count);
+    if (!count) {
+        free(paths);
+        return;
+    }
+    if (!files->writable) {
+        protected_notice(files, files->path);
+        free_paths(paths, count);
+        return;
+    }
+    char **trashed = calloc(count, sizeof *trashed);
+    char **from = calloc(count, sizeof *from);
+    size_t moved = 0;
+    int first_error = 0;
+    const char *failed = NULL;
+    for (size_t i = 0; trashed && from && i < count; ++i) {
+        char *to;
+        int error = trash_one(files, paths[i], &to);
+        if (error) {
+            if (!first_error) {
+                first_error = error;
+                failed = paths[i];
+            }
+            continue;
+        }
+        from[moved] = paths[i];
+        trashed[moved++] = to;
+        paths[i] = NULL;
+    }
+    if (moved) {
+        if (moved == 1)
+            notify(files, "Moved %s to the trash. Ctrl+Z puts it back", base_name(from[0]));
+        else
+            notify(files, "Moved %zu items to the trash. Ctrl+Z puts them back", moved);
+        undo_set(files, UNDO_TRASH, from, trashed, moved);
+    } else {
+        free(from);
+        free(trashed);
+    }
+    if (first_error == EXDEV)
+        notify(files, "%s is on another drive, which has no trash yet; Shift+Delete deletes it", base_name(failed));
+    else if (first_error)
+        notify(files, "Couldn't move %s to the trash: %s", base_name(failed), strerror(first_error));
+    free_paths(paths, count);
+    refresh(files);
+}
+
+/* Put items from the trash back where they came from. */
+static void restore_selection(struct files *files)
+{
+    size_t count;
+    char **paths = selected_paths(files, &count);
+    size_t restored = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const char *name = base_name(paths[i]);
+        char *origin = trash_origin(files, name);
+        if (!origin) {
+            notify(files, "Where %s came from isn't known", name);
+            continue;
+        }
+        char *parent = parent_path(origin);
+        char *ancestor = parent ? existing(strdup(parent)) : NULL;
+        if (!ancestor || !may_modify(files, ancestor)) {
+            protected_notice(files, parent ? parent : origin);
+        } else {
+            if (strcmp(ancestor, parent) != 0) {
+                /* Its folder went too: make it again. */
+                char *made = strdup(parent);
+                if (made) {
+                    for (char *at = made + strlen(ancestor) + 1; *at; ++at) {
+                        if (*at == '/') {
+                            *at = 0;
+                            mkdir(made, 0777);
+                            *at = '/';
+                        }
+                    }
+                    mkdir(made, 0777);
+                }
+                free(made);
+            }
+            int error = move_no_replace(paths[i], origin);
+            if (error == EEXIST) {
+                notify(files, "%s already exists", origin);
+            } else if (error) {
+                notify(files, "Couldn't restore %s: %s", name, strerror(error));
+            } else {
+                char *info = trash_info_path(files, name);
+                if (info)
+                    unlink(info);
+                free(info);
+                ++restored;
+            }
+        }
+        free(ancestor);
+        free(parent);
+        free(origin);
+    }
+    if (restored)
+        notify(files, restored == 1 ? "Restored %zu item" : "Restored %zu items", restored);
+    free_paths(paths, count);
+    undo_forget(files);
+    refresh(files);
+}
+
+/* Deleting for good */
+
+/* Remove name in directory fd and everything under it, never following a
+   link and never leaving the file system it's on, like rm -r
+   --one-file-system. Returns the first error. */
+static int remove_at(int directory, const char *name, dev_t device)
+{
+    struct stat info;
+    if (fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : errno;
+    if (!S_ISDIR(info.st_mode))
+        return unlinkat(directory, name, 0) == 0 ? 0 : errno;
+    if (info.st_dev != device)
+        return EXDEV; /* A mount point: what's mounted there stays. */
+    int fd = openat(directory, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno;
+    DIR *dir = fdopendir(fd);
+    if (!dir) {
+        int error = errno;
+        close(fd);
+        return error;
+    }
+    int first = 0;
+    struct dirent *item;
+    while ((item = readdir(dir))) {
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
+            continue;
+        int error = remove_at(fd, item->d_name, device);
+        if (error && !first)
+            first = error;
+    }
+    closedir(dir);
+    if (unlinkat(directory, name, AT_REMOVEDIR) != 0 && !first)
+        first = errno;
+    return first;
+}
+
+static int remove_path(const char *path)
+{
+    char *parent = parent_path(path);
+    int fd = parent ? open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+    free(parent);
+    if (fd < 0)
+        return errno;
+    struct stat info;
+    int error = fstatat(fd, base_name(path), &info, AT_SYMLINK_NOFOLLOW) == 0 ? remove_at(fd, base_name(path), info.st_dev)
+                                                                            : errno;
+    close(fd);
+    return error;
+}
+
+enum { DIALOG_DELETE, DIALOG_EMPTY_TRASH };
+
+static void open_dialog(struct files *files, int action, char **paths, size_t count, const char *confirm,
+                        const char *title, const char *message)
+{
+    struct dialog *dialog = &files->dialog;
+    free_paths(dialog->paths, dialog->count);
+    *dialog = (struct dialog){.open = true, .action = action, .paths = paths, .count = count};
+    snprintf(dialog->title, sizeof dialog->title, "%s", title);
+    snprintf(dialog->message, sizeof dialog->message, "%s", message);
+    snprintf(dialog->confirm, sizeof dialog->confirm, "%s", confirm);
+    close_menus(files);
+    stop_rename(files);
+    desk_window_redraw(&files->window);
+}
+
+static void close_dialog(struct files *files)
+{
+    struct dialog *dialog = &files->dialog;
+    free_paths(dialog->paths, dialog->count);
+    *dialog = (struct dialog){0};
+    desk_window_redraw(&files->window);
+}
+
+/* Shift+Delete, or Delete in the trash: ask, then delete for good. */
+static void ask_delete(struct files *files)
+{
+    size_t count;
+    char **paths = selected_paths(files, &count);
+    if (!count) {
+        free(paths);
+        return;
+    }
+    if (!files->writable) {
+        protected_notice(files, files->path);
+        free_paths(paths, count);
+        return;
+    }
+    char title[300];
+    if (count == 1)
+        snprintf(title, sizeof title, "Delete %s permanently?", base_name(paths[0]));
+    else
+        snprintf(title, sizeof title, "Delete %zu items permanently?", count);
+    open_dialog(files, DIALOG_DELETE, paths, count, "Delete", title,
+                count == 1 && shown_entry(files, files->cursor)->directory
+                    ? "It and everything in it will be gone. This can't be undone."
+                    : "This can't be undone.");
+}
+
+static void ask_empty_trash(struct files *files)
+{
+    DIR *dir = files->trash_files ? opendir(files->trash_files) : NULL;
+    size_t count = 0;
+    struct dirent *item;
+    while (dir && (item = readdir(dir)))
+        count += strcmp(item->d_name, ".") != 0 && strcmp(item->d_name, "..") != 0;
+    if (dir)
+        closedir(dir);
+    if (!count) {
+        notify(files, "The trash is empty");
+        return;
+    }
+    char message[100];
+    snprintf(message, sizeof message, count == 1 ? "%zu item will be deleted permanently."
+                                                 : "%zu items will be deleted permanently.", count);
+    open_dialog(files, DIALOG_EMPTY_TRASH, NULL, 0, "Empty trash", "Empty the trash?", message);
+}
+
+/* Remove everything in a directory, keeping it. */
+static int empty_directory(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : errno;
+    struct stat self;
+    DIR *dir = fstat(fd, &self) == 0 ? fdopendir(fd) : NULL;
+    if (!dir) {
+        close(fd);
+        return errno;
+    }
+    int first = 0;
+    struct dirent *item;
+    while ((item = readdir(dir))) {
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
+            continue;
+        int error = remove_at(dirfd(dir), item->d_name, self.st_dev);
+        if (error && !first)
+            first = error;
+    }
+    closedir(dir);
+    return first;
+}
+
+/* The dialog's button: do what it asked. */
+static void dialog_confirmed(struct files *files)
+{
+    struct dialog *dialog = &files->dialog;
+    int action = dialog->action;
+    char **paths = dialog->paths;
+    size_t count = dialog->count;
+    dialog->paths = NULL;
+    dialog->count = 0;
+    close_dialog(files);
+    if (action == DIALOG_EMPTY_TRASH) {
+        char *info = NULL;
+        int error = files->trash_files ? empty_directory(files->trash_files) : ENOENT;
+        if (asprintf(&info, "%s/info", files->trash_dir) >= 0)
+            empty_directory(info);
+        free(info);
+        char *sizes = NULL;
+        if (asprintf(&sizes, "%s/directorysizes", files->trash_dir) >= 0)
+            unlink(sizes);
+        free(sizes);
+        if (error)
+            notify(files, "Couldn't empty all of the trash: %s", strerror(error));
+        undo_forget(files);
+        refresh(files);
+        return;
+    }
+    size_t deleted = 0;
+    for (size_t i = 0; i < count; ++i) {
+        char *parent = parent_path(paths[i]);
+        bool allowed = parent && may_modify(files, parent);
+        free(parent);
+        if (!allowed) {
+            protected_notice(files, paths[i]);
+            continue;
+        }
+        int error = remove_path(paths[i]);
+        if (error == EXDEV)
+            notify(files, "%s has another drive mounted in it, which was left alone", base_name(paths[i]));
+        else if (error)
+            notify(files, "Couldn't delete all of %s: %s", base_name(paths[i]), strerror(error));
+        else
+            ++deleted;
+        if (in_trash(files)) {
+            char *info = trash_info_path(files, base_name(paths[i]));
+            if (info && error == 0)
+                unlink(info);
+            free(info);
+        }
+    }
+    if (!count)
+        ;
+    else if (deleted == count && count == 1)
+        notify(files, "Deleted %s", base_name(paths[0]));
+    else if (deleted == count)
+        notify(files, "Deleted %zu items", count);
+    free_paths(paths, count);
+    undo_forget(files);
+    refresh(files);
+}
+
+/* Ctrl+Z: undo the last rename, new folder or file, or move to the trash. */
+static void undo(struct files *files)
+{
+    struct undo *undo = &files->undo;
+    int error = 0;
+    const char *what = NULL;
+    switch (undo->kind) {
+    case UNDO_NONE:
+        notify(files, "Nothing to undo");
+        return;
+    case UNDO_RENAME:
+        error = move_no_replace(undo->to[0], undo->from[0]);
+        what = "Rename undone";
+        break;
+    case UNDO_CREATE: {
+        struct stat info;
+        if (lstat(undo->to[0], &info) != 0)
+            error = errno;
+        else if (S_ISDIR(info.st_mode) ? rmdir(undo->to[0]) != 0 : info.st_size ? (errno = ENOTEMPTY, 1)
+                                                                              : unlink(undo->to[0]) != 0)
+            error = errno;
+        what = S_ISDIR(info.st_mode) ? "New folder removed" : "New file removed";
+        if (error == ENOTEMPTY || error == EEXIST) {
+            notify(files, "%s has something in it now, so it stays", base_name(undo->to[0]));
+            undo_forget(files);
+            return;
+        }
+        break;
+    }
+    case UNDO_TRASH:
+        for (size_t i = 0; i < undo->count; ++i) {
+            int failed = move_no_replace(undo->to[i], undo->from[i]);
+            if (failed) {
+                if (!error)
+                    error = failed;
+                continue;
+            }
+            char *info = trash_info_path(files, base_name(undo->to[i]));
+            if (info)
+                unlink(info);
+            free(info);
+        }
+        what = "Put back from the trash";
+        break;
+    }
+    char *select = undo->kind == UNDO_RENAME || undo->kind == UNDO_TRASH ? strdup(base_name(undo->from[0])) : NULL;
+    if (error)
+        notify(files, "Couldn't undo: %s", error == EEXIST ? "something has taken its name" : strerror(error));
+    else
+        notify(files, "%s", what);
+    undo_forget(files);
+    refresh_selecting(files, select);
+    free(select);
+}
+
+/* Keys while the dialog is open: nothing else gets them. */
+static void dialog_key(struct files *files, xkb_keysym_t sym)
+{
+    struct dialog *dialog = &files->dialog;
+    switch (sym) {
+    case XKB_KEY_Escape:
+        close_dialog(files);
+        break;
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+    case XKB_KEY_space:
+        if (dialog->focus == 1)
+            dialog_confirmed(files);
+        else
+            close_dialog(files);
+        break;
+    case XKB_KEY_Tab:
+    case XKB_KEY_ISO_Left_Tab:
+    case XKB_KEY_Left:
+    case XKB_KEY_Right:
+        dialog->focus = !dialog->focus;
+        desk_window_redraw(&files->window);
+        break;
+    default:
+        break;
+    }
+}
+
 /* Keys */
 
 static void menu_key(struct files *files, xkb_keysym_t sym);
@@ -2951,6 +3730,12 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         case XKB_KEY_KP_Subtract: zoom(files, -1); return true;
         case XKB_KEY_0:
         case XKB_KEY_KP_0: zoom(files, 0); return false;
+        case XKB_KEY_z: undo(files); return false;
+        case XKB_KEY_N: create_item(files, true); return false;
+        case XKB_KEY_n:
+            if (mods & DESK_MOD_SHIFT)
+                create_item(files, true);
+            return false;
         case XKB_KEY_a:
         case XKB_KEY_A:
             for (size_t i = 0; i < files->listing.shown_count; ++i)
@@ -3032,6 +3817,17 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
     case XKB_KEY_F5:
         refresh(files);
         return false;
+    case XKB_KEY_F2:
+        if (selected_count(files) <= 1 && cursor_entry(files))
+            start_rename(files, files->cursor, false);
+        return false;
+    case XKB_KEY_Delete:
+    case XKB_KEY_KP_Delete:
+        if ((mods & DESK_MOD_SHIFT) || in_trash(files))
+            ask_delete(files);
+        else
+            trash_selection(files);
+        return false;
     case XKB_KEY_F9:
         toggle_sidebar(files);
         return false;
@@ -3107,9 +3903,20 @@ static bool handle_key(struct files *files, uint32_t key)
     xkb_keysym_t sym = desk_keyboard_sym(&files->keyboard, key);
     unsigned mods = desk_keyboard_mods(&files->keyboard);
     clear_notice(files);
+    if (files->dialog.open) {
+        dialog_key(files, sym);
+        return false;
+    }
     if (files->menus[0].open) {
         menu_key(files, sym);
         return false;
+    }
+    if (files->renaming) {
+        int repeats = rename_key(files, key, sym, mods);
+        if (repeats >= 0)
+            return repeats;
+        if (!(mods & (DESK_MOD_CTRL | DESK_MOD_ALT | DESK_MOD_LOGO)))
+            return false; /* Typing goes to the name, not type to select. */
     }
     if (sym == XKB_KEY_Menu || (sym == XKB_KEY_F10 && (mods & DESK_MOD_SHIFT))) {
         context_key(files);
@@ -3535,6 +4342,7 @@ static void outline(DeskCanvas *canvas, int x, int y, int width, int height, int
    cursor's outline shows (when it isn't simply the one selected). */
 struct marks {
     bool selected, hovered, focused;
+    bool renaming;          /* Its name is being edited. */
 };
 
 static struct marks entry_marks(struct files *files, size_t index, size_t selected)
@@ -3544,6 +4352,7 @@ static struct marks entry_marks(struct files *files, size_t index, size_t select
         .selected = entry->selected,
         .hovered = hovering(files, TARGET_ROW, index) && !files->banding,
         .focused = index == files->cursor && (!entry->selected || selected > 1),
+        .renaming = files->renaming && files->rename_name && strcmp(entry->name, files->rename_name) == 0,
     };
 }
 
@@ -3563,6 +4372,23 @@ static void draw_marks(struct files *files, DeskCanvas *canvas, struct marks mar
                 mix(colors->background, colors->directory, 150));
 }
 
+static void draw_field(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct field *field,
+                       int left, int right, int top, bool focused, const char *placeholder);
+
+/* The field a name is edited in, between left and right on the line at
+   top. */
+static void paint_rename(struct files *files, DeskCanvas *canvas, const struct layout *layout, int left, int right,
+                         int top)
+{
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    int inner = layout->padding / 4;
+    desk_canvas_fill(canvas, left, top, right - left, layout->row_height, files->colors.background);
+    outline(canvas, left, top, right - left, layout->row_height, line, files->colors.directory);
+    draw_field(files, canvas, layout, &files->rename_field, left + inner + line, right - inner - line, top, true, NULL);
+    files->rename_top = top;
+    files->rename_bottom = top + layout->row_height;
+}
+
 static void draw_row(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct entry *entry,
                      int x0, int x1, int y, struct marks marks)
 {
@@ -3576,7 +4402,9 @@ static void draw_row(struct files *files, DeskCanvas *canvas, const struct layou
               entry_icon(entry), color);
 
     int name_x = x0 + inner + layout->icon_width, name_right = panes->column_right[COLUMN_NAME];
-    if (name_right > name_x) {
+    if (marks.renaming && name_right > name_x) {
+        paint_rename(files, canvas, layout, name_x - inner / 2, name_right, y);
+    } else if (name_right > name_x) {
         DeskCanvas clipped = *canvas;
         desk_canvas_clip(&clipped, name_x > canvas->clip_left ? name_x : canvas->clip_left, canvas->clip_top,
                          name_right < canvas->clip_right ? name_right : canvas->clip_right, canvas->clip_bottom);
@@ -3705,6 +4533,10 @@ static void paint_icons(struct files *files, DeskCanvas *canvas, const struct la
                              canvas->clip_top,
                              left + tile - pad < canvas->clip_right ? left + tile - pad : canvas->clip_right,
                              canvas->clip_bottom);
+            if (marks.renaming) {
+                paint_rename(files, canvas, ui, left + pad / 2, left + tile - pad / 2, baseline - ui->baseline);
+                continue;
+            }
             int first = desk_text_width(font, entry->name, cut);
             desk_text_draw(font, &clipped, left + (tile - first) / 2, baseline, entry->name, cut, color);
             if (cut < length) {
@@ -3909,7 +4741,7 @@ static void draw_field(struct files *files, DeskCanvas *canvas, const struct lay
     if (focused && desk_text_selection(&field->text, &start, &end)) {
         int from = desk_text_width(layout->font, text, start), to = desk_text_width(layout->font, text, end);
         desk_canvas_fill(&clipped, field->text_x + from, top + space / 2, to - from, height - space,
-                         colors->selection_background);
+                         mix(colors->selection_background, colors->directory, 90));
     }
     desk_text_draw(layout->font, &clipped, field->text_x, baseline, text, strlen(text), colors->foreground);
     if (focused)
@@ -4114,6 +4946,7 @@ static void paint_notice(struct files *files, DeskCanvas *canvas, const struct l
 
 static void paint(struct files *files, DeskCanvas *canvas)
 {
+    files->rename_top = files->rename_bottom = -1;
     const struct colors *colors = &files->colors;
     double scale = desk_window_scale(&files->window);
     fonts_resize(files);
@@ -4257,6 +5090,53 @@ static void paint_suggestions(struct files *files, DeskCanvas *canvas)
     }
 }
 
+/* The dialog: the window dimmed, a box with the question, and Cancel and
+   the button that does it, which is red. */
+static void paint_dialog(struct files *files, DeskCanvas *canvas)
+{
+    struct dialog *dialog = &files->dialog;
+    if (!dialog->open)
+        return;
+    const struct colors *colors = &files->colors;
+    double scale = desk_window_scale(&files->window);
+    struct layout ui = make_layout(files->font, files->italic, files->mono, scale);
+    int line = scale >= 2 ? (int)scale : 1, pad = ui.padding, row = ui.row_height;
+    desk_canvas_fill(canvas, 0, 0, canvas->width, canvas->height, 0x80000000);
+    int width = (int)lround(440 * scale);
+    if (width > canvas->width - 2 * pad)
+        width = canvas->width - 2 * pad;
+    int height = pad + 2 * row + pad + row + pad;
+    int left = (canvas->width - width) / 2, top = (canvas->height - height) / 3;
+    uint32_t background = mix(colors->background, colors->muted, 25);
+    desk_canvas_fill(canvas, left, top, width, height, background);
+    outline(canvas, left, top, width, height, line, mix(colors->background, colors->muted, 110));
+    draw_clipped(ui.font, canvas, left + pad, left + width - pad, top + pad + ui.baseline, dialog->title,
+                 colors->foreground);
+    draw_clipped(ui.font, canvas, left + pad, left + width - pad, top + pad + row + ui.baseline, dialog->message,
+                 colors->muted);
+    const char *labels[2] = {"Cancel", dialog->confirm};
+    int right = left + width - pad, button_top = top + height - pad - row;
+    dialog->button_top = button_top;
+    dialog->button_bottom = button_top + row;
+    for (int i = 1; i >= 0; --i) {
+        int text = desk_text_width(ui.font, labels[i], strlen(labels[i]));
+        int button = text + 2 * pad > (int)lround(90 * scale) ? text + 2 * pad : (int)lround(90 * scale);
+        dialog->button_left[i] = right - button;
+        dialog->button_right[i] = right;
+        bool lit = hovering(files, TARGET_DIALOG_BUTTON, (size_t)i);
+        uint32_t fill = i == 1 ? colors->urgent : mix(colors->background, colors->muted, 60);
+        if (lit)
+            fill = mix(fill, colors->foreground, 40);
+        desk_canvas_fill(canvas, right - button, button_top, button, row, fill);
+        if (dialog->focus == i)
+            outline(canvas, right - button - 2 * line, button_top - 2 * line, button + 4 * line, row + 4 * line, line,
+                    colors->foreground);
+        desk_text_draw(ui.font, canvas, right - button + (button - text) / 2, button_top + ui.baseline, labels[i],
+                       strlen(labels[i]), i == 1 ? colors->background : colors->foreground);
+        right -= button + pad;
+    }
+}
+
 static void draw(void *data, DeskWindow *window)
 {
     struct files *files = data;
@@ -4266,6 +5146,7 @@ static void draw(void *data, DeskWindow *window)
     DeskCanvas canvas = desk_canvas(buffer->pixels, buffer->width, buffer->height);
     paint(files, &canvas);
     paint_suggestions(files, &canvas);
+    paint_dialog(files, &canvas);
     desk_window_commit(window, buffer);
 }
 
@@ -4409,6 +5290,19 @@ static struct target target_at(const struct files *files)
     const struct toolbar *bar = &files->toolbar;
     const struct panes *panes = &files->panes;
     int x = pointer_buffer_x(files), y = pointer_buffer_y(files);
+    if (files->dialog.open) {
+        /* Modal: only its buttons. */
+        const struct dialog *dialog = &files->dialog;
+        for (int i = 0; i < 2; ++i) {
+            if (y >= dialog->button_top && y < dialog->button_bottom && x >= dialog->button_left[i] &&
+                x < dialog->button_right[i])
+                return (struct target){TARGET_DIALOG_BUTTON, (size_t)i};
+        }
+        return (struct target){TARGET_NONE, 0};
+    }
+    if (files->renaming && files->rename_bottom >= 0 && y >= files->rename_top && y < files->rename_bottom &&
+        x >= files->rename_field.left - files->panes.line_height / 4 && x < files->rename_field.right)
+        return (struct target){TARGET_RENAME, 0};
     if (files->path_editing && files->suggestion_count && bar->suggest_row > 0 && x >= bar->suggest_left &&
         x < bar->suggest_right && y >= bar->suggest_top) {
         size_t row = (size_t)((y - bar->suggest_top) / bar->suggest_row);
@@ -4738,6 +5632,14 @@ enum {
     MENU_SORT,            /* index: COLUMN_ */
     MENU_DESCENDING,
     MENU_REFRESH,
+    MENU_RENAME,
+    MENU_TRASH,
+    MENU_DELETE,
+    MENU_RESTORE,
+    MENU_EMPTY_TRASH,
+    MENU_NEW_FOLDER,
+    MENU_NEW_FILE,
+    MENU_UNDO,
     MENU_NOTHING,         /* A disabled line such as "No applications". */
 };
 
@@ -4766,14 +5668,17 @@ static void menu_measure(struct files *files, struct menu *menu)
     menu->item_height = (int)lround(font * 1.9);
     menu->separator_height = (int)lround(font * 0.7);
     menu->padding = 4;
-    int widest = 0;
+    int widest = 0, widest_key = 0;
     for (size_t i = 0; i < menu->count; ++i) {
         int width = desk_text_width(files->font, menu->items[i].label, strlen(menu->items[i].label));
+        int key = desk_text_width(files->font, menu->items[i].shortcut, strlen(menu->items[i].shortcut));
         if (width > widest)
             widest = width;
+        if (key > widest_key)
+            widest_key = key;
     }
-    /* A check column, the label, a gap and the submenu arrow. */
-    int text = (int)lround(widest / scale);
+    /* A check column, the label, a gap, the shortcut and the submenu arrow. */
+    int text = (int)lround((widest + (widest_key ? widest_key + 2 * font_pixels(files) : 0)) / scale);
     menu->width = text + 2 * menu->item_height + 24;
     if (menu->width < 180)
         menu->width = 180;
@@ -4872,6 +5777,9 @@ static void paint_menu(struct files *files, struct menu *menu, DeskCanvas *canva
             draw_check(canvas, (column - size) / 2 + line * 2, top + (item_height - size) / 2, size, color, behind);
         }
         draw_clipped(files->font, canvas, column, canvas->width - column, baseline, item->label, color);
+        if (item->shortcut[0])
+            draw_right(files->font, canvas, column, canvas->width - column, baseline, item->shortcut,
+                       lit ? color : colors->muted);
         if (item->submenu) {
             int half = item_height / 6, x = canvas->width - column / 2, y = top + item_height / 2;
             for (int row = -half; row <= half; ++row) {
@@ -5034,7 +5942,19 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
     files->menu_directory = directory;
     if (!files->menu_path)
         return false;
+    bool writable = files->writable;
     if (context == CONTEXT_BACKGROUND) {
+        if (in_trash(files)) {
+            menu_add(menu, MENU_EMPTY_TRASH, 0, "Empty trash")->enabled = files->listing.count > 0;
+        } else {
+            struct menu_item *item = menu_add(menu, MENU_NEW_FOLDER, 0, "New folder");
+            item->enabled = writable;
+            snprintf(item->shortcut, sizeof item->shortcut, "Ctrl+Shift+N");
+            menu_add(menu, MENU_NEW_FILE, 0, "New file")->enabled = writable;
+        }
+        if (files->undo.kind != UNDO_NONE)
+            snprintf(menu_add(menu, MENU_UNDO, 0, "Undo")->shortcut, sizeof menu->items[0].shortcut, "Ctrl+Z");
+        menu_separator(menu);
         menu_add(menu, MENU_HIDDEN, 0, "Show hidden files")->checked = files->show_hidden;
         menu_add(menu, MENU_SORT_LIST, 0, "Sort by")->submenu = true;
         menu_separator(menu);
@@ -5048,6 +5968,28 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
             menu_add(menu, MENU_OPEN_WITH_LIST, 0, "Open with")->submenu = true;
             if (executable)
                 menu_add(menu, MENU_RUN, 0, "Run");
+        }
+        if (context == CONTEXT_ENTRY) {
+            menu_separator(menu);
+            size_t selected = selected_count(files);
+            struct menu_item *item;
+            if (in_trash(files)) {
+                menu_add(menu, MENU_RESTORE, 0, "Restore");
+                item = menu_add(menu, MENU_DELETE, 0, "Delete permanently");
+                snprintf(item->shortcut, sizeof item->shortcut, "Delete");
+            } else {
+                item = menu_add(menu, MENU_RENAME, 0, "Rename");
+                item->enabled = writable && selected <= 1;
+                snprintf(item->shortcut, sizeof item->shortcut, "F2");
+                item = menu_add(menu, MENU_TRASH, 0, "Move to trash");
+                item->enabled = writable;
+                snprintf(item->shortcut, sizeof item->shortcut, "Delete");
+                item = menu_add(menu, MENU_DELETE, 0, "Delete permanently");
+                item->enabled = writable;
+                snprintf(item->shortcut, sizeof item->shortcut, "Shift+Delete");
+            }
+        } else if (files->trash_files && strcmp(path, files->trash_files) == 0) {
+            menu_add(menu, MENU_EMPTY_TRASH, 0, "Empty trash");
         }
         menu_separator(menu);
         menu_add(menu, MENU_COPY_PATH, 0, "Copy path");
@@ -5164,6 +6106,28 @@ static void menu_choose(struct files *files, struct menu *menu, int index, bool 
     case MENU_REFRESH:
         refresh(files);
         break;
+    case MENU_RENAME:
+        start_rename(files, files->cursor, false);
+        break;
+    case MENU_TRASH:
+        trash_selection(files);
+        break;
+    case MENU_DELETE:
+        ask_delete(files);
+        break;
+    case MENU_RESTORE:
+        restore_selection(files);
+        break;
+    case MENU_EMPTY_TRASH:
+        ask_empty_trash(files);
+        break;
+    case MENU_NEW_FOLDER:
+    case MENU_NEW_FILE:
+        create_item(files, action == MENU_NEW_FOLDER);
+        break;
+    case MENU_UNDO:
+        undo(files);
+        break;
     default:
         break;
     }
@@ -5252,6 +6216,14 @@ static void menu_key(struct files *files, xkb_keysym_t sym)
 /* The right-click menu for what's at the pointer in the window. */
 static void context_click(struct files *files, struct target target)
 {
+    if (files->dialog.open)
+        return;
+    if (files->renaming) {
+        finish_rename(files);
+        if (files->renaming)
+            return;
+        target = target_at(files);
+    }
     int x = (int)lround(files->pointer_x), y = (int)lround(files->pointer_y);
     if (target.kind == TARGET_ROW) {
         /* On the selection it stays; elsewhere that entry alone is selected. */
@@ -5471,6 +6443,24 @@ static void click(struct files *files, uint32_t time)
 {
     struct target target = target_at(files);
     unsigned mods = desk_keyboard_mods(&files->keyboard);
+    if (files->dialog.open) {
+        if (target.kind == TARGET_DIALOG_BUTTON) {
+            if (target.index == 1)
+                dialog_confirmed(files);
+            else
+                close_dialog(files);
+        }
+        update_hover(files, true);
+        return;
+    }
+    if (files->renaming && target.kind != TARGET_RENAME) {
+        /* A click elsewhere takes the name as typed; one that can't be used
+           keeps the field, and the click does nothing else. */
+        finish_rename(files);
+        if (files->renaming)
+            return;
+        target = target_at(files);
+    }
     bool twice = target.kind != TARGET_NONE && target.kind == files->press.kind &&
                  target.index == files->press.index && time - files->press_time < DOUBLE_CLICK_MS;
     files->press = target;
@@ -5546,6 +6536,11 @@ static void click(struct files *files, uint32_t time)
     case TARGET_HEADING:
         sort_by(files, (enum column)target.index);
         break;
+    case TARGET_RENAME:
+        field_press(files, &files->rename_field, twice);
+        break;
+    case TARGET_DIALOG_BUTTON:
+        break;
     case TARGET_COLUMN_EDGE:
         if (twice) {
             files->press.kind = TARGET_NONE;
@@ -5571,6 +6566,8 @@ static void click(struct files *files, uint32_t time)
 static void middle_click(struct files *files)
 {
     struct target target = target_at(files);
+    if (files->dialog.open)
+        return;
     char *path = NULL;
     if (target.kind == TARGET_TAB || target.kind == TARGET_TAB_CLOSE) {
         close_tab(files, target.index);
@@ -6135,6 +7132,21 @@ int main(int argc, char **argv)
     files.mounts = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
     files.sizer = sizer_create(); /* Without it, directories just show no size. */
     files.thumbs_dir = thumbnails_directory(files.home);
+    files.trash_dir = trash_directory(files.home);
+    if (files.trash_dir && asprintf(&files.trash_files, "%s/files", files.trash_dir) >= 0) {
+        /* Made now, so the Trash place is there from the start. */
+        char *made = strdup(files.trash_files);
+        if (made)
+            make_private_directories(made);
+        free(made);
+        if (asprintf(&made, "%s/info", files.trash_dir) >= 0) {
+            make_private_directories(made);
+            free(made);
+        }
+        files.trash_real = realpath(files.trash_dir, NULL);
+    } else {
+        files.trash_files = NULL;
+    }
     files.thumbnailer = thumbnailer_create(files.thumbs_dir); /* Without it, images show their icon. */
     files.terminal = terminal_command();
     files.bookmarks_path = bookmarks_file();
@@ -6167,6 +7179,13 @@ int main(int argc, char **argv)
     thumbs_clear(&files);
     thumbnailer_destroy(files.thumbnailer);
     free(files.thumbs_dir);
+    free(files.trash_dir);
+    free(files.trash_files);
+    free(files.trash_real);
+    free(files.rename_name);
+    desk_text_free(&files.rename_field.text);
+    close_dialog(&files);
+    undo_forget(&files);
     free(files.sized_path);
     free(files.terminal);
     free(files.bookmarks_path);

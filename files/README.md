@@ -44,6 +44,11 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Ctrl with the moving keys | Move without changing the selection (an outline shows where) |
 | Ctrl+Space | Add the entry under the outline to the selection, or take it out |
 | Ctrl+A | Select everything shown |
+| F2 | Rename the selected entry, in place |
+| Delete | Move the selection to the trash (in the trash: delete it permanently, after asking) |
+| Shift+Delete | Delete the selection permanently, after asking |
+| Ctrl+Shift+N | New folder |
+| Ctrl+Z | Undo the last rename, new folder or file, or move to the trash |
 | Enter | Open: into a directory, or a file with its application (see Opening files) |
 | Backspace, Alt+Up | Up to the parent, with the directory you came from selected |
 | Alt+Left, Alt+Right | Back, forward through the directories visited |
@@ -96,16 +101,28 @@ Programs aren't run by double-clicking: an executable opens like any other file 
 
 | Right-click on | Menu |
 |---|---|
-| A file | Open, Open with ▸ (the applications for its type, the default first), Run (executables), Copy path |
-| A folder | Open, Open in new tab, Copy path, Add to sidebar |
-| A place in the sidebar | Open, Open in new tab, Copy path, Remove from sidebar (bookmarks) |
-| The empty part of the list | Show hidden files, Sort by ▸ (Name, Type, Size, Modified, Descending), Refresh, Copy path (of the folder) |
+| A file | Open, Open with ▸ (the applications for its type, the default first), Run (executables), Rename, Move to trash, Delete permanently, Copy path |
+| A folder | Open, Open in new tab, Rename, Move to trash, Delete permanently, Copy path, Add to sidebar |
+| Something in the trash | Open, Restore, Delete permanently, Copy path |
+| A place in the sidebar | Open, Open in new tab, Empty trash (the Trash), Copy path, Remove from sidebar (bookmarks) |
+| The empty part of the list | New folder, New file (Empty trash in the trash), Undo when there's something to undo, Show hidden files, Sort by ▸ (Name, Type, Size, Modified, Descending), Refresh, Copy path (of the folder) |
+
+Items show their keys on the right. Right-clicking an entry that's part of the selection keeps the selection, and Move to trash and Delete permanently act on all of it. Outside home, the items that would change something are greyed out.
 
 It's a popup the compositor places, so it flips or slides to stay on screen; a click outside closes it. Hovering an item with ▸ opens its submenu. From the keyboard: Up and Down choose, Right opens a submenu, Left or Escape closes it, Enter or Space picks.
 
 - **Run** starts a script (text with `#!`) in the terminal so its output shows, and a program on its own.
 - **Copy path** puts the full path on the clipboard as text, until something else is copied.
 - **Add to sidebar** adds the folder to GTK's bookmarks (`~/.config/gtk-3.0/bookmarks`), so GTK file dialogs and other file managers show it too. Bookmarks appear under a Bookmarks heading in the sidebar.
+
+## Changing files
+
+- **Rename** (F2) turns the name into a field: in the list over the name column, in the icon view over the label. For a file the part before the extension is selected, so typing replaces just that; a folder's whole name is. Enter, Tab or a click elsewhere renames, Escape leaves it as it was. A name that's taken, empty, or has a `/` in it says so and keeps the field open. Renaming never replaces anything.
+- **New folder** and **New file** make "New folder" (or "New folder 2" and so on) in the current directory, select it and start renaming it. The search is cleared first, so it shows.
+- **Move to trash** (Delete) uses the freedesktop trash in `~/.local/share/Trash`, so other file managers and `gio trash --list` see the same items: each gets an info file with where it came from and when, and a name not yet used there (`notes.2.txt`). Only the home drive's trash is used for now: something on another drive can't be trashed and the message says Shift+Delete deletes it.
+- **The Trash** is a place in the sidebar. Right-clicking in it offers Restore, which puts an item back where it came from (making its folder again if that went too, and refusing to replace anything), Delete permanently, and Empty trash.
+- **Delete permanently** (Shift+Delete) asks first, over the window: "Delete report.pdf permanently?" with Cancel, which has the focus, and Delete. Tab or the arrows move between them, Enter picks, Escape cancels. Deleting never follows a symlink (a link to `/` inside a folder removes the link, not `/`) and never goes into another mounted file system, like `rm -r --one-file-system`. It runs in the window for now; a big folder holds it until done (a progress bar comes with copying).
+- **Undo** (Ctrl+Z) reverses the last rename, new folder or file (only while it's still empty), or move to the trash. One step; deleting permanently can't be undone.
 
 ## Mouse
 
@@ -158,6 +175,7 @@ The two make one scale: zooming in past the biggest list switches to the smalles
 |---|---|
 | Home | `$HOME` |
 | Desktop, Documents, Downloads, Music, Pictures, Videos | From `~/.config/user-dirs.dirs` when it names them, else `~/Desktop` and so on; only the ones that exist |
+| Trash | The freedesktop trash, `~/.local/share/Trash/files` (made at start if missing) |
 | Bookmarks | GTK's bookmarks, ones that still exist, by their label or folder name |
 | File system | `/` |
 | Drives | Whatever is mounted under `/run/media`, `/media` or `/mnt`, by its mount point's name |
@@ -186,7 +204,7 @@ A header over the list names its columns: Name, Type, Size and Modified. Each ro
 
 ### Protected places
 
-files will only change things inside your home directory: that's the rule every file operation follows once they arrive in 0.4, so a slip can't delete the system. A directory counts as home by where it really is, so a symlink in home pointing at `/etc` is still protected. Running files as root lifts the rule. Outside home the end of the path shows a lock and `read-only`; as root it shows `root` in red.
+files will only change things inside your home directory (and your trash, wherever `$XDG_DATA_HOME` puts it): every file operation follows this rule, so a slip can't delete the system. Outside home, Rename, Move to trash, Delete permanently and New folder are greyed out in the menu, and their keys say "/etc is protected: files only changes things inside your home directory". A directory counts as home by where it really is, so a symlink in home pointing at `/etc` is still protected. Running files as root lifts the rule. Outside home the end of the path shows a lock and `read-only`; as root it shows `root` in red.
 
 ## Behaviour
 
@@ -215,6 +233,9 @@ files will only change things inside your home directory: that's the rule every 
 - [ ] Clicking a place goes there; clicking a row selects it, double-clicking enters, and the wheel scrolls the list.
 - [ ] Dragging the sidebar's edge resizes it with a resize arrow, and the width and visibility come back after a restart.
 - [ ] A mounted USB stick shows under Drives and goes when it's unmounted.
+- [ ] F2 renames in the list and the icon view; Ctrl+Shift+N makes a folder ready to name; Ctrl+Z undoes each.
+- [ ] Delete moves files to the trash and they show in the Trash place (and in `gio trash --list`, if installed); Restore puts them back; Empty trash asks, then empties it.
+- [ ] Shift+Delete asks before deleting; Escape cancels. In `/etc` or `/tmp` none of these change anything.
 - [ ] Narrowing the window hides the sidebar.
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
 - [ ] Images show thumbnails in the icon view, quickly on a second visit; a photo taken sideways shows upright; editing an image updates its thumbnail.
