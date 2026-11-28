@@ -1,6 +1,6 @@
 # files
 
-`files` is the graphical file manager. Version 0.2 is laid out like a file explorer: a toolbar with back, forward and up buttons and the path, a sidebar of places on the left, and the current directory filling the rest. You move through the tree from the keyboard or the mouse, and it refreshes when a directory changes. Opening files, file operations and the file picker come in later versions; the plan is in [docs/files-roadmap.md](../docs/files-roadmap.md).
+`files` is the graphical file manager. Version 0.2 is laid out like a file explorer: tabs along the top, a toolbar with back, forward and up buttons, the path, a search field and the view buttons, a sidebar of places on the left, and the current directory filling the rest as a list or a grid of icons. You move through the tree from the keyboard or the mouse, and it refreshes when a directory changes. Opening files, file operations and the file picker come in later versions; the plan is in [docs/files-roadmap.md](../docs/files-roadmap.md).
 
 It's a normal xdg-shell window with app ID `files`, so dwl tiles it like any other client. It draws on the CPU into shm buffers at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so text stays sharp at fractional scales. It's built on [desk](../desk/README.md): the window, keyboard, key repeat, fonts, palette and file watch.
 
@@ -38,9 +38,9 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 
 | Key | Action |
 |---|---|
-| `j` / Down, `k` / Up | Next, previous entry |
-| `l` / Right / Enter | Into the directory. On a file nothing happens yet (opening comes in 0.3) |
-| `h` / Left / Backspace, Alt+Up | Up to the parent, with the directory you came from selected |
+| `j` / Down, `k` / Up | Next, previous entry (a row of icons in the icon view) |
+| `l` / Right / Enter | Into the directory. On a file nothing happens yet (opening comes in 0.3). In the icon view Right moves to the next icon |
+| `h` / Left / Backspace, Alt+Up | Up to the parent, with the directory you came from selected. In the icon view Left moves to the previous icon |
 | Alt+Left or `-`, Alt+Right | Back, forward through the directories visited |
 | `g` / Home, `G` / End | First, last entry |
 | Ctrl+D, Ctrl+U | Half a page down, up, moving the view with the cursor |
@@ -50,7 +50,17 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | `=` | Reset the sidebar's width |
 | `.` | Show or hide hidden files |
 | `~` | Home |
+| Ctrl+T | New tab, in the same directory |
+| Ctrl+W | Close the tab; the last one closes the window |
+| Ctrl+Tab, Ctrl+Shift+Tab (or Ctrl+Page Down, Page Up) | Next, previous tab |
+| Alt+1 … Alt+8, Alt+9 | That tab, the last tab |
+| Ctrl+F | Search |
+| Escape | Clear the search |
+| Ctrl+1, Ctrl+2 | List, icons |
+| Ctrl+plus, Ctrl+minus, Ctrl+0 | Zoom in, out, back to normal |
 | `q`, Ctrl+Q | Quit |
+
+While the search field has the focus, typing goes into it: Left, Right, Home and End move, Backspace and Delete delete (a word with Ctrl), Escape clears it, and Enter, Tab or Down give the focus back to the list with the search kept. Ctrl shortcuts still work.
 
 Movement keys repeat while held, at the compositor's rate. Enter doesn't repeat, so holding it can't dive down the tree.
 
@@ -58,12 +68,18 @@ Movement keys repeat while held, at the compositor's rate. Enter doesn't repeat,
 
 | Where | Action |
 |---|---|
+| A tab | Switches to it; its × or a middle-click closes it |
+| `+` after the tabs | New tab |
 | The sidebar button (left of back) | Shows or hides the sidebar |
 | Back, forward, up buttons | As Alt+Left, Alt+Right, Alt+Up; a button is dimmed when there's nowhere to go |
 | A piece of the path | Goes to that directory, with the one you came through selected |
 | A place in the sidebar | Goes there |
-| A row in the list | Selects it; double-click goes into a directory (opening files comes in 0.3) |
-| The wheel over the list | Scrolls it, three rows a notch, without moving the selection. Touchpads scroll by distance |
+| The search field | Focuses it, with the cursor where you clicked; its × clears it |
+| The list and icon buttons (right end) | Switch the view |
+| An entry | Selects it; double-click goes into a directory (opening files comes in 0.3) |
+| Middle-click on a directory, place or path piece | Opens it in a new tab behind this one |
+| The wheel over the entries | Scrolls them, three rows a notch (a row of icons in the icon view), without moving the selection. Touchpads scroll by distance |
+| Ctrl+wheel | Zooms the current view |
 | Mouse side buttons | Back, forward |
 | The sidebar's edge | Drag to resize; double-click resets |
 
@@ -71,7 +87,20 @@ After scrolling with the wheel the selection may be off screen; the next key tha
 
 ## What it shows
 
-Along the top: the sidebar button, back, forward and up, then the path, cut into pieces you can click (home shows as a house). When the path is too long the pieces on the left are folded into `…`, which goes to the last one folded. At the right end of the path, `read-only` or `root` when that applies (see below). Back and forward remember the last 100 directories; going back skips any that have been deleted since.
+At the very top, the tabs: each shows its directory's name (Home for home) and a ×, the current one underlined, then `+`. Each tab keeps its own directory, selection, back and forward history and search; switching to a tab whose directory has gone since lands on the nearest parent that exists.
+
+Under them, the toolbar: the sidebar button, back, forward and up, then the path, cut into pieces you can click (home shows as a house). When the path is too long the pieces on the left are folded into `…`, which goes to the last one folded. At the right end of the path, `read-only` or `root` when that applies (see below). Back and forward remember the last 100 directories; going back skips any that have been deleted since. Then the search field and the list and icon view buttons.
+
+### Search
+
+The search field filters the current directory as you type: names containing the text, ignoring ASCII case, with hidden files still hidden unless shown. "No matches" says when nothing does. Going to another directory ends the search.
+
+### Views and zoom
+
+- **List:** one row per entry, with size and date where there's room. Zoom changes its text size, from 0.75× to 2×.
+- **Icons:** a grid of large icons with the name under each in up to two lines, broken at a space, dot, dash or underscore where it can be, and cut in the middle when it's still too long. Zoom changes the icon size, from 32 to 192 pixels; the grid fits as many columns as it can.
+
+Each view keeps its own zoom. The view and both zooms are kept in the state file.
 
 ### The sidebar
 
@@ -84,7 +113,7 @@ Along the top: the sidebar button, back, forward and up, then the path, cut into
 
 The place you're in is highlighted. The list is made again whenever a directory loads, so a new `~/Music` shows up, and drives follow `/proc/self/mountinfo`, so one appears as soon as it's mounted and goes when it's unmounted.
 
-The sidebar is 180 pixels wide to begin with. Drag its edge (the pointer turns into a resize arrow) or use `<` and `>`; double-clicking the edge or `=` resets it. It's never narrower than 100 or wider than half the window, and it hides itself when the window is narrower than 60 character cells. Its width and whether it's shown are kept in `~/.local/state/files/state` (or under `$XDG_STATE_HOME`).
+The sidebar is 180 pixels wide to begin with. Drag its edge (the pointer turns into a resize arrow) or use `<` and `>`; double-clicking the edge or `=` resets it. It's never narrower than 100 or wider than half the window, and it hides itself when the window is narrower than 60 character cells. Its width and whether it's shown are kept in `~/.local/state/files/state` (or under `$XDG_STATE_HOME`), with the view and zoom.
 
 ### The list
 
@@ -129,3 +158,7 @@ files will only change things inside your home directory: that's the rule every 
 - [ ] Dragging the sidebar's edge resizes it with a resize arrow, and the width and visibility come back after a restart.
 - [ ] A mounted USB stick shows under Drives and goes when it's unmounted.
 - [ ] Narrowing the window hides the sidebar.
+- [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
+- [ ] Tabs open, close and switch by clicking, middle-click and keys, each keeping its place.
+- [ ] Typing in the search field filters as you type; its × clears it.
+- [ ] Ctrl+wheel zooms the list and the icons, and the zoom comes back after a restart.

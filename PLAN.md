@@ -17,7 +17,7 @@ Ground rules that apply to every phase:
 
 **Next, in order:**
 
-1. `files`: 0.1 and 0.2 are done apart from their live key checks (`files/README.md`). Next is 0.3 from [docs/files-roadmap.md](docs/files-roadmap.md): double-click to open with the default application, the right-click menu with Open with, search, typing a path, bookmarks, sorting by column headers, and the standard keys in place of `h`/`j`/`k`/`l`. files is a mouse-first explorer, not a keyboard-first one. Worth installing `shared-mime-info` before 0.3, which reads its MIME globs to pick applications.
+1. `files`: 0.1 and 0.2 are done apart from their live key checks (`files/README.md`). Next is 0.3 from [docs/files-roadmap.md](docs/files-roadmap.md): double-click to open with the default application, the right-click menu with Open with, typing a path, bookmarks, sorting by column headers, and the standard keys in place of `h`/`j`/`k`/`l`. files is a mouse-first explorer, not a keyboard-first one. Worth installing `shared-mime-info` before 0.3, which reads its MIME globs to pick applications.
 2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
 3. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
@@ -31,7 +31,7 @@ Ground rules that apply to every phase:
 
 | What | Result |
 |---|---|
-| files 0.2 | An explorer layout: a toolbar (sidebar toggle, back, forward, up, clickable path) and a sidebar of places (home folders, `/`, mounted drives) beside the list; date and time on every entry. The mouse works: click, double-click, wheel, side buttons, dragging the sidebar's edge, kept between runs. Outside home is read-only unless root (the rule 0.4's operations follow). It began as Miller columns with previews on worker threads (`14b4e7f`), replaced in 0.2.2. desk gained `desk_canvas_blit` |
+| files 0.2 | An explorer layout: a toolbar (sidebar toggle, back, forward, up, clickable path) and a sidebar of places (home folders, `/`, mounted drives) beside the list; date and time on every entry. The mouse works: click, double-click, wheel, side buttons, dragging the sidebar's edge, kept between runs. Tabs, a search field beside the path, list and icon views, and zoom (Ctrl+wheel) followed in 0.2.3. Outside home is read-only unless root (the rule 0.4's operations follow). It began as Miller columns with previews on worker threads (`14b4e7f`), replaced in 0.2.2. desk gained `desk_canvas_blit` |
 | files 0.1 | One directory: keyboard navigation, selection remembered per directory, live refresh, Nerd Font icons, palette colors. desk gained fonts with fallback (`-DDESK_FONT`), the keyboard and an xdg-shell window; view moved onto the last two. Key checks pending |
 | shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
 | view 0.1 | One image fitted to the window, sharp at any scale |
@@ -237,10 +237,10 @@ A graphical file manager that works like a normal explorer, mouse first with the
 | Version | Milestone | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, search, typing a path, bookmarks, sorting by column headers, standard keys | Not started |
+| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom | Done (live key and mouse checks pending) |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, sorting by column headers, standard keys | Not started |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
-| 0.5 | Icon view with thumbnails, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
+| 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Not started |
 

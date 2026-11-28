@@ -6,7 +6,7 @@ Implementation plan for files, the graphical file manager, from 0.1 to 1.0. It e
 
 files is one `files.c` and one `files.h`, built on `desk/` from its first commit, the same way view and shot were. It's a normal xdg-shell window (app ID `files`), so dwl tiles it like any other client.
 
-files is a normal graphical file explorer, used with the mouse first: a toolbar with back, forward, up and the path, a sidebar of places on the left, and the current directory filling the rest (0.2). Things are done the way other explorers do them: double-click opens, right-click brings up a menu, files are dragged where they should go, and dialogs ask before anything is replaced or deleted. The keyboard has the standard shortcuts (Ctrl+C, Ctrl+V, F2, Delete, Ctrl+L, Alt+Left), not a vocabulary of its own to learn.
+files is a normal graphical file explorer, used with the mouse first: tabs, a toolbar with back, forward, up, the path and a search field, a sidebar of places on the left, and the current directory filling the rest as a list or icons (0.2). Things are done the way other explorers do them: double-click opens, right-click brings up a menu, files are dragged where they should go, and dialogs ask before anything is replaced or deleted. The keyboard has the standard shortcuts (Ctrl+C, Ctrl+V, F2, Delete, Ctrl+L, Alt+Left), not a vocabulary of its own to learn.
 
 0.1 started out keyboard-only, with ranger's `h`, `j`, `k` and `l`. Those letter keys go in 0.3, when typing a letter starts selecting by name as in other explorers.
 
@@ -119,6 +119,10 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 - The sidebar is 180 logical pixels wide to begin with. Its edge can be dragged (no narrower than 100, no wider than half the window), and the width and whether it's shown are kept in `~/.local/state/files/state`. Under 60 cells of width it hides itself.
 - **The list:** the current directory, with size and date on the right where there's room.
 - **Mouse** (brought forward from 0.5): click selects, double-click enters a directory, a place goes there, and the wheel scrolls the list without moving the selection. The mouse's side buttons go back and forward.
+- **Tabs** along the top, each with its own directory, selection, history and search: Ctrl+T, Ctrl+W (the last tab closes the window), Ctrl+Tab, Alt+1–9, a × on each and a `+`, and middle-click on a directory, place or path piece to open it in a background tab.
+- **Search** in a field beside the path (Ctrl+F): it filters the current directory as you type, ignoring ASCII case. Going elsewhere ends it. Brought forward from 0.3.
+- **Views:** list, or a grid of large icons with names under them in up to two lines, from buttons at the toolbar's end or Ctrl+1 and Ctrl+2. Brought forward from 0.5; thumbnails in the icon view stay in 0.5.
+- **Zoom:** Ctrl+wheel, Ctrl+plus, minus and 0. The list's text goes from 0.75× to 2×, the icons from 32 to 192 pixels; each view keeps its own, saved with the view in the state file.
 - No preview. 0.2 first had Miller columns (parent, current, preview) with image and text previews made on worker threads; they were replaced by this layout in 0.2.2. That code is in git history (`14b4e7f`) if a preview pane comes back, and the image decoding and worker thread will return with 0.5's thumbnail grid.
 - The status line 0.2 first had is gone too. The details it showed are the list's size and date columns; permissions and owner come back in a properties view if they're missed.
 
@@ -130,6 +134,10 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 | Alt+Up | Up, like `h` |
 | `b`, F9 | Show or hide the sidebar |
 | `<`, `>`, `=` | Sidebar narrower, wider, back to 180 |
+| Ctrl+T, Ctrl+W, Ctrl+Tab | New tab, close tab, next tab |
+| Ctrl+F, Escape | Search, clear it |
+| Ctrl+1, Ctrl+2 | List, icons |
+| Ctrl+plus, Ctrl+minus, Ctrl+0 | Zoom |
 
 ### Manual checks
 
@@ -137,6 +145,9 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 - Clicking selects, double-clicking enters, and the wheel scrolls the list.
 - Plugging in a USB stick (once mounted) adds it under Drives; unmounting removes it.
 - Dragging the sidebar's edge resizes it, and the width and visibility come back after a restart.
+- Tabs open, close and switch by click, middle-click and keys, and each keeps its own place.
+- The search field narrows a large directory as you type.
+- Ctrl+wheel zooms the list and the icons, and both come back after a restart.
 
 ---
 
@@ -164,7 +175,7 @@ A popup menu (desk's new `xdg_popup` piece) at the pointer. Keyboard users reach
 ### Finding and going places
 
 - **Typing a path:** clicking the empty part of the path bar, or Ctrl+L, turns it into a text field holding the full path, selected. Suggestions for the directory being typed drop down below it; Tab or a click completes one, `~` expands, Enter goes there, Escape gives the crumbs back.
-- **Search:** a search field at the right end of the toolbar (Ctrl+F) filters the current directory as you type, substring and case-insensitive. A × in the field, or Escape, clears it. Searching below the current directory, recursively, comes after 1.0 if it's wanted.
+- **Search** in the current directory is in since 0.2. Searching below it, recursively, comes after 1.0 if it's wanted.
 - **Type to select:** typing letters in the list jumps to the first name that starts with them, as in other explorers. The typed text resets after a second without a key.
 - **Bookmarks:** "Add to sidebar" in the menu, or dragging a folder onto the sidebar (0.4), adds it under a Bookmarks heading. They're kept in GTK's bookmarks file (`~/.config/gtk-3.0/bookmarks`), so GTK file dialogs and other file managers show the same ones.
 
@@ -185,7 +196,6 @@ The standard ones, replacing 0.1's letter keys:
 | Alt+Left, Alt+Right | Back, forward (and the mouse's side buttons) |
 | Alt+Home | Home |
 | Ctrl+L | Type a path |
-| Ctrl+F | Search |
 | Ctrl+H | Show or hide hidden files |
 | F5 | Refresh |
 | F9 | Show or hide the sidebar |
@@ -197,7 +207,7 @@ The standard ones, replacing 0.1's letter keys:
 
 - Double-clicking a PNG opens view, a `.md` opens mark in a new deal window, a `.c` file opens `editor` in deal.
 - Right-click → Open with → Other application… with "Always use" checked changes the default, and it sticks after a restart.
-- The search field narrows a large directory as you type; typing a path with Tab completion goes there.
+- Typing a path with Tab completion goes there.
 - A bookmark added in files shows in a GTK app's file dialog.
 - Clicking the Size heading sorts by size, and again reverses it.
 
@@ -262,7 +272,7 @@ So a slip can't delete the system, files only changes things inside the user's o
 
 ## 0.5: Views, thumbnails, config and desktop integration
 
-- **Views:** buttons at the right of the toolbar switch between Details (the 0.3 list with its header) and Icons, a grid of large icons and thumbnails (Ctrl+1, Ctrl+2). Ctrl+wheel changes the icon size. The view is remembered per directory.
+- **Views:** the list and icon views and their zoom are in since 0.2. 0.5 remembers the view per directory.
 - **Thumbnails** for images in the icon view, decoded on a worker thread (desk's image decoding, as 0.2's first version did for previews). They follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
 - **Drag and drop with other applications** through `wl_data_device`: dragging files out of files into a browser's upload area, an editor or another file manager (`text/uri-list`), and dropping files from them into files, which copies them in.
 - **Hover:** rows highlight under the pointer, and resting on a name that was cut short shows it in full in a tooltip.
@@ -421,7 +431,7 @@ How applications pick up the portal (to confirm against the installed versions):
 - Recursive search below the current directory, from the search field.
 - Drives that aren't mounted yet in the sidebar, mounted with a click through `mount` (#15) once it exists. Mounted ones are listed since 0.2.
 - Archives: browse `.zip` and `.tar.*` as directories through libarchive, which is installed.
-- Tabs or split panes, if one list turns out not to be enough.
+- Split panes, if tabs turn out not to be enough.
 - A preview pane, if it's missed: images and text from 0.2's first version (`14b4e7f`), PDF and video once `read` and `video` exist to borrow from.
 - Bulk rename in `editor`: the names as lines of a file, renamed to whatever they are when it's saved.
 
@@ -430,9 +440,9 @@ How applications pick up the portal (to confirm against the installed versions):
 | Version | Theme | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, search, typing a path, bookmarks, sorting by column headers, standard keys | Not started |
+| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom | Done (live key and mouse checks pending) |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, sorting by column headers, standard keys | Not started |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
-| 0.5 | Icon view with thumbnails, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
+| 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Final |
