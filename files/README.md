@@ -84,13 +84,9 @@ files --pick --multiple --filter 'Images:*.png;*.jpg;image/webp' ~/Pictures
 files --save report.pdf -0 --app-id my.script
 ```
 
-`files --portal` serves `org.freedesktop.impl.portal.FileChooser` on the session bus (`OpenFile`, `SaveFile`, `SaveFiles`), so applications using xdg-desktop-portal, browsers among them, get files as their file dialog. Each dialog is a `files --pick` or `--save` child; the application closing its request closes the dialog, and the service leaves after a minute with none open. `make portal` installs the D-Bus service and `~/.config/xdg-desktop-portal/dwl-portals.conf`, and the portal description under `$(DATADIR)`. xdg-desktop-portal reads descriptions only from its own system directory, so that file needs root:
+`files --portal` serves `org.freedesktop.impl.portal.FileChooser` on the session bus (`OpenFile`, `SaveFile`, `SaveFiles`), so applications using xdg-desktop-portal, browsers among them, get files as their file dialog. Each dialog is a `files --pick` or `--save` child; the application closing its request closes the dialog, and the service leaves after a minute with none open. `make portal` installs the D-Bus service, the portal description and `~/.config/xdg-desktop-portal/dwl-portals.conf`, which sends file dialogs to files. xdg-desktop-portal 1.22 finds the description under `~/.local/share`; older versions read only `/usr/share/xdg-desktop-portal/portals`, so with those: `sudo make portal PREFIX=/usr/local PORTALDIR=/usr/share/xdg-desktop-portal/portals`.
 
-```sh
-sudo make portal PREFIX=/usr/local PORTALDIR=/usr/share/xdg-desktop-portal/portals
-```
-
-The system also needs `xdg-desktop-portal` installed, `XDG_CURRENT_DESKTOP=dwl` exported before dwl starts, and that variable and `WAYLAND_DISPLAY` given to D-Bus activation (`dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP` in dwl's startup). Applications' extra choices (encoding boxes and the like) come back at their defaults, and the dialog doesn't yet float over the application that opened it, since dwl doesn't export xdg-foreign handles.
+The system needs `xdg-desktop-portal` installed. dwl does the rest when it starts: it sets `XDG_CURRENT_DESKTOP=dwl` unless a display manager already did (the session file has `DesktopNames=dwl`) and passes it and `WAYLAND_DISPLAY` to D-Bus and systemd activation. Applications' extra choices (encoding boxes and the like) come back at their defaults, and the dialog doesn't yet float over the application that opened it, since dwl doesn't export xdg-foreign handles.
 
 ## Keys
 

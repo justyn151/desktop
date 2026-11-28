@@ -3876,6 +3876,24 @@ resize(Client *c, struct wlr_box geo, int interact)
 	transactionschedule();
 }
 
+/* Name the desktop and hand the display to D-Bus and systemd activation,
+ * so services started on demand (xdg-desktop-portal, files --portal) know
+ * which portals to use and can open windows here. A display manager may
+ * have set XDG_CURRENT_DESKTOP already from the session's DesktopNames. */
+static void
+exportsession(void)
+{
+	pid_t pid;
+	if (!getenv("XDG_CURRENT_DESKTOP"))
+		setenv("XDG_CURRENT_DESKTOP", "dwl", 1);
+	if ((pid = fork()) == 0) {
+		setsid();
+		execlp("dbus-update-activation-environment", "dbus-update-activation-environment",
+				"--systemd", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", (char *)NULL);
+		_exit(127);
+	}
+}
+
 void
 run(char *startup_cmd)
 {
@@ -3885,6 +3903,7 @@ run(char *startup_cmd)
 		die("startup: display_add_socket_auto");
 	setenv("WAYLAND_DISPLAY", socket, 1);
 	setuptheme();
+	exportsession();
 
 	/* Start the backend. This will enumerate outputs and inputs, become the DRM
 	 * master, etc */

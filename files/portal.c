@@ -644,7 +644,13 @@ static int choose(sd_bus_message *message, void *data, sd_bus_error *error, enum
         r = -errno;
     } else if ((r = -posix_spawn_file_actions_init(&actions)) == 0) {
         posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
-        r = -posix_spawn(&request->pid, "/proc/self/exe", &actions, NULL, argv, environ);
+        /* The binary by its real name, so the dialog shows as files in
+           process lists rather than exe. */
+        char self[4096];
+        ssize_t length = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (length > 0)
+            self[length] = 0;
+        r = -posix_spawn(&request->pid, length > 0 ? self : "/proc/self/exe", &actions, NULL, argv, environ);
         posix_spawn_file_actions_destroy(&actions);
     }
     if (fds[1] >= 0)

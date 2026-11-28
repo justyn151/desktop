@@ -2,4 +2,5 @@
 Name=dwl
 Comment=dwm for Wayland
 Exec=dwl
+DesktopNames=dwl
 Type=Application
