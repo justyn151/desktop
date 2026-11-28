@@ -32,7 +32,7 @@ all: files
 files: $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PKG_LIBS) -lm -pthread $(LDLIBS)
 
-$(BUILD)/files.o: files.c files.h $(HEADERS) $(DESK)/desk.h
+$(BUILD)/files.o: files.c files.h $(HEADERS) $(DESK)/desk.h $(BUILD)/default-config.h
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(FILES_CFLAGS) -c -o $@ files.c
 
 $(BUILD)/desk.o: $(DESK)/desk.c $(DESK)/desk.h $(HEADERS) | $(BUILD)
@@ -43,6 +43,11 @@ $(BUILD)/%-protocol.o: $(BUILD)/%-protocol.c
 
 $(BUILD):
 	mkdir -p $@
+
+# The sample config, embedded so files can write it when the user has none.
+$(BUILD)/default-config.h: files.conf | $(BUILD)
+	LC_ALL=C od -An -v -tu1 files.conf | awk '{ for (i = 1; i <= NF; ++i) printf "%s,", $$i; print "" }' > "$@.tmp"
+	mv -f "$@.tmp" "$@"
 
 $(BUILD)/xdg-shell-client-protocol.h $(BUILD)/xdg-shell-protocol.c: $(XDG_SHELL_XML)
 $(BUILD)/viewporter-client-protocol.h $(BUILD)/viewporter-protocol.c: $(VIEWPORTER_XML)
@@ -60,10 +65,23 @@ clean:
 	rm -f files
 	rm -rf $(BUILD)
 
+DATADIR ?= $(PREFIX)/share
+
 install: files
 	install -Dm755 files "$(DESTDIR)$(BINDIR)/files"
+	install -Dm644 files.desktop "$(DESTDIR)$(DATADIR)/applications/files.desktop"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/files"
+	rm -f "$(DESTDIR)$(BINDIR)/files" "$(DESTDIR)$(DATADIR)/applications/files.desktop"
 
-.PHONY: all clean install uninstall
+# Make files the default for folders, for the user running make, so other
+# applications' "show in folder" opens it.
+default:
+	@if command -v xdg-mime >/dev/null; then \
+		xdg-mime default files.desktop inode/directory && echo "files is the default for inode/directory"; \
+	else \
+		echo "xdg-mime isn't installed. Add this line under [Default Applications] in ~/.config/mimeapps.list:"; \
+		echo "inode/directory=files.desktop"; \
+	fi
+
+.PHONY: all clean install uninstall default

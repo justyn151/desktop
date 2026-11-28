@@ -313,6 +313,8 @@ So a slip can't delete the system, files only changes things inside the user's o
 - Colors from the palette, followed live through `desk_watch`: background, foreground, accent for directories, muted for hidden entries and details, the selection colors for the selection, urgent for broken links and errors.
 - `files.desktop` with `MimeType=inode/directory;`, and `make default` registering it, so other apps' "show in folder" opens files. A dwl key binding (Super+E) in the README.
 
+Progress: 0.5.0 adds the config file (with `click`, `directories_first`, `[thumbnails]`, `[safety] writable` and `[open] terminal`; the sidebar width stays in the state file, and the view is `list` or `icons`), the view remembered per folder, tooltips for names cut short, and `files.desktop` with `make default`. Super+E is bound in dwl's config. Colors already followed the palette live since 0.2.
+
 ### Manual checks
 
 - Dragging an image from files into a browser upload works; dragging a file from a browser into files copies it in.
@@ -428,6 +430,7 @@ How applications pick up the portal (to confirm against the installed versions):
 
 ## After 1.0 (unscheduled)
 
+- Dialogs in windows of their own: Delete, Empty trash, the Replace question, Properties and any other box that pops up become real windows (xdg dialog toplevels, parented to files) that can be dragged around, instead of being drawn over the window.
 - The portal's `choices` (extra combo boxes and checkboxes) drawn in the picker's bottom bar, if an application needs them.
 - Recursive search below the current directory, from the search field.
 - Drives that aren't mounted yet in the sidebar, mounted with a click through `mount` (#15) once it exists. Mounted ones are listed since 0.2.
@@ -443,7 +446,7 @@ How applications pick up the portal (to confirm against the installed versions):
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
 | 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Done, but for the "Other application…" dialog (put off) |
-| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | In progress: selecting, rename, new folder, trash, delete, undo, copy, move, paste, drag and drop, properties done |
-| 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
+| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Done, but for the slow second click to rename and the trash on other drives |
+| 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Done in 0.5.0 (thumbnails, drag and drop and hover came early in 0.4) |
 | 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Final |

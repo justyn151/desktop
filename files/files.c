@@ -31,7 +31,11 @@
 #include "xdg-shell-client-protocol.h"
 #include "viewporter-client-protocol.h"
 
-#define FONT_POINTS 11.0      /* UI text size, in points at 96 dpi. */
+static const unsigned char default_config[] = {
+#include "default-config.h"
+};
+
+#define FONT_POINTS 11.0      /* UI text size, in points at 96 dpi, unless the config says. */
 #define ROW_SPACING 1.5       /* Row height as a multiple of the line height. */
 #define PADDING 10            /* Logical pixels around the list. */
 #define GAP 16                /* Logical pixels between name and details. */
@@ -187,6 +191,7 @@ static void entry_type(const struct entry *entry, char *out, size_t length);
 /* The order qsort sorts by, set by listing_sort. */
 static enum column sort_column;
 static bool sort_descending;
+static bool sort_directories_first = true;
 
 static int compare_numbers(long long a, long long b)
 {
@@ -198,7 +203,7 @@ static int compare_numbers(long long a, long long b)
 static int entry_order(const void *left, const void *right)
 {
     const struct entry *a = left, *b = right;
-    if (a->directory != b->directory)
+    if (sort_directories_first && a->directory != b->directory)
         return a->directory ? -1 : 1;
     int order = 0;
     switch (sort_column) {
@@ -534,6 +539,12 @@ static bool may_modify(const struct files *files, const char *directory)
     size_t trash = files->trash_real ? strlen(files->trash_real) : 0;
     if (trash && strncmp(real, files->trash_real, trash) == 0 && (real[trash] == '/' || real[trash] == 0))
         inside = true;
+    /* Folders the config's [safety] writable opens up. */
+    for (size_t i = 0; !inside && i < files->config.writable_count; ++i) {
+        size_t n = strlen(files->config.writable[i]);
+        inside = strncmp(real, files->config.writable[i], n) == 0 &&
+                 (real[n] == '/' || real[n] == 0 || (n == 1 && real[0] == '/'));
+    }
     free(real);
     return inside;
 }
@@ -584,8 +595,6 @@ static void state_entry(void *data, const char *section, const char *key, const 
                 files->column_width[c] = width;
             at = end;
         }
-    } else if (strcmp(key, "view") == 0) {
-        files->view = strcmp(value, "icons") == 0 ? VIEW_ICONS : VIEW_LIST;
     } else if (strcmp(key, "list_zoom") == 0 || strcmp(key, "icon_size") == 0) {
         bool list = key[0] == 'l';
         const double *levels = list ? list_zooms : icon_zooms;
@@ -602,9 +611,9 @@ static void load_state(struct files *files)
 {
     files->sidebar_width = SIDEBAR_WIDTH;
     files->show_sidebar = true;
-    files->view = VIEW_LIST;
+    files->view = files->config.view;
     memcpy(files->zoom, default_zoom, sizeof files->zoom);
-    files->sort = COLUMN_NAME;
+    files->sort = files->config.sort;
     files->sort_reverse = false;
     memcpy(files->column_width, default_column_width, sizeof files->column_width);
     if (files->state_path)
@@ -627,14 +636,219 @@ static void save_state(struct files *files)
         return;
     fprintf(atomic.file,
             "# Written by files. Widths and the icon size in logical pixels.\n[layout]\n"
-            "sidebar = %.0f\nshow_sidebar = %s\nview = %s\nlist_zoom = %.3f\nicon_size = %.0f\n"
+            "sidebar = %.0f\nshow_sidebar = %s\nlist_zoom = %.3f\nicon_size = %.0f\n"
             "sort = %s\nsort_reverse = %s\ncolumns = %.0f %.0f %.0f\n",
-            files->sidebar_width, files->show_sidebar ? "yes" : "no", files->view == VIEW_ICONS ? "icons" : "list",
-            list_zooms[files->zoom[VIEW_LIST]], icon_zooms[files->zoom[VIEW_ICONS]], column_titles[files->sort],
+            files->sidebar_width, files->show_sidebar ? "yes" : "no", list_zooms[files->zoom[VIEW_LIST]], icon_zooms[files->zoom[VIEW_ICONS]], column_titles[files->sort],
             files->sort_reverse ? "yes" : "no", files->column_width[COLUMN_TYPE], files->column_width[COLUMN_SIZE],
             files->column_width[COLUMN_MODIFIED]);
     desk_atomic_commit(&atomic, true);
     desk_atomic_abort(&atomic); /* Frees what's left, after success or failure. */
+}
+
+/* Config */
+
+struct config_parse {
+    struct config *config;
+    const char *label;
+};
+
+static void config_entry(void *data, const char *section, const char *key, const char *value, int line)
+{
+    struct config_parse *parse = data;
+    struct config *config = parse->config;
+    if (!key) {
+        fprintf(stderr, "files: %s:%d: not a setting, ignored\n", parse->label, line);
+        return;
+    }
+    bool known = true, valid = true;
+    char *end;
+    if (strcmp(section, "layout") == 0 && strcmp(key, "font_size") == 0) {
+        double points = strtod(value, &end);
+        if (end != value && !*end && points >= 5 && points <= 48)
+            config->font_points = points;
+        else
+            valid = false;
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "view") == 0) {
+        if (strcmp(value, "list") == 0 || strcmp(value, "details") == 0)
+            config->view = VIEW_LIST;
+        else if (strcmp(value, "icons") == 0)
+            config->view = VIEW_ICONS;
+        else
+            valid = false;
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "hidden") == 0) {
+        valid = desk_parse_bool(value, &config->hidden);
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "sort") == 0) {
+        valid = false;
+        for (int c = 0; c < COLUMN_COUNT; ++c) {
+            if (strcasecmp(value, column_titles[c]) == 0) {
+                config->sort = (enum column)c;
+                valid = true;
+            }
+        }
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "directories_first") == 0) {
+        valid = desk_parse_bool(value, &config->directories_first);
+    } else if (strcmp(section, "view") == 0 && strcmp(key, "click") == 0) {
+        if (strcmp(value, "single") == 0 || strcmp(value, "double") == 0)
+            config->single_click = value[0] == 's';
+        else
+            valid = false;
+    } else if (strcmp(section, "thumbnails") == 0 && strcmp(key, "enable") == 0) {
+        valid = desk_parse_bool(value, &config->thumbnails);
+    } else if (strcmp(section, "thumbnails") == 0 && strcmp(key, "image_limit") == 0) {
+        long mib = strtol(value, &end, 10);
+        if (end != value && !*end && mib >= 1 && mib <= 4096)
+            config->image_limit = (size_t)mib << 20;
+        else
+            valid = false;
+    } else if (strcmp(section, "safety") == 0 && strcmp(key, "writable") == 0) {
+        for (size_t i = 0; i < config->writable_count; ++i)
+            free(config->writable[i]);
+        free(config->writable);
+        config->writable = NULL;
+        config->writable_count = 0;
+        char *list = strdup(value), *save = NULL;
+        for (char *part = list ? strtok_r(list, ":", &save) : NULL; part; part = strtok_r(NULL, ":", &save)) {
+            char *expanded = desk_expand_home(part), *real = expanded ? realpath(expanded, NULL) : NULL;
+            free(expanded);
+            char **grown = real ? realloc(config->writable, (config->writable_count + 1) * sizeof *grown) : NULL;
+            if (!grown) {
+                if (!real)
+                    fprintf(stderr, "files: %s:%d: %s isn't there, so it stays protected\n", parse->label, line, part);
+                free(real);
+                continue;
+            }
+            config->writable = grown;
+            config->writable[config->writable_count++] = real;
+        }
+        free(list);
+    } else if (strcmp(section, "open") == 0 && strcmp(key, "terminal") == 0) {
+        free(config->terminal);
+        config->terminal = *value ? strdup(value) : NULL;
+    } else {
+        known = false;
+    }
+    if (!known)
+        fprintf(stderr, "files: %s:%d: unknown key %s in [%s]\n", parse->label, line, key, section);
+    else if (!valid)
+        fprintf(stderr, "files: %s:%d: invalid value for %s, keeping the default\n", parse->label, line, key);
+}
+
+/* The built-in defaults, then the user's file, written from the sample
+   when it's missing so there's always one to edit. */
+static void config_load(struct config *config)
+{
+    *config = (struct config){.font_points = FONT_POINTS, .view = VIEW_LIST, .sort = COLUMN_NAME,
+                              .directories_first = true, .thumbnails = true, .image_limit = 256u << 20};
+    struct config_parse parse = {.config = config, .label = "built-in config"};
+    desk_ini_parse((const char *)default_config, sizeof default_config, config_entry, &parse);
+    char *path = desk_config_path("files");
+    if (!path)
+        return;
+    int error = desk_write_default(path, default_config, sizeof default_config);
+    if (error == 0) {
+        fprintf(stderr, "files: created %s\n", path);
+    } else if (error != EEXIST) {
+        fprintf(stderr, "files: can't create %s: %s\n", path, strerror(error));
+    } else {
+        parse.label = path;
+        error = desk_ini_load(path, config_entry, &parse);
+        if (error && error != ENOENT)
+            fprintf(stderr, "files: can't read %s: %s\n", path, strerror(error));
+    }
+    free(path);
+}
+
+static void config_free(struct config *config)
+{
+    for (size_t i = 0; i < config->writable_count; ++i)
+        free(config->writable[i]);
+    free(config->writable);
+    free(config->terminal);
+}
+
+/* Folders' own views */
+
+static void views_load(struct files *files)
+{
+    FILE *file = files->views_path ? fopen(files->views_path, "re") : NULL;
+    char *line = NULL;
+    size_t capacity = 0;
+    ssize_t length;
+    while (file && (length = getline(&line, &capacity, file)) > 0) {
+        while (length && line[length - 1] == '\n')
+            line[--length] = 0;
+        char *tab = strchr(line, '\t');
+        if (!tab || tab[1] != '/')
+            continue;
+        struct folder_view *grown = realloc(files->views, (files->view_count + 1) * sizeof *grown);
+        char *path = strdup(tab + 1);
+        if (!grown || !path) {
+            free(path);
+            break;
+        }
+        files->views = grown;
+        files->views[files->view_count++] = (struct folder_view){path, strncmp(line, "icons", 5) == 0 ? VIEW_ICONS : VIEW_LIST};
+    }
+    free(line);
+    if (file)
+        fclose(file);
+}
+
+#define VIEWS_KEPT 1000
+
+static void views_save(struct files *files)
+{
+    if (!files->views_path)
+        return;
+    char *directory = parent_path(files->views_path);
+    if (!directory || desk_mkdirs(directory, 0700) != 0) {
+        free(directory);
+        return;
+    }
+    free(directory);
+    DeskAtomic atomic;
+    if (desk_atomic_open(&atomic, files->views_path, 0600) != 0)
+        return;
+    for (size_t i = 0; i < files->view_count; ++i)
+        fprintf(atomic.file, "%s\t%s\n", files->views[i].view == VIEW_ICONS ? "icons" : "list", files->views[i].path);
+    desk_atomic_commit(&atomic, true);
+    desk_atomic_abort(&atomic);
+}
+
+static const struct folder_view *folder_view(const struct files *files, const char *path)
+{
+    for (size_t i = files->view_count; i-- > 0;) {
+        if (strcmp(files->views[i].path, path) == 0)
+            return &files->views[i];
+    }
+    return NULL;
+}
+
+/* The view was switched in path: remember it there, newest last. */
+static void remember_view(struct files *files, const char *path, enum view view)
+{
+    for (size_t i = 0; i < files->view_count; ++i) {
+        if (strcmp(files->views[i].path, path) == 0) {
+            free(files->views[i].path);
+            memmove(files->views + i, files->views + i + 1, (files->view_count - i - 1) * sizeof *files->views);
+            --files->view_count;
+            break;
+        }
+    }
+    if (files->view_count == VIEWS_KEPT) {
+        free(files->views[0].path);
+        memmove(files->views, files->views + 1, (files->view_count - 1) * sizeof *files->views);
+        --files->view_count;
+    }
+    struct folder_view *grown = realloc(files->views, (files->view_count + 1) * sizeof *grown);
+    char *copy = strdup(path);
+    if (!grown || !copy) {
+        free(copy);
+        return;
+    }
+    files->views = grown;
+    files->views[files->view_count++] = (struct folder_view){copy, view};
+    views_save(files);
 }
 
 /* Applications marked Terminal=true run in run's terminal (its
@@ -1220,7 +1434,9 @@ static char *thumbnails_directory(const char *home)
    x-large (512) or xx-large (1024), holding Thumb::URI and Thumb::MTime, so
    other applications make and use the same ones. */
 
-#define THUMB_MAX_BYTES (256u << 20) /* The most an image may decode to. */
+/* Set from the config before the thumbnailer starts. */
+static size_t thumb_max_bytes = 256u << 20; /* The most an image may decode to. */
+static bool thumbnails_enabled = true;
 
 static const struct {
     const char *name;
@@ -1231,7 +1447,7 @@ static const struct {
 static bool thumbnailable(const struct entry *entry)
 {
     static const char *const types[] = {"png", "jpg", "jpeg", "jpe", "gif", "webp", NULL};
-    return !entry->directory && !entry->broken && S_ISREG(entry->target_mode) && entry->size > 0 &&
+    return thumbnails_enabled && !entry->directory && !entry->broken && S_ISREG(entry->target_mode) && entry->size > 0 &&
            has_suffix(entry->name, types);
 }
 
@@ -1548,7 +1764,7 @@ static bool make_thumbnail(const char *thumbs_dir, const char *path, time_t mtim
         FILE *file = fopen(path, "rbe");
         DeskImage image;
         char error[128];
-        if (file && desk_image_load(file, &image, THUMB_MAX_BYTES, DESK_IMAGE_SHRINK, error, sizeof error)) {
+        if (file && desk_image_load(file, &image, thumb_max_bytes, DESK_IMAGE_SHRINK, error, sizeof error)) {
             struct rgba full = {(int)image.width, (int)image.height, image.pixels};
             ok = rgba_fit(&full, thumb_classes[class].size, &stored) && rgba_orient(&stored, image.orientation);
             bool turned = image.orientation >= 5 && image.orientation <= 8;
@@ -1893,6 +2109,8 @@ static void enter(struct files *files, char *path, const char *select)
         stop_path_edit(files);
     files->typed[0] = 0;
     files->notice[0] = 0;
+    const struct folder_view *own = folder_view(files, path);
+    files->view = own ? own->view : files->config.view;
     struct memory *memory = find_memory(files, path);
     load(files, select ? select : memory ? memory->name : NULL, 0, false);
     watch_directory(files);
@@ -2350,7 +2568,7 @@ static void set_view(struct files *files, enum view view)
         return;
     files->view = view;
     files->free_scroll = false;
-    save_state(files);
+    remember_view(files, files->path, view);
     desk_window_redraw(&files->window);
 }
 
@@ -2375,6 +2593,8 @@ static void zoom(struct files *files, int direction)
         level = count - 1;
     if (view == files->view && level == files->zoom[view])
         return;
+    if (view != files->view)
+        remember_view(files, files->path, view);
     files->view = view;
     files->zoom[view] = level;
     files->free_scroll = false;
@@ -5109,7 +5329,7 @@ static bool handle_key(struct files *files, uint32_t key)
 
 static double font_pixels(const struct files *files)
 {
-    return FONT_POINTS * 96.0 / 72.0 * desk_window_scale(&files->window);
+    return files->config.font_points * 96.0 / 72.0 * desk_window_scale(&files->window);
 }
 
 static void resize_font(DeskFont *font, double size)
@@ -5579,6 +5799,11 @@ static void draw_row(struct files *files, DeskCanvas *canvas, const struct layou
                          name_right < canvas->clip_right ? name_right : canvas->clip_right, canvas->clip_bottom);
         draw_name(entry->link ? layout->italic : layout->font, &clipped, name_x, baseline, name_right - name_x,
                   entry->name, entry->directory, color);
+        if (marks.hovered && desk_text_width(entry->link ? layout->italic : layout->font, entry->name,
+                                             strlen(entry->name)) > name_right - name_x) {
+            files->tip_cut = true;
+            files->tip_name = entry->name;
+        }
     }
 
     uint32_t detail_color = selected ? colors->selection_foreground : colors->muted;
@@ -5714,6 +5939,10 @@ static void paint_icons(struct files *files, DeskCanvas *canvas, const struct la
                 int second = desk_text_width(font, rest, rest_length);
                 int x = second <= text_width ? left + (tile - second) / 2 : left + pad;
                 draw_name_part(font, &clipped, x, baseline + line, text_width, rest, rest_length, false, color);
+                if (marks.hovered && second > text_width) {
+                    files->tip_cut = true;
+                    files->tip_name = entry->name;
+                }
             }
         }
     }
@@ -6196,6 +6425,32 @@ static void paint_progress(struct files *files, DeskCanvas *canvas, const struct
     desk_canvas_fill(canvas, left, bar_top, (int)(width * fraction), bar_height, colors->directory);
 }
 
+static int pointer_buffer_y(const struct files *files);
+
+/* The full name of a name cut short, under the pointer after a rest. */
+static void paint_tip(struct files *files, DeskCanvas *canvas, const struct layout *ui)
+{
+    if (!files->tip_shown || !files->tip_cut || !files->tip_name)
+        return;
+    const struct colors *colors = &files->colors;
+    int pad = ui->padding, line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    const char *name = files->tip_name;
+    int width = desk_text_width(ui->font, name, strlen(name)) + pad;
+    if (width > canvas->width - 2 * pad)
+        width = canvas->width - 2 * pad;
+    int height = ui->row_height;
+    int x = pointer_buffer_x(files) + pad, y = pointer_buffer_y(files) + (int)lround(20 * desk_window_scale(&files->window));
+    if (x + width > canvas->width - pad / 2)
+        x = canvas->width - pad / 2 - width;
+    if (x < pad / 2)
+        x = pad / 2;
+    if (y + height > canvas->height - pad / 2)
+        y = pointer_buffer_y(files) - height - pad / 2;
+    desk_canvas_fill(canvas, x, y, width, height, mix(colors->background, colors->muted, 35));
+    outline(canvas, x, y, width, height, line, mix(colors->background, colors->muted, 110));
+    draw_clipped(ui->font, canvas, x + pad / 2, x + width - pad / 2, y + ui->baseline, name, colors->foreground);
+}
+
 /* Dropping into the folder shown: a frame around the list. */
 static void paint_drop_frame(struct files *files, DeskCanvas *canvas, int top, int bottom)
 {
@@ -6299,6 +6554,8 @@ static void paint(struct files *files, DeskCanvas *canvas)
         files->top = clamp_top(files->top, lines, panes->rows);
     else
         files->top = keep_visible(files->top, files->cursor / per_line, lines, panes->rows);
+    files->tip_cut = false;
+    files->tip_name = NULL;
     if (files->view == VIEW_ICONS)
         paint_icons(files, &area, &ui, panes->list_left, top, panes->rows + 1);
     else
@@ -6317,6 +6574,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
     }
     paint_drop_frame(files, &area, top, bottom);
     paint_notice(files, &area, &ui, bottom);
+    paint_tip(files, canvas, &ui);
 }
 
 /* While a path is typed: the directories it could go on to, in a box
@@ -6516,6 +6774,10 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
     files->input_serial = serial;
     if (!files->keyboard.state)
         return;
+    if (files->tip_shown) {
+        files->tip_shown = false;
+        desk_window_redraw(&files->window);
+    }
     bool repeats = handle_key(files, key);
     if (repeats && desk_keyboard_repeats(&files->keyboard, key))
         desk_repeat_start(&files->repeat, key);
@@ -8185,6 +8447,29 @@ static bool shows_hover(enum target_kind kind)
     return kind != TARGET_NONE && kind != TARGET_SEARCH && kind != TARGET_PATH;
 }
 
+/* The pointer moved to something else: the tooltip goes, and comes back
+   after a rest on an entry. */
+static void tip_rearm(struct files *files)
+{
+    if (files->tip_shown)
+        desk_window_redraw(&files->window);
+    files->tip_shown = false;
+    if (files->tip_timer <= 0)
+        return;
+    struct itimerspec when = {0};
+    if (files->hover.kind == TARGET_ROW && !files->band_pending && !files->dialog.open)
+        when.it_value.tv_nsec = 600 * 1000000L;
+    timerfd_settime(files->tip_timer, 0, &when, NULL);
+}
+
+static void tip_fired(struct files *files)
+{
+    uint64_t count;
+    (void)!read(files->tip_timer, &count, sizeof count);
+    files->tip_shown = true;
+    desk_window_redraw(&files->window);
+}
+
 static void update_hover(struct files *files, bool force)
 {
     struct target hover = target_at(files);
@@ -8193,6 +8478,7 @@ static void update_hover(struct files *files, bool force)
     struct target old = files->hover;
     /* Set before redrawing: the redraw may paint right away. */
     files->hover = hover;
+    tip_rearm(files);
     if (shows_hover(hover.kind) || shows_hover(old.kind))
         desk_window_redraw(&files->window);
     set_cursor(files, force);
@@ -8276,6 +8562,8 @@ static void press_entries(struct files *files, size_t index, unsigned mods)
     }
     files->free_scroll = false;
     files->band_pending = true;
+    files->press_row = index;
+    files->press_mods = mods;
     files->press_on_name = index != (size_t)-1 && on_name(files, index);
     files->band_x0 = files->band_x1 = pointer_buffer_x(files);
     files->band_y0 = files->band_y1 = content_y(files);
@@ -8338,8 +8626,23 @@ static void band_drag(struct files *files)
     desk_window_redraw(&files->window);
 }
 
+static void go_in(struct files *files);
+
 static void band_end(struct files *files)
 {
+    /* Single-click opening: a plain click on an entry that didn't drag. */
+    int reach_open = (int)lround(4 * desk_window_scale(&files->window));
+    bool open = files->config.single_click && !files->banding && files->band_pending &&
+                files->press_row != (size_t)-1 && files->press_row < files->listing.shown_count &&
+                !(files->press_mods & (DESK_MOD_CTRL | DESK_MOD_SHIFT)) &&
+                abs(pointer_buffer_x(files) - files->band_x0) < reach_open &&
+                abs(content_y(files) - files->band_y0) < reach_open;
+    if (open) {
+        files->band_pending = files->banding = false;
+        select_only(files, files->press_row);
+        go_in(files);
+        return;
+    }
     if (!files->banding && files->band_pending && files->press_on_name && !files->band_add) {
         /* A click on a selected name, not a drag: that entry alone. */
         int reach = (int)lround(4 * desk_window_scale(&files->window));
@@ -8351,8 +8654,12 @@ static void band_end(struct files *files)
     desk_window_redraw(&files->window);
 }
 
+static void tip_rearm(struct files *files);
+
 static void click(struct files *files, uint32_t time)
 {
+    files->hover = (struct target){TARGET_NONE, 0};
+    tip_rearm(files);
     struct target target = target_at(files);
     unsigned mods = desk_keyboard_mods(&files->keyboard);
     if (files->dialog.open) {
@@ -8409,7 +8716,7 @@ static void click(struct files *files, uint32_t time)
         go_to_place(files, target.index);
         break;
     case TARGET_ROW:
-        if (twice && !(mods & (DESK_MOD_CTRL | DESK_MOD_SHIFT))) {
+        if (twice && !files->config.single_click && !(mods & (DESK_MOD_CTRL | DESK_MOD_SHIFT))) {
             select_only(files, target.index);
             go_in(files);
             break;
@@ -8623,6 +8930,8 @@ static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, 
     struct files *files = data;
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
         files->scroll_pixels += wl_fixed_to_double(value);
+    if (files->tip_shown)
+        tip_rearm(files);
 }
 
 /* Apply the frame's scrolling. With Ctrl held it zooms, a step a notch;
@@ -8779,7 +9088,7 @@ static const struct wl_registry_listener registry_listener = {
 static bool open_window(struct files *files)
 {
     char error[256];
-    double size = FONT_POINTS * 96.0 / 72.0;
+    double size = files->config.font_points * 96.0 / 72.0;
     if (!(files->font = desk_font_open("sans-serif", size, error, sizeof error)) ||
         !(files->italic = desk_font_open("sans-serif:slant=italic", size, error, sizeof error)) ||
         !(files->mono = desk_font_open("monospace", size * 0.9, error, sizeof error)) ||
@@ -8889,7 +9198,7 @@ static bool run(struct files *files)
             wl_display_cancel_read(display);
             return false;
         }
-        struct pollfd fds[10] = {
+        struct pollfd fds[11] = {
             {.fd = wl_display_get_fd(display), .events = POLLIN},
             {.fd = files->repeat.fd, .events = POLLIN},
             {.fd = files->inotify, .events = POLLIN},
@@ -8900,8 +9209,9 @@ static bool run(struct files *files)
             {.fd = files->thumbnailer ? files->thumbnailer->event : -1, .events = POLLIN},
             {.fd = files->worker ? files->worker->event : -1, .events = POLLIN},
             {.fd = files->counter ? files->counter->event : -1, .events = POLLIN},
+            {.fd = files->tip_timer > 0 ? files->tip_timer : -1, .events = POLLIN},
         };
-        if (poll(fds, 10, -1) < 0) {
+        if (poll(fds, 11, -1) < 0) {
             wl_display_cancel_read(display);
             if (errno == EINTR)
                 continue;
@@ -8946,6 +9256,8 @@ static bool run(struct files *files)
             jobs_event(files);
         if (files->counter && fds[9].revents & POLLIN)
             counter_event(files);
+        if (files->tip_timer > 0 && fds[10].revents & POLLIN)
+            tip_fired(files);
         if (files->mounts >= 0 && fds[5].revents & (POLLPRI | POLLERR)) {
             build_places(files); /* A drive came or went. */
             desk_window_redraw(&files->window);
@@ -9038,8 +9350,20 @@ int main(int argc, char **argv)
     }
     if (files.home)
         files.home_real = realpath(files.home, NULL);
+    config_load(&files.config);
+    sort_directories_first = files.config.directories_first;
+    thumbnails_enabled = files.config.thumbnails;
+    thumb_max_bytes = files.config.image_limit;
+    files.show_hidden = files.config.hidden;
     files.state_path = state_path();
     load_state(&files);
+    if (files.state_path) {
+        char *directory = parent_path(files.state_path);
+        if (directory && asprintf(&files.views_path, "%s/views", directory) < 0)
+            files.views_path = NULL;
+        free(directory);
+    }
+    views_load(&files);
     char *directory, *select = NULL;
     int status = start_at(optind < argc ? argv[optind] : files.home ? files.home : "/", &directory, &select);
     if (status) {
@@ -9055,6 +9379,7 @@ int main(int argc, char **argv)
     update_colors(&files);
     files.inotify = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     files.refresh = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    files.tip_timer = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     int error = desk_repeat_open(&files.repeat);
     if (error)
         fprintf(stderr, "files: no key repeat: %s\n", strerror(error));
@@ -9081,7 +9406,7 @@ int main(int argc, char **argv)
     files.thumbnailer = thumbnailer_create(files.thumbs_dir); /* Without it, images show their icon. */
     files.worker = worker_create(); /* Without it, copying and deleting say so. */
     files.job_top = -1;
-    files.terminal = terminal_command();
+    files.terminal = files.config.terminal ? strdup(files.config.terminal) : terminal_command();
     files.bookmarks_path = bookmarks_file();
     signal(SIGCHLD, SIG_IGN); /* Applications started are left to themselves. */
     files.tabs = calloc(1, sizeof *files.tabs);
@@ -9142,5 +9467,12 @@ int main(int argc, char **argv)
     free(files.home);
     free(files.home_real);
     free(files.state_path);
+    config_free(&files.config);
+    for (size_t i = 0; i < files.view_count; ++i)
+        free(files.views[i].path);
+    free(files.views);
+    free(files.views_path);
+    if (files.tip_timer > 0)
+        close(files.tip_timer);
     return status;
 }

@@ -10,8 +10,30 @@ On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-prot
 
 ```sh
 make
-make install      # /usr/local/bin/files; honors PREFIX, BINDIR and DESTDIR
+make install      # /usr/local/bin/files and files.desktop; honors PREFIX, BINDIR, DATADIR and DESTDIR
+make default      # files opens folders for other applications (xdg-mime default ... inode/directory)
 ```
+
+In dwl, Super+E starts files. Without `xdg-mime`, `make default` prints the line to put under `[Default Applications]` in `~/.config/mimeapps.list`: `inode/directory=files.desktop`.
+
+## Config
+
+`~/.config/files/files.conf` (or under `$XDG_CONFIG_HOME`) is written from [files.conf](files.conf) on the first start, so deleting it brings back the defaults. Changes take effect the next time files starts. Unknown keys and bad values are reported on stderr and the default stays.
+
+| Section | Key | Default | Meaning |
+|---|---|---|---|
+| `[layout]` | `font_size` | `11` | Text size in points |
+| `[view]` | `view` | `list` | `list` or `icons`, for folders without a view of their own |
+| | `hidden` | `false` | Show hidden files from the start (Ctrl+H toggles) |
+| | `sort` | `name` | `name`, `type`, `size` or `modified`, until a heading is clicked |
+| | `directories_first` | `true` | Folders before files |
+| | `click` | `double` | `single` opens with one click; Ctrl or Shift and a click still select |
+| `[thumbnails]` | `enable` | `true` | Thumbnails of images in the icon view |
+| | `image_limit` | `256` | The largest image decoded for one, in MiB of pixels |
+| `[safety]` | `writable` | empty | Folders outside home files may change, separated by `:` (see Protected places) |
+| `[open]` | `terminal` | empty | How `Terminal=true` applications start; empty uses run's, or `deal -e` |
+
+The window's own choices are kept in `~/.local/state/files/`: `state` (sidebar and column widths, zoom, sort) and `views`, the view of each folder it was switched in (Ctrl+1, Ctrl+2 or the buttons), the last 1000.
 
 Icons are glyphs from Symbols Nerd Font, found through fontconfig's fallback for `sans-serif`, so no icon theme is needed. Without that font they show as boxes.
 
@@ -222,6 +244,7 @@ files will only change things inside your home directory (and your trash, wherev
 - Directories are read with `openat` and `fstatat` relative to the directory, so long paths and renames while reading can't confuse it. Symlinks to directories are followed by name, so the path shows the link and `h` returns to where the link was.
 - The selection is remembered per directory for the session, so `h` then `l` comes back to the same entry.
 - The current directory is watched with inotify. Changes are gathered for 100 ms and then the directory is read again, keeping the selection on the same name.
+- Resting the pointer on a name that was cut short shows it whole in a tooltip.
 - If the current directory is deleted, moved or unmounted, files moves to the nearest parent that still exists.
 - A directory without read permission shows the error in place of the entries; `h` still works.
 - Only the rows on screen are drawn. A directory of 100,000 entries takes about 0.1 s to read and sort, and redrawing a 4K frame takes about 3 ms once the glyphs are cached.
@@ -254,6 +277,10 @@ files will only change things inside your home directory (and your trash, wherev
 - [ ] In dwl, an image opened from files floats over files instead of under it.
 - [ ] Dragging shows a badge with the name (or "3 items") under the pointer.
 - [ ] Alt+Enter on a big folder counts up its size and contents; closing it stops the counting.
+- [ ] A first start writes `~/.config/files/files.conf`; `click = single` opens with one click, `view = icons` applies to new folders.
+- [ ] Icons in ~/Pictures and the list elsewhere stay that way after a restart.
+- [ ] Resting on a long name shows it whole.
+- [ ] Super+E starts files; a browser's "show in folder" opens files.
 - [ ] Narrowing the window hides the sidebar.
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
 - [ ] Images show thumbnails in the icon view, quickly on a second visit; a photo taken sideways shows upright; editing an image updates its thumbnail.

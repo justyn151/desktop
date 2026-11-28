@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=files
+GenericName=File Manager
+Comment=Browse, open and manage your files
+Exec=files %f
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;

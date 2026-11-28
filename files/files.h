@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.4.5"
+#define FILES_VERSION "0.5.0"
 
 /* Exit statuses. */
 enum {
@@ -195,6 +195,24 @@ struct undo {
 struct worker;
 struct counter;
 
+/* ~/.config/files/files.conf. */
+struct config {
+    double font_points;
+    enum view view;           /* For folders without their own. */
+    bool hidden, directories_first, single_click, thumbnails;
+    enum column sort;
+    size_t image_limit;       /* Bytes of pixels. */
+    char **writable;          /* Real paths outside home that may change. */
+    size_t writable_count;
+    char *terminal;           /* NULL: run's, or deal -e. */
+};
+
+/* A folder's own view, from switching it there. */
+struct folder_view {
+    char *path;
+    enum view view;
+};
+
 /* An image's thumbnail, as made for a box of size buffer pixels. Kept in
    a hash by path while the directory is shown. */
 enum thumb_state { THUMB_PENDING, THUMB_READY, THUMB_FAILED };
@@ -311,6 +329,17 @@ struct files {
     struct wp_viewport *drag_viewport;
     DeskBufferPool drag_buffers;
     struct counter *counter;  /* Counting for Properties. */
+    struct config config;
+    struct folder_view *views; /* Oldest first. */
+    size_t view_count;
+    char *views_path;         /* ~/.local/state/files/views */
+    /* The full name of a cut-short name under the pointer, after a rest. */
+    int tip_timer;            /* timerfd */
+    bool tip_shown, tip_cut;  /* Shown; the hovered name was drawn cut short this frame. */
+    const char *tip_name;
+    /* The last press on the list, for single-click opening. */
+    size_t press_row;
+    unsigned press_mods;
     char **drag_paths;
     size_t drag_count;
     /* Something dragged over the window: where it would go. */
