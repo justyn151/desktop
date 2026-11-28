@@ -17,7 +17,7 @@ Ground rules that apply to every phase:
 
 **Next, in order:**
 
-1. `files`: 0.1 and 0.2 are done apart from their live key checks (`files/README.md`). Next is 0.3 from [docs/files-roadmap.md](docs/files-roadmap.md): opening files with the default application, Open with, filtering, path entry, bookmarks and sorting. Worth installing `shared-mime-info` before 0.3, which reads its MIME globs to pick applications.
+1. `files`: 0.1 and 0.2 are done apart from their live key checks (`files/README.md`). Next is 0.3 from [docs/files-roadmap.md](docs/files-roadmap.md): double-click to open with the default application, the right-click menu with Open with, search, typing a path, bookmarks, sorting by column headers, and the standard keys in place of `h`/`j`/`k`/`l`. files is a mouse-first explorer, not a keyboard-first one. Worth installing `shared-mime-info` before 0.3, which reads its MIME globs to pick applications.
 2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
 3. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
@@ -232,15 +232,15 @@ The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on d
 
 ### files
 
-A graphical file manager with an explorer layout (toolbar, sidebar of places, the list) and H/J/K/L navigation, pulled forward after view and mark. The detailed plan is in [docs/files-roadmap.md](docs/files-roadmap.md). Icons are Nerd Font glyphs in palette colors, so it needs no icon theme; opening files resolves `mimeapps.list` and desktop entries itself, so it doesn't need xdg-utils. It's also the file picker for other apps (choosing uploads, where downloads go, Open and Save dialogs) through its own FileChooser portal backend, which needs `xdg-desktop-portal` installed.
+A graphical file manager that works like a normal explorer, mouse first with the standard shortcuts: a toolbar, a sidebar of places and the list, pulled forward after view and mark. The detailed plan is in [docs/files-roadmap.md](docs/files-roadmap.md). Icons are Nerd Font glyphs in palette colors, so it needs no icon theme; opening files resolves `mimeapps.list` and desktop entries itself, so it doesn't need xdg-utils. It's also the file picker for other apps (choosing uploads, where downloads go, Open and Save dialogs) through its own FileChooser portal backend, which needs `xdg-desktop-portal` installed.
 
 | Version | Milestone | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse | Done (live key and mouse checks pending) |
-| 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
-| 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
-| 0.5 | Right-click, drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
+| 0.3 | Double-click to open, the right-click menu and Open with, search, typing a path, bookmarks, sorting by column headers, standard keys | Not started |
+| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
+| 0.5 | Icon view with thumbnails, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Not started |
 
@@ -314,7 +314,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 | 14 | `power` | Session and power controls: logout, suspend, reboot, shutdown |
 | 15 | `mount` | Storage and removable-device manager (udisks2) |
 | 16 | `view` | Image viewer |
-| 17 | `files` | Graphical file manager with an explorer layout and H/J/K/L navigation; roadmap in `docs/files-roadmap.md` |
+| 17 | `files` | Graphical file manager, a normal mouse-first explorer; roadmap in `docs/files-roadmap.md` |
 | 18 | `ctl` | Desktop configuration tool for fonts, theme and shared settings |
 | 19 | `music` | Local music player |
 | 20 | `video` | Video frontend, with mpv as the playback backend |

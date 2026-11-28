@@ -6,9 +6,11 @@ Implementation plan for files, the graphical file manager, from 0.1 to 1.0. It e
 
 files is one `files.c` and one `files.h`, built on `desk/` from its first commit, the same way view and shot were. It's a normal xdg-shell window (app ID `files`), so dwl tiles it like any other client.
 
-The layout is a file explorer's: a toolbar with back, forward, up and the path, a sidebar of places on the left, and the current directory filling the rest (0.2). Moving is ranger's: `h` goes up, `l` goes in (or opens a file), `j` and `k` move. Everything works from the keyboard first; the mouse works too since 0.2, and right-click and drag and drop come in 0.5.
+files is a normal graphical file explorer, used with the mouse first: a toolbar with back, forward, up and the path, a sidebar of places on the left, and the current directory filling the rest (0.2). Things are done the way other explorers do them: double-click opens, right-click brings up a menu, files are dragged where they should go, and dialogs ask before anything is replaced or deleted. The keyboard has the standard shortcuts (Ctrl+C, Ctrl+V, F2, Delete, Ctrl+L, Alt+Left), not a vocabulary of its own to learn.
 
-files has two jobs. It's the file manager, and it's also the file picker for every other application: the dialog a browser opens to upload a file or ask where a download goes, and any "Open…" or "Save as…" dialog. The picker is the same window and keys with a choose bar added (0.6). Applications reach it through the `org.freedesktop.impl.portal.FileChooser` portal backend, so there's one way to move around the filesystem instead of a GTK dialog with keys of its own.
+0.1 started out keyboard-only, with ranger's `h`, `j`, `k` and `l`. Those letter keys go in 0.3, when typing a letter starts selecting by name as in other explorers.
+
+files has two jobs. It's the file manager, and it's also the file picker for every other application: the dialog a browser opens to upload a file or ask where a download goes, and any "Open…" or "Save as…" dialog. The picker is the same window with Open and Cancel buttons added (0.6). Applications reach it through the `org.freedesktop.impl.portal.FileChooser` portal backend, so there's one way to move around the filesystem instead of a GTK dialog with keys of its own.
 
 ### What already exists
 
@@ -16,7 +18,7 @@ files has two jobs. It's the file manager, and it's also the file picker for eve
 |---|---|---|
 | xdg-shell window, shm buffers, fractional scale through `wp_viewporter` | view (`desk_buffer_get`, `-DDESK_WAYLAND`) | Every frame (0.1) |
 | xkbcommon keymap and modifiers | view, run, deal (each its own copy) | Keys (0.1) |
-| Key repeat | `DeskRepeat` | Holding `j` (0.1) |
+| Key repeat | `DeskRepeat` | Holding an arrow key (0.1) |
 | Fontconfig matching and FreeType rendering into ARGB | bar, run, wall (each its own copy) | Every line of text (0.1) |
 | Image decoding | `desk_image_load` (`-DDESK_IMAGE`) | Thumbnails (0.5) |
 | Desktop entry parsing (`Exec`, `TryExec`, `MimeType`, field codes) | run | Opening files with the right application (0.3) |
@@ -42,6 +44,8 @@ dwl already supports everything files needs: xdg-shell, viewporter, fractional s
 | A plain xdg-shell window with scale tracking (`DeskWindow`: surface, toplevel, viewport, fractional scale, configure and close) | 1 | 0.1 | Step 4, for toplevels. view moves onto it |
 | Desktop entries and `mimeapps.list` lookup (`desk_app_for_type`, `desk_app_exec` with field codes and a detached spawn) | 0 | 0.3 | None yet. run moves onto the parser later |
 | MIME type of a file (`desk_mime_type`: globs2, built-in table, sniffing) | 0 | 0.3 | None |
+| Popup menus (`xdg_popup` with a grab, positioned against the window, closing on a click outside) | 1 | 0.3 | Step 4, for popups. bar's menus could move onto it |
+| A one-line text field (cursor, selection, word movement, clipboard paste), for the path, search, rename and the picker's name | 2 | 0.3 | None. run's prompt could move onto it |
 
 Moving view onto the keyboard and window pieces happens in the same milestone that adds them, so there are never two copies. bar, run and wall move to the font layer in Phase 3 step 5, not here.
 
@@ -136,64 +140,110 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 
 ---
 
-## 0.3: Opening, finding and going places
+## 0.3: Opening, menus, finding and sorting
 
 ### Opening files
 
-- `l` or Enter on a file opens it with the default application for its MIME type: `mimeapps.list` (`~/.config/mimeapps.list`, then the system lists) and desktop entries from `XDG_DATA_DIRS` and `~/.local/share/applications`. Images go to view, markdown to mark in deal (through `Terminal=true` and the `terminal` command from run's config), text to `editor` in deal.
-- `o` opens an "Open with" list of every application that declares the type, plus all others below a separator; choosing one with Shift+Enter also makes it the default (written atomically to `~/.config/mimeapps.list`).
-- Executable files are not run on Enter. `x` runs one, in deal when it's a script.
+- Double-click or Enter on a file opens it with the default application for its MIME type: `mimeapps.list` (`~/.config/mimeapps.list`, then the system lists) and desktop entries from `XDG_DATA_DIRS` and `~/.local/share/applications`. Images go to view, markdown to mark in deal (through `Terminal=true` and the `terminal` command from run's config), text to `editor` in deal.
+- Several selected files (0.4) open together, each with its own application.
+- Executables don't run on double-click; they open like any other file of their type. The menu has Run for them, in deal when it's a script.
 - Applications start detached in their own session, like mark's opener.
 
-### Finding
+### The right-click menu
+
+A popup menu (desk's new `xdg_popup` piece) at the pointer. Keyboard users reach it with the Menu key or Shift+F10.
+
+| Right-click on | Menu |
+|---|---|
+| A file | Open, Open with ▸, Run (executables), Copy path, Add to sidebar (directories). 0.4 adds Cut, Copy, Rename, Move to trash, Properties |
+| Empty space in the list | Show hidden files (checked when on), Sort by ▸, Refresh. 0.4 adds Paste, New folder, New file |
+| A place in the sidebar | Open, Remove from sidebar (bookmarks only) |
+
+- **Open with ▸** lists the applications that declare the type, the default first, then "Other application…", a dialog listing every application with a search field and an "Always use for this kind of file" checkbox, written atomically to `~/.config/mimeapps.list`.
+
+### Finding and going places
+
+- **Typing a path:** clicking the empty part of the path bar, or Ctrl+L, turns it into a text field holding the full path, selected. Suggestions for the directory being typed drop down below it; Tab or a click completes one, `~` expands, Enter goes there, Escape gives the crumbs back.
+- **Search:** a search field at the right end of the toolbar (Ctrl+F) filters the current directory as you type, substring and case-insensitive. A × in the field, or Escape, clears it. Searching below the current directory, recursively, comes after 1.0 if it's wanted.
+- **Type to select:** typing letters in the list jumps to the first name that starts with them, as in other explorers. The typed text resets after a second without a key.
+- **Bookmarks:** "Add to sidebar" in the menu, or dragging a folder onto the sidebar (0.4), adds it under a Bookmarks heading. They're kept in GTK's bookmarks file (`~/.config/gtk-3.0/bookmarks`), so GTK file dialogs and other file managers show the same ones.
+
+### Sorting and the details view
+
+- The list gets a header row: Name, Size, Modified, Type. Clicking a heading sorts by it, clicking again reverses, and an arrow marks the sorted column. Dragging between headings resizes the columns. Directories stay first either way.
+- The sort and column widths are kept in the state file.
+
+### Keys
+
+The standard ones, replacing 0.1's letter keys:
 
 | Key | Action |
 |---|---|
-| `/` | Filter the current directory as you type (substring, smart case); Enter keeps the filter, Escape clears it |
-| `n`, `N` | With a kept filter, next and previous match instead of hiding the rest |
-| `:` or Ctrl+L | Type a path, with Tab completion; `~` expands |
-| `'` then a letter | Jump to a bookmark; `m` then a letter sets one (`~/.config/files/bookmarks`) |
-| `s` | Sort: name, modified, size, type, cycling; `S` reverses |
+| Up, Down, Page Up, Page Down, Home, End | Move the selection |
+| Enter | Open (go into a directory) |
+| Backspace, Alt+Up | Up to the parent |
+| Alt+Left, Alt+Right | Back, forward (and the mouse's side buttons) |
+| Alt+Home | Home |
+| Ctrl+L | Type a path |
+| Ctrl+F | Search |
+| Ctrl+H | Show or hide hidden files |
+| F5 | Refresh |
+| F9 | Show or hide the sidebar |
+| Menu, Shift+F10 | The right-click menu for the selection |
+| Ctrl+W, Ctrl+Q | Close |
+| Letters and digits | Type to select |
 
 ### Manual checks
 
-- Enter on a PNG opens view, on a `.md` opens mark in a new deal window, on a `.c` file opens `editor` in deal.
-- `o` lists the applications for a type; making one the default sticks after a restart.
-- `/` narrows a large directory as you type; `:` with Tab completes paths.
+- Double-clicking a PNG opens view, a `.md` opens mark in a new deal window, a `.c` file opens `editor` in deal.
+- Right-click → Open with → Other application… with "Always use" checked changes the default, and it sticks after a restart.
+- The search field narrows a large directory as you type; typing a path with Tab completion goes there.
+- A bookmark added in files shows in a GTK app's file dialog.
+- Clicking the Size heading sorts by size, and again reverses it.
 
 ---
 
 ## 0.4: File operations
 
-### Selection and clipboard
+### Selecting
 
-| Key | Action |
-|---|---|
-| Space | Select or unselect and move down |
-| `v` | Select all, `V` invert, Escape clears |
-| `y` | Copy the selection (or the entry under the cursor) |
-| `d` | Cut |
-| `p` | Paste into the current directory |
-| `r` | Rename inline, with the name minus its extension selected |
-| `a` | New file or, ending in `/`, a directory, typed inline |
-| Delete | Move to the trash |
-| Shift+Delete | Delete permanently, after a confirmation that names what goes |
-| `u` | Undo the last rename, move or trash |
+- Click selects one entry, Ctrl+click adds or removes one, Shift+click selects the range from the last click. Dragging on empty space draws a rubber band that selects what it touches.
+- Ctrl+A selects everything; Escape or a click on empty space clears the selection. Shift with the arrow keys extends it.
+
+### Doing things
+
+Every action is in the right-click menu, with the usual shortcut:
+
+| Action | Shortcut | Notes |
+|---|---|---|
+| Cut, Copy, Paste | Ctrl+X, Ctrl+C, Ctrl+V | Paste goes into the current directory, or into a folder right-clicked |
+| Rename | F2, or a slow second click on a selected name | Inline, with the name minus its extension selected |
+| New folder, New file | Ctrl+Shift+N | Created as "New folder" with its name being edited |
+| Move to trash | Delete | |
+| Delete permanently | Shift+Delete | After a dialog that names what goes |
+| Undo | Ctrl+Z | The last rename, move, copy or trash |
+| Properties | Alt+Enter | Type, size (a folder's counted in the background), location, permissions, owner, modified time, link target |
+
+### Drag and drop
+
+- Dragging the selection onto a folder, a crumb in the path or a place in the sidebar moves it there within one filesystem and copies it onto another, as in other explorers. Holding Ctrl copies, Shift moves. The target highlights while it's under the pointer.
+- Dropping a folder on the sidebar's empty space bookmarks it.
+- Dragging to and from other applications comes in 0.5.
 
 ### Design
 
-- Copy, move and delete run in a worker thread with a progress line under the toolbar (files, bytes, current name) and can be cancelled. Moves within a filesystem are `renameat2`; across filesystems, copy then remove. Copies use `copy_file_range` and keep modes and times. Symlinks are copied as links.
-- Name conflicts ask once per operation: replace, skip, rename (`name (2).ext`), with "apply to all".
-- The trash follows the freedesktop spec (`~/.local/share/Trash/files` and `info`, `$topdir/.Trash-$uid` on other filesystems), so other tools see the same trash. `T` opens the trash as a directory, where `p` restores.
+- Copy, move and delete run in a worker thread with a progress bar under the toolbar (files, bytes, current name) and a Cancel button. Moves within a filesystem are `renameat2`; across filesystems, copy then remove. Copies use `copy_file_range` and keep modes and times. Symlinks are copied as links.
+- Dialogs are drawn over the window, modal: "Replace report.pdf?" with Replace, Skip, Keep both (`report (2).pdf`) and "Do this for all conflicts"; confirmations for permanent deletes; errors that name the file and why.
+- The trash follows the freedesktop spec (`~/.local/share/Trash/files` and `info`, `$topdir/.Trash-$uid` on other filesystems), so other tools see the same trash. Trash is a place in the sidebar; right-click in it offers Restore and Empty trash.
 - The clipboard is shared with other applications as `text/uri-list` and `x-special/gnome-copied-files` through `wl_data_device`, so a copy in files can be pasted in a browser's upload dialog or another file manager. Pasting `text/uri-list` from elsewhere copies those files in.
-- Nothing is ever overwritten without asking, and a failed operation reports which file and why.
+- Nothing is ever overwritten without asking.
 
 ### Protected places
 
 So a slip can't delete the system, files only changes things inside the user's own home directory. This is on top of the kernel's permissions: it also covers files the user happens to own elsewhere, such as in `/tmp` or on a mounted drive.
 
 - Every operation asks `may_modify` (in files.c since 0.2) of each directory whose entries it changes: the destination of a copy, move, paste or new file, and the source directory of a move, rename or trash. The directory is judged by where it really is (`realpath`), so a symlink inside home that points at `/etc` doesn't count as home.
-- Outside home the operation is refused before anything happens, with "/etc is protected: files only changes things inside your home directory". Copying *from* anywhere into home is fine.
+- Outside home, actions that would change something are greyed out in the menu, a drop is refused (the pointer shows "not allowed"), and a shortcut shows "/etc is protected: files only changes things inside your home directory". Copying *from* anywhere into home is fine.
 - Running files as root (`sudo files`, effective uid 0) lifts the rule. The end of the path then shows `root` in the urgent color, so it's never forgotten.
 - Recursive operations never follow symlinks and never cross onto another filesystem, like `rm --one-file-system`, so a bind mount or a link to `/` inside a directory being deleted can't take the system with it.
 - More writable places, such as a USB drive under `/run/media/$USER`, are an explicit opt-in in the config (0.5, `[safety] writable`). Home itself can't be removed from the list.
@@ -202,17 +252,20 @@ So a slip can't delete the system, files only changes things inside the user's o
 ### Manual checks
 
 - Copying a large directory from a USB stick into home shows progress and can be cancelled midway, leaving no half-copied file.
-- Delete, Shift+Delete, paste and rename in `/etc` or `/tmp` are refused with a message naming the protected directory; run as root, they work and the path bar says `root`.
+- In `/etc` or `/tmp`, Cut, Rename, Delete and Paste are greyed out and a drop is refused; run as root, they work and the path bar says `root`.
 - Deleting a directory in home that contains a symlink to `/` removes the link, not what it points to.
-- Renaming, moving and trashing can each be undone with `u`.
+- Dragging files onto a folder moves them; with Ctrl it copies. Renaming, moving and trashing can each be undone with Ctrl+Z.
+- Ctrl+click, Shift+click and the rubber band select as in other explorers.
 - A file trashed in files appears in another tool's trash view, and restoring it puts it back.
 
 ---
 
-## 0.5: Mouse, thumbnails, config and desktop integration
+## 0.5: Views, thumbnails, config and desktop integration
 
-- Mouse: since 0.2 the sidebar's edge drags, clicks select, double-clicks enter directories, the wheel scrolls, and the toolbar's buttons and path work. Left for 0.5: double-click opens files (through 0.3's opener), right-click opens the "Open with" list. Drag and drop out of files (`text/uri-list`) and into it.
-- A grid view (`t`) of thumbnails for image directories. Thumbnails follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
+- **Views:** buttons at the right of the toolbar switch between Details (the 0.3 list with its header) and Icons, a grid of large icons and thumbnails (Ctrl+1, Ctrl+2). Ctrl+wheel changes the icon size. The view is remembered per directory.
+- **Thumbnails** for images in the icon view, decoded on a worker thread (desk's image decoding, as 0.2's first version did for previews). They follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
+- **Drag and drop with other applications** through `wl_data_device`: dragging files out of files into a browser's upload area, an editor or another file manager (`text/uri-list`), and dropping files from them into files, which copies them in.
+- **Hover:** rows highlight under the pointer, and resting on a name that was cut short shows it in full in a tooltip.
 - Config through desk at `~/.config/files/files.conf`, written from a sample on first run:
 
   ```ini
@@ -223,9 +276,13 @@ So a slip can't delete the system, files only changes things inside the user's o
   font_size = 11
 
   [view]
+  # details or icons, for directories not yet visited.
+  view = details
   hidden = false
   sort = name
   directories_first = true
+  # Double-click to open, or single.
+  click = double
 
   [thumbnails]
   enable = true
@@ -242,13 +299,13 @@ So a slip can't delete the system, files only changes things inside the user's o
   terminal = deal -e
   ```
 
-- Colors from the palette, followed live through `desk_watch`: background, foreground, accent for directories, muted for hidden entries and details, the selection colors for the cursor, urgent for broken links and errors.
+- Colors from the palette, followed live through `desk_watch`: background, foreground, accent for directories, muted for hidden entries and details, the selection colors for the selection, urgent for broken links and errors.
 - `files.desktop` with `MimeType=inode/directory;`, and `make default` registering it, so other apps' "show in folder" opens files. A dwl key binding (Super+E) in the README.
 
 ### Manual checks
 
-- Double-clicking opens; dragging an image from files into a browser upload works.
-- The grid fills in thumbnails once and reuses them on the next visit, from `~/.cache/thumbnails`.
+- Dragging an image from files into a browser upload works; dragging a file from a browser into files copies it in.
+- The icon view fills in thumbnails once and reuses them on the next visit, from `~/.cache/thumbnails`.
 - Changing the wallpaper recolors an open window.
 
 ---
@@ -257,7 +314,7 @@ So a slip can't delete the system, files only changes things inside the user's o
 
 files becomes the file dialog for other applications: choosing files to upload in a browser, choosing where a download goes, and any "Open…" or "Save as…" dialog. There are two parts. `files --pick` is a picker usable from the command line and scripts. `files --portal` is the portal backend that opens that picker for applications.
 
-This comes after 0.5 because a picker needs the earlier milestones: filters and MIME types from 0.3, making a new folder from 0.4, and the mouse from 0.5, since a browser dialog is often reached with the mouse in hand.
+This comes after 0.5 because a picker needs the earlier milestones: MIME types and the search field from 0.3, multiple selection and New folder from 0.4, and thumbnails from 0.5, since choosing a photo to upload is easier when you can see it.
 
 ### Command line
 
@@ -269,34 +326,25 @@ files --portal
 
 - `--pick` chooses one existing file, or several with `--multiple`. With `--directory` it chooses a directory instead.
 - `--save NAME` asks for a file name and a directory to save it in, with NAME as the suggested name. Without a DIR it starts in the download directory (`XDG_DOWNLOAD_DIR` from `~/.config/user-dirs.dirs`, else `~/Downloads`), or wherever the last save went.
-- `--filter 'Images:*.png;*.jpg;image/webp'` is repeatable. Patterns are globs or MIME types (matched through `desk_mime_type`). The first filter is active, and "All files" is always added last.
+- `--filter 'Images:*.png;*.jpg;image/webp'` is repeatable. Patterns are globs or MIME types (matched through `desk_mime_type`). The first filter is active, and "All files" is always added last, in the filter dropdown.
 - Chosen paths go to stdout, one per line, or NUL-separated with `-0`.
 - Exit statuses: 0 chosen, 1 error, 2 usage, 3 cancelled (nothing printed). Cancelling is a separate status so a caller can tell it apart from a failure.
 
 ### The picker window
 
-- It's the normal toolbar, sidebar and list, filter (`/`), path entry (`:`), bookmarks (`'`), sorting and hidden files. The only change is a choose bar at the bottom with the title, the active filter, the accept button and, when saving, the name field.
+- It's the normal window: toolbar, sidebar, list or icons, search, typing a path, sorting and hidden files. Along the bottom is a bar with the file type filter (a dropdown: "Images", "All files"), and Cancel and Open (or the `--accept` label) buttons. When saving, a name field sits on the left of that bar.
 - App ID `files-picker`, floating, with a dwl rule like view's, at about 60% of the output.
-- Entries that don't match the active filter are hidden. Directories always show. `Ctrl+F` cycles the filters.
-- Only `a` (new file or directory) is available from 0.4's operations, because saving into a new folder is a common need. Cut, paste, rename and trash are off, so a stray key in a dialog can't move anything.
-
-| Key | Action in the picker |
-|---|---|
-| Enter on a file | Choose it (instead of opening it) |
-| Space | With `--multiple`, select and move down; Enter then returns every selected file |
-| Enter on a directory | Go into it, as usual |
-| Ctrl+Enter | With `--directory`, choose the directory under the cursor, or the current one if the cursor is on a file |
-| Ctrl+F | Next filter |
-| Tab | When saving, move between the name field and the list |
-| Escape | Clear the filter or selection first, then cancel |
-| `q`, Ctrl+Q | Cancel |
+- Entries that don't match the chosen filter are hidden; directories always show.
+- Double-clicking a file, or selecting it and clicking Open, chooses it. With `--multiple`, Ctrl+click and Shift+click select several and Open returns them all. With `--directory`, Open chooses the selected directory, or the current one when nothing is selected.
+- The only operation from 0.4 is New folder, because saving into a new folder is a common need. Cut, paste, rename and trash are off, so a stray click in a dialog can't move anything.
+- Enter is Open and Escape is Cancel, as in any dialog.
 
 ### Saving
 
-- The name field has focus at the start, with the name minus its extension selected, like `r` in 0.4. Typing replaces it.
-- Choosing an existing file in the list copies its name into the field.
+- The name field has the focus at the start, with the name minus its extension selected. Typing replaces it.
+- Clicking an existing file copies its name into the field.
 - A name with a `/` in it (`~/Documents/report.pdf`) is a path: the directory part goes there.
-- Enter saves into the current directory. If the file already exists, files asks "Replace report.pdf?" before returning. It never writes the file itself. The application does that.
+- Save (Enter) saves into the current directory. If the file already exists, files asks "Replace report.pdf?" before returning. It never writes the file itself. The application does that.
 - The last directory saved to and the last one opened from are remembered per application in `~/.local/state/files/picker` (keyed by the portal's app ID, or `--app-id` for scripts), so a browser's downloads keep going to the same place.
 
 ### Portal backend
@@ -309,7 +357,7 @@ files --portal
   - `filters` (`a(sa(us))`, type 0 is a glob, 1 a MIME type) and `current_filter` → `--filter`, with the current one first
   - `current_name`, `current_folder` (bytes, NUL-terminated) and `current_file` (select it) → the name and starting directory
   - `SaveFiles` → `--directory` with the accept label "Save here", plus a check that names the given files that already exist there
-  - `choices` (the extra combo boxes and checkboxes some applications add) are returned at their defaults in 0.6. Drawing them in the choose bar can come later if an application turns out to need them
+  - `choices` (the extra combo boxes and checkboxes some applications add) are returned at their defaults in 0.6. Drawing them in the bottom bar can come later if an application turns out to need them
 - Results are `uris` (`file://`, percent-encoded from the raw bytes, so non-UTF-8 names survive) and `current_filter`. Response 0 means chosen, 1 cancelled, 2 failed.
 - Each request exports an `org.freedesktop.impl.portal.Request` object at its handle. `Close` kills the child process, so a dialog the application gives up on goes away.
 - The parent window arrives as `wayland:HANDLE` from xdg-foreign. dwl doesn't expose `zxdg_exporter_v2` yet, although wlroots 0.20 ships `wlr_xdg_foreign_v2`. Adding it to dwl lets the picker set the browser as its parent and float centered over it. Without it, the float rule still works and the handle is ignored.
@@ -348,9 +396,9 @@ How applications pick up the portal (to confirm against the installed versions):
 
 ### Manual checks
 
-- `files --pick --multiple ~/Pictures` prints the chosen paths. Escape prints nothing and exits 3.
+- `files --pick --multiple ~/Pictures` prints the chosen paths. Cancel prints nothing and exits 3.
 - `files --save report.pdf` starts in the download directory with "report" selected. Saving over an existing file asks first.
-- `files --pick --filter 'Images:*.png;*.jpg'` hides other files, and Ctrl+F switches to "All files".
+- `files --pick --filter 'Images:*.png;*.jpg'` hides other files, and the filter dropdown switches to "All files".
 - A browser's upload button opens the files picker. Choosing two files uploads both.
 - A download with "always ask where to save" opens save mode in `~/Downloads`. The file lands where it was saved, and the next download starts there.
 - Cancelling the dialog from the browser side (closing the tab) closes the picker window.
@@ -364,12 +412,13 @@ How applications pick up the portal (to confirm against the installed versions):
 - A week as the only file manager, with annoyances logged in `docs/files-papercuts.md`. This includes a week as the only file picker: every upload and download goes through it.
 - Fuzz the MIME sniffing, desktop entry and `mimeapps.list` parsers, the trash info parser, and the portal's option decoding (filters, folders as bytes) under ASan/UBSan.
 - A stress test of the operations: copying trees with symlinks, special files, permission errors and name conflicts, compared with `cp -a`.
-- README documents every key, option and setting.
+- README documents every menu, shortcut, option and setting.
 - Tag `files-1.0.0`.
 
 ## After 1.0 (unscheduled)
 
-- The portal's `choices` (extra combo boxes and checkboxes) drawn in the choose bar, if an application needs them.
+- The portal's `choices` (extra combo boxes and checkboxes) drawn in the picker's bottom bar, if an application needs them.
+- Recursive search below the current directory, from the search field.
 - Drives that aren't mounted yet in the sidebar, mounted with a click through `mount` (#15) once it exists. Mounted ones are listed since 0.2.
 - Archives: browse `.zip` and `.tar.*` as directories through libarchive, which is installed.
 - Tabs or split panes, if one list turns out not to be enough.
@@ -382,8 +431,8 @@ How applications pick up the portal (to confirm against the installed versions):
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse | Done (live key and mouse checks pending) |
-| 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
-| 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
-| 0.5 | Right-click, drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
-| 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend for browsers and other apps | Not started |
+| 0.3 | Double-click to open, the right-click menu and Open with, search, typing a path, bookmarks, sorting by column headers, standard keys | Not started |
+| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
+| 0.5 | Icon view with thumbnails, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
+| 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Final |
