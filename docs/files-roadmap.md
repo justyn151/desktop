@@ -8,6 +8,8 @@ files is one `files.c` and one `files.h`, built on `desk/` from its first commit
 
 The model is Miller columns, as in ranger or lf but drawn as a real window: the parent directory on the left, the current one in the middle, a preview of the selected entry on the right. `h` goes up, `l` goes in (or opens a file), `j` and `k` move. Everything works from the keyboard first; the mouse comes along in 0.5.
 
+files has two jobs. It's the file manager, and it's also the file picker for every other application: the dialog a browser opens to upload a file or ask where a download goes, and any "Open…" or "Save as…" dialog. The picker is the same window and keys with a choose bar added (0.6). Applications reach it through the `org.freedesktop.impl.portal.FileChooser` portal backend, so there's one way to move around the filesystem instead of a GTK dialog with keys of its own.
+
 ### What already exists
 
 | Piece | Where | files uses it for |
@@ -29,6 +31,8 @@ dwl already supports everything files needs: xdg-shell, viewporter, fractional s
 - **An icon theme.** Only `hicolor` is installed. files draws its icons as glyphs from Symbols Nerd Font Mono, which is installed and already the fontconfig fallback: a folder, a file, and a few dozen type icons (image, video, audio, archive, code, PDF, markdown), colored from the palette. No icon theme package, no SVG renderer.
 - **MIME data.** Neither `shared-mime-info` nor `xdg-utils` is installed. files needs a MIME type to pick an application. Plan: read `/usr/share/mime/globs2` (from `shared-mime-info`, a small package worth installing) when it exists, with a built-in table of common extensions as the fallback, plus content sniffing for files without an extension (the image signatures desk already knows, `#!` scripts, UTF-8 text).
 - **`xdg-open`.** files doesn't need it: it resolves `mimeapps.list` and desktop entries itself (0.3). Installing `xdg-utils` is still worth it for mark's and other apps' links.
+- **The portal frontend.** `xdg-desktop-portal` isn't installed. Applications talk to it, and it forwards file dialogs to files (0.6). It's needed for 0.6 and later for screen sharing (`xdg-desktop-portal-wlr`, PLAN Phase 6). `XDG_CURRENT_DESKTOP` isn't set either, and the portal needs it to pick its config.
+- **`~/.config/user-dirs.dirs`.** Doesn't exist, so there's no configured download directory. The picker falls back to `~/Downloads` (0.6). `xdg-user-dirs-update` would write the file.
 
 ### What desk gains
 
@@ -228,18 +232,123 @@ files [DIR]
 
 ---
 
+## 0.6: File picker
+
+files becomes the file dialog for other applications: choosing files to upload in a browser, choosing where a download goes, and any "Open…" or "Save as…" dialog. There are two parts. `files --pick` is a picker usable from the command line and scripts. `files --portal` is the portal backend that opens that picker for applications.
+
+This comes after 0.5 because a picker needs the earlier milestones: filters and MIME types from 0.3, making a new folder from 0.4, and the mouse from 0.5, since a browser dialog is often reached with the mouse in hand.
+
+### Command line
+
+```text
+files --pick [--multiple] [--directory] [--filter NAME:PATTERNS]... [--title TEXT] [--accept LABEL] [-0] [DIR|FILE]
+files --save NAME [--filter NAME:PATTERNS]... [--title TEXT] [--accept LABEL] [DIR]
+files --portal
+```
+
+- `--pick` chooses one existing file, or several with `--multiple`. With `--directory` it chooses a directory instead.
+- `--save NAME` asks for a file name and a directory to save it in, with NAME as the suggested name. Without a DIR it starts in the download directory (`XDG_DOWNLOAD_DIR` from `~/.config/user-dirs.dirs`, else `~/Downloads`), or wherever the last save went.
+- `--filter 'Images:*.png;*.jpg;image/webp'` is repeatable. Patterns are globs or MIME types (matched through `desk_mime_type`). The first filter is active, and "All files" is always added last.
+- Chosen paths go to stdout, one per line, or NUL-separated with `-0`.
+- Exit statuses: 0 chosen, 1 error, 2 usage, 3 cancelled (nothing printed). Cancelling is a separate status so a caller can tell it apart from a failure.
+
+### The picker window
+
+- It's the normal Miller columns, previews, filter (`/`), path entry (`:`), bookmarks (`'`), sorting and hidden files. The only change is a choose bar at the bottom with the title, the active filter, the accept button and, when saving, the name field.
+- App ID `files-picker`, floating, with a dwl rule like view's, at about 60% of the output.
+- Entries that don't match the active filter are hidden. Directories always show. `Ctrl+F` cycles the filters.
+- Only `a` (new file or directory) is available from 0.4's operations, because saving into a new folder is a common need. Cut, paste, rename and trash are off, so a stray key in a dialog can't move anything.
+
+| Key | Action in the picker |
+|---|---|
+| Enter on a file | Choose it (instead of opening it) |
+| Space | With `--multiple`, select and move down; Enter then returns every selected file |
+| Enter on a directory | Go into it, as usual |
+| Ctrl+Enter | With `--directory`, choose the directory under the cursor, or the current one if the cursor is on a file |
+| Ctrl+F | Next filter |
+| Tab | When saving, move between the name field and the list |
+| Escape | Clear the filter or selection first, then cancel |
+| `q`, Ctrl+Q | Cancel |
+
+### Saving
+
+- The name field has focus at the start, with the name minus its extension selected, like `r` in 0.4. Typing replaces it.
+- Choosing an existing file in the list copies its name into the field.
+- A name with a `/` in it (`~/Documents/report.pdf`) is a path: the directory part goes there.
+- Enter saves into the current directory. If the file already exists, files asks "Replace report.pdf?" before returning. It never writes the file itself. The application does that.
+- The last directory saved to and the last one opened from are remembered per application in `~/.local/state/files/picker` (keyed by the portal's app ID, or `--app-id` for scripts), so a browser's downloads keep going to the same place.
+
+### Portal backend
+
+- `files --portal` is a small session-bus service named `org.freedesktop.impl.portal.desktop.files`. It implements `org.freedesktop.impl.portal.FileChooser` (`OpenFile`, `SaveFile`, `SaveFiles`) at `/org/freedesktop/portal/desktop`, through sd-bus (libsystemd, already used by bar and net).
+- Each request runs `files --pick` or `files --save` as a child process and replies when that process exits. A crash in a dialog never takes the service down. The service keeps the pending call and doesn't block, so several dialogs can be open at once.
+- Option mapping:
+  - `accept_label` → `--accept`
+  - `multiple`, `directory` → the same flags
+  - `filters` (`a(sa(us))`, type 0 is a glob, 1 a MIME type) and `current_filter` → `--filter`, with the current one first
+  - `current_name`, `current_folder` (bytes, NUL-terminated) and `current_file` (select it) → the name and starting directory
+  - `SaveFiles` → `--directory` with the accept label "Save here", plus a check that names the given files that already exist there
+  - `choices` (the extra combo boxes and checkboxes some applications add) are returned at their defaults in 0.6. Drawing them in the choose bar can come later if an application turns out to need them
+- Results are `uris` (`file://`, percent-encoded from the raw bytes, so non-UTF-8 names survive) and `current_filter`. Response 0 means chosen, 1 cancelled, 2 failed.
+- Each request exports an `org.freedesktop.impl.portal.Request` object at its handle. `Close` kills the child process, so a dialog the application gives up on goes away.
+- The parent window arrives as `wayland:HANDLE` from xdg-foreign. dwl doesn't expose `zxdg_exporter_v2` yet, although wlroots 0.20 ships `wlr_xdg_foreign_v2`. Adding it to dwl lets the picker set the browser as its parent and float centered over it. Without it, the float rule still works and the handle is ignored.
+- The service exits after a minute with no open dialogs. D-Bus activation starts it again on the next request.
+
+### Installing
+
+`make portal` installs:
+
+- `/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.files.service` with `Exec=/usr/local/bin/files --portal`
+- `/usr/share/xdg-desktop-portal/portals/files.portal`:
+
+  ```ini
+  [portal]
+  DBusName=org.freedesktop.impl.portal.desktop.files
+  Interfaces=org.freedesktop.impl.portal.FileChooser
+  ```
+
+- `~/.config/xdg-desktop-portal/dwl-portals.conf`, which sends file dialogs to files and leaves the rest to whatever is installed:
+
+  ```ini
+  [preferred]
+  default=wlr
+  org.freedesktop.impl.portal.FileChooser=files
+  ```
+
+On the system side, install `xdg-desktop-portal`, export `XDG_CURRENT_DESKTOP=dwl` before dwl starts, and pass `WAYLAND_DISPLAY` and `XDG_CURRENT_DESKTOP` to D-Bus activation from dwl's startup (`dbus-update-activation-environment` or `systemctl --user import-environment`).
+
+How applications pick up the portal (to confirm against the installed versions):
+
+- Flatpak apps use it on their own.
+- Firefox needs `widget.use-xdg-desktop-portal.file-picker = 1` in `about:config`.
+- Chromium-based browsers and Electron apps use it when the portal is running.
+- Other GTK apps need `GTK_USE_PORTAL=1` (GTK 3) or `GDK_DEBUG=portals` (GTK 4).
+- Qt apps need `QT_QPA_PLATFORMTHEME=xdgdesktopportal`.
+
+### Manual checks
+
+- `files --pick --multiple ~/Pictures` prints the chosen paths. Escape prints nothing and exits 3.
+- `files --save report.pdf` starts in the download directory with "report" selected. Saving over an existing file asks first.
+- `files --pick --filter 'Images:*.png;*.jpg'` hides other files, and Ctrl+F switches to "All files".
+- A browser's upload button opens the files picker. Choosing two files uploads both.
+- A download with "always ask where to save" opens save mode in `~/Downloads`. The file lands where it was saved, and the next download starts there.
+- Cancelling the dialog from the browser side (closing the tab) closes the picker window.
+- Killing a picker process makes the browser see a failed dialog, not a hang. The service keeps serving.
+
+---
+
 ## 1.0: Daily driver
 
 - Every 0.x checklist passes on dwl.
-- A week as the only file manager, with annoyances logged in `docs/files-papercuts.md`.
-- Fuzz the MIME sniffing, desktop entry and `mimeapps.list` parsers, and the trash info parser, under ASan/UBSan.
+- A week as the only file manager, with annoyances logged in `docs/files-papercuts.md`. This includes a week as the only file picker: every upload and download goes through it.
+- Fuzz the MIME sniffing, desktop entry and `mimeapps.list` parsers, the trash info parser, and the portal's option decoding (filters, folders as bytes) under ASan/UBSan.
 - A stress test of the operations: copying trees with symlinks, special files, permission errors and name conflicts, compared with `cp -a`.
 - README documents every key, option and setting.
 - Tag `files-1.0.0`.
 
 ## After 1.0 (unscheduled)
 
-- The `org.freedesktop.impl.portal.FileChooser` backend, so browsers and other apps use files as their file dialog (in PLAN's Phase 6, portals).
+- The portal's `choices` (extra combo boxes and checkboxes) drawn in the choose bar, if an application needs them.
 - Removable drives in a sidebar, through `mount` (#15) once it exists.
 - Archives: browse `.zip` and `.tar.*` as directories through libarchive, which is installed.
 - Tabs or split panes, if Miller columns turn out not to be enough.
@@ -255,4 +364,5 @@ files [DIR]
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
 | 0.5 | Mouse and drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
+| 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend for browsers and other apps | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Final |

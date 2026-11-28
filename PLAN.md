@@ -227,7 +227,7 @@ The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on d
 
 ### files
 
-A graphical file manager with Miller columns (parent, current, preview) and H/J/K/L navigation, pulled forward after view and mark. The detailed plan is in [docs/files-roadmap.md](docs/files-roadmap.md). Icons are Nerd Font glyphs in palette colors, so it needs no icon theme; opening files resolves `mimeapps.list` and desktop entries itself, so it doesn't need xdg-utils.
+A graphical file manager with Miller columns (parent, current, preview) and H/J/K/L navigation, pulled forward after view and mark. The detailed plan is in [docs/files-roadmap.md](docs/files-roadmap.md). Icons are Nerd Font glyphs in palette colors, so it needs no icon theme; opening files resolves `mimeapps.list` and desktop entries itself, so it doesn't need xdg-utils. It's also the file picker for other apps (choosing uploads, where downloads go, Open and Save dialogs) through its own FileChooser portal backend, which needs `xdg-desktop-portal` installed.
 
 | Version | Milestone | Status |
 |---|---|---|
@@ -236,6 +236,7 @@ A graphical file manager with Miller columns (parent, current, preview) and H/J/
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
 | 0.5 | Mouse and drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
+| 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Not started |
 
 ### mark
@@ -274,7 +275,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 | Brightness keys + OSD | Missing | backlight via logind `SetBrightness`, layer-shell popup |
 | Idle dim/lock/suspend | Missing | `ext-idle-notify-v1` (dwl supports it) → `lock` |
 | Polkit agent | Missing (net's README notes one may be needed) | polkit over D-Bus (sd-bus) |
-| Portals | Missing | `xdg-desktop-portal-wlr` for screen sharing; later `files` as the FileChooser backend |
+| Portals | Missing | `xdg-desktop-portal-wlr` for screen sharing. The FileChooser backend comes earlier, with `files` 0.6 (which installs `xdg-desktop-portal` and sets `XDG_CURRENT_DESKTOP`) |
 | Display configuration | Missing | `wlr-output-management` (dwl supports it) |
 | Night light | Missing | `wlr-gamma-control` (dwl supports it) |
 | Battery in bar | Missing | `/sys/class/power_supply` |
