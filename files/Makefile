@@ -5,11 +5,11 @@ WAYLAND_PROTOCOLS_DIR ?= $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-pro
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
-PACKAGES = wayland-client xkbcommon freetype2 fontconfig
+PACKAGES = wayland-client xkbcommon freetype2 fontconfig libpng libjpeg libwebp
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PKG_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 CFLAGS ?= -O2
-FILES_CFLAGS = -std=c11 -pthread -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_WINDOW -DDESK_KEYBOARD -DDESK_FONT -DDESK_APPS \
+FILES_CFLAGS = -std=c11 -pthread -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_WINDOW -DDESK_KEYBOARD -DDESK_FONT -DDESK_APPS -DDESK_IMAGE -DDESK_IMAGE_GIF -DDESK_IMAGE_WEBP \
 	-I$(BUILD) -I$(DESK)
 
 DESK = ../desk

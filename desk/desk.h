@@ -312,6 +312,11 @@ int desk_text_width(DeskFont *font, const char *text, size_t length);
 /* The width of one character. */
 int desk_char_width(DeskFont *font, uint32_t code);
 
+/* Where a character's ink is: pixels above the baseline to its top, and
+   below it to its bottom (negative when the ink ends above it). Both 0 for
+   a blank. */
+void desk_char_ink(DeskFont *font, uint32_t code, int *above, int *below);
+
 /* How many bytes from the start of text fit in max_width pixels, ending on a
    character boundary. */
 size_t desk_text_fit(DeskFont *font, const char *text, size_t length, int max_width);

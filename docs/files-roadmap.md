@@ -20,7 +20,7 @@ files has two jobs. It's the file manager, and it's also the file picker for eve
 | xkbcommon keymap and modifiers | view, run, deal (each its own copy) | Keys (0.1) |
 | Key repeat | `DeskRepeat` | Holding an arrow key (0.1) |
 | Fontconfig matching and FreeType rendering into ARGB | bar, run, wall (each its own copy) | Every line of text (0.1) |
-| Image decoding | `desk_image_load` (`-DDESK_IMAGE`) | Thumbnails (0.5) |
+| Image decoding | `desk_image_load` (`-DDESK_IMAGE`) | Thumbnails (brought forward into 0.4) |
 | Desktop entry parsing (`Exec`, `TryExec`, `MimeType`, field codes) | run | Opening files with the right application (0.3) |
 | INI config, palette, file watch | desk | Config, colors, refreshing a directory that changes (0.1 onward) |
 | Atomic files | `desk_atomic_*` | Writing `mimeapps.list` and bookmarks (0.3) |
@@ -214,7 +214,7 @@ The standard ones, replacing 0.1's letter keys:
 
 ## 0.4: File operations
 
-Progress: selecting is in (0.4.0): Ctrl+click, Shift+click, Shift and Ctrl with the moving keys, Ctrl+A, the rubber band, and entries lighting up under the pointer. The selection survives refreshes and sorting; a search drops what it hides. The "Other application…" dialog from 0.3 is put off. Next: rename, new folder and trash, then copy and move with progress, the clipboard and dialogs, then drag and drop, undo and properties.
+Progress: selecting is in (0.4.0): Ctrl+click, Shift+click, Shift and Ctrl with the moving keys, Ctrl+A, the rubber band, and entries lighting up under the pointer. The selection survives refreshes and sorting; a search drops what it hides. The "Other application…" dialog from 0.3 is put off. Thumbnails were brought forward from 0.5 into 0.4.1, in the freedesktop cache. Next: rename, new folder and trash, then copy and move with progress, the clipboard and dialogs, then drag and drop, undo and properties.
 
 ### Selecting
 
@@ -274,7 +274,7 @@ So a slip can't delete the system, files only changes things inside the user's o
 ## 0.5: Views, thumbnails, config and desktop integration
 
 - **Views:** the list and icon views and their zoom are in since 0.2. 0.5 remembers the view per directory.
-- **Thumbnails** for images in the icon view, decoded on a worker thread (desk's image decoding, as 0.2's first version did for previews). They follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
+- **Thumbnails** (done early, in 0.4.1; the `[thumbnails]` config is still to come) for images in the icon view, decoded on a worker thread (desk's image decoding, as 0.2's first version did for previews). They follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
 - **Drag and drop with other applications** through `wl_data_device`: dragging files out of files into a browser's upload area, an editor or another file manager (`text/uri-list`), and dropping files from them into files, which copies them in.
 - **Hover:** rows highlight under the pointer, and resting on a name that was cut short shows it in full in a tooltip.
 - Config through desk at `~/.config/files/files.conf`, written from a sample on first run:

@@ -6,7 +6,7 @@ It's a normal xdg-shell window with app ID `files`, so dwl tiles it like any oth
 
 ## Build
 
-On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-protocols`, `libxkbcommon`, `freetype2` and `fontconfig`.
+On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-protocols`, `libxkbcommon`, `freetype2`, `fontconfig`, `libpng`, `libjpeg-turbo` and `libwebp` (the last three for thumbnails).
 
 ```sh
 make
@@ -147,7 +147,8 @@ The search field filters the current directory as you type: names containing the
 ### Views and zoom
 
 - **List:** one row per entry, with size and date where there's room. Zoom changes its text size, from 0.75× to 1.5×.
-- **Icons:** a grid of large icons with the name under each in up to two lines, broken at a space, dot, dash or underscore where it can be, and cut in the middle when it's still too long. Zoom changes the icon size, from 48 to 192 pixels; the grid fits as many columns as it can.
+- **Icons:** a grid of large icons with the name under each in up to two lines, broken at a space, dot, dash or underscore where it can be, and cut in the middle when it's still too long. Zoom changes the icon size, from 48 to 192 pixels; the grid fits as many columns as it can. Glyphs are centered by their ink in the icon's square, with more room under them as they grow.
+- **Thumbnails:** PNG, JPEG, GIF and WebP images show a thumbnail instead of their icon in the icon view, made on a worker thread as they come into view (their icon shows until then, or when one can't be made), turned upright by EXIF orientation. They're kept in the freedesktop cache, `~/.cache/thumbnails/normal`, `large`, `x-large` or `xx-large` (128 to 1024 pixels, the smallest at least the icon's size), named and tagged as the spec asks (`Thumb::URI`, `Thumb::MTime`), so GTK applications and files share them and a changed image is made again. Thumbnails of the cache itself are never made. An image may decode to at most 256 MiB; larger JPEGs are decoded at a fraction of their size.
 
 The two make one scale: zooming in past the biggest list switches to the smallest icons, and zooming out past the smallest icons switches back to the biggest list. Ctrl+0 resets the current view only. Each view keeps its own zoom. The view and both zooms are kept in the state file.
 
@@ -216,6 +217,7 @@ files will only change things inside your home directory: that's the rule every 
 - [ ] A mounted USB stick shows under Drives and goes when it's unmounted.
 - [ ] Narrowing the window hides the sidebar.
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
+- [ ] Images show thumbnails in the icon view, quickly on a second visit; a photo taken sideways shows upright; editing an image updates its thumbnail.
 - [x] The list has a Name, Type, Size, Modified header lined up with its columns.
 - [x] Folders show their summed size, and sorting by Size orders them by it.
 

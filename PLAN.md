@@ -170,11 +170,12 @@ shot and view have grown desk further ahead of this phase. What's already there 
 | shm buffer pool (`-DDESK_WAYLAND`) | shot 0.2 | shot, view | 4 (layer-shell setup still in each app) |
 | Key repeat (`DeskRepeat`, a timerfd) | view 0.2 | view | 6 (keymap and compose still in each app) |
 | Atomic files, `desk_shm_open` | shot 0.1 | shot | none |
-| Image decoding (`-DDESK_IMAGE`, PNG, JPEG, optional GIF and WebP, EXIF orientation) | wall, moved for view 0.1 | wall, view | none |
+| Image decoding (`-DDESK_IMAGE`, PNG, JPEG, optional GIF and WebP, EXIF orientation) | wall, moved for view 0.1 | wall, view, files (thumbnails) | none |
 | Fonts with fallback, glyph cache, canvas (`-DDESK_FONT`) | files 0.1 | files | 5 (bar, run, wall and deal's rasterizer still have their own) |
 | Desktop entries, `mimeapps.list`, MIME types and detached launching (`-DDESK_APPS`) | files 0.3 | files | none yet (run still parses desktop entries itself) |
 | Popups (`desk_popup_open`, an `xdg_popup` with a grab) | files 0.3 | files | 4, for popups (bar's menus could move onto it) |
 | A one-line text field (`DeskText`, `desk_text_key`: cursor, selection, word moves) | files 0.3 | files | none yet (run's prompt could move onto it) |
+| A glyph's ink bounds (`desk_char_ink`), for centering icon glyphs | files 0.4 | files | none |
 | xkb keymap and modifiers (`-DDESK_KEYBOARD`) | files 0.1 | files, view | 6 (run and deal still have their own; compose to come) |
 | xdg-shell window with scale tracking (`-DDESK_WINDOW`) | files 0.1 | files, view | 4, for toplevels |
 

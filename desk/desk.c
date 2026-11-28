@@ -1175,6 +1175,13 @@ int desk_char_width(DeskFont *font, uint32_t code)
     return (font_glyph(font, visible_code(code))->advance + 32) >> 6;
 }
 
+void desk_char_ink(DeskFont *font, uint32_t code, int *above, int *below)
+{
+    const struct glyph *glyph = font_glyph(font, visible_code(code));
+    *above = glyph->height ? glyph->top : 0;
+    *below = glyph->height ? glyph->height - glyph->top : 0;
+}
+
 int desk_text_width(DeskFont *font, const char *text, size_t length)
 {
     const char *end = text + length;

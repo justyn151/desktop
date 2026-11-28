@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <png.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/eventfd.h>
@@ -842,7 +843,9 @@ static char *path_uri(const char *path)
         return NULL;
     char *out = uri + sprintf(uri, "file://");
     for (const unsigned char *at = (const unsigned char *)path; *at; ++at) {
-        if (isalnum(*at) || strchr("/-._~", *at))
+        /* What GLib leaves as is, so the URI (and a thumbnail's name, its
+           MD5) is the same as GTK's. */
+        if (isalnum(*at) || strchr("!$&'()*+,-./:=@_~", *at))
             *out++ = (char)*at;
         else
             out += sprintf(out, "%%%02X", *at);
@@ -1186,6 +1189,623 @@ static void sizer_start(struct files *files)
     pthread_mutex_unlock(&sizer->lock);
 }
 
+static bool has_suffix(const char *name, const char *const *suffixes);
+
+/* The freedesktop thumbnail cache: $XDG_CACHE_HOME/thumbnails. */
+static char *thumbnails_directory(const char *home)
+{
+    const char *cache = getenv("XDG_CACHE_HOME");
+    char *path = NULL;
+    if (cache && cache[0] == '/') {
+        if (asprintf(&path, "%s/thumbnails", cache) < 0)
+            path = NULL;
+    } else if (home && asprintf(&path, "%s/.cache/thumbnails", home) < 0) {
+        path = NULL;
+    }
+    return path;
+}
+
+/* Thumbnails
+
+   Images in the icon view show a thumbnail, made on a worker thread. They
+   follow the freedesktop thumbnail spec: a PNG named by the MD5 of the
+   file's URI in ~/.cache/thumbnails/normal (128 pixels), large (256),
+   x-large (512) or xx-large (1024), holding Thumb::URI and Thumb::MTime, so
+   other applications make and use the same ones. */
+
+#define THUMB_MAX_BYTES (256u << 20) /* The most an image may decode to. */
+
+static const struct {
+    const char *name;
+    int size;
+} thumb_classes[] = {{"normal", 128}, {"large", 256}, {"x-large", 512}, {"xx-large", 1024}};
+
+/* Whether files makes a thumbnail of this entry: an image it can decode. */
+static bool thumbnailable(const struct entry *entry)
+{
+    static const char *const types[] = {"png", "jpg", "jpeg", "jpe", "gif", "webp", NULL};
+    return !entry->directory && !entry->broken && S_ISREG(entry->target_mode) && entry->size > 0 &&
+           has_suffix(entry->name, types);
+}
+
+/* MD5 (RFC 1321), for the cache's file names. */
+static void md5_hex(const char *text, char out[33])
+{
+    static const uint32_t k[64] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    };
+    static const unsigned char shifts[16] = {7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21};
+    uint32_t h[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
+    size_t length = strlen(text), total = (length + 8) / 64 * 64 + 64;
+    unsigned char *message = calloc(total, 1);
+    if (!message) {
+        out[0] = 0;
+        return;
+    }
+    memcpy(message, text, length);
+    message[length] = 0x80;
+    uint64_t bits = (uint64_t)length * 8;
+    for (int i = 0; i < 8; ++i)
+        message[total - 8 + i] = (unsigned char)(bits >> (8 * i));
+    for (size_t chunk = 0; chunk < total; chunk += 64) {
+        uint32_t w[16];
+        for (int i = 0; i < 16; ++i) {
+            const unsigned char *b = message + chunk + 4 * i;
+            w[i] = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t f;
+            int g;
+            if (i < 16) {
+                f = (b & c) | (~b & d);
+                g = i;
+            } else if (i < 32) {
+                f = (d & b) | (~d & c);
+                g = (5 * i + 1) % 16;
+            } else if (i < 48) {
+                f = b ^ c ^ d;
+                g = (3 * i + 5) % 16;
+            } else {
+                f = c ^ (b | ~d);
+                g = (7 * i) % 16;
+            }
+            uint32_t sum = a + f + k[i] + w[g];
+            int s = shifts[(i / 16) * 4 + i % 4];
+            a = d;
+            d = c;
+            c = b;
+            b += (sum << s) | (sum >> (32 - s));
+        }
+        h[0] += a;
+        h[1] += b;
+        h[2] += c;
+        h[3] += d;
+    }
+    free(message);
+    for (int i = 0; i < 16; ++i)
+        sprintf(out + 2 * i, "%02x", (h[i / 4] >> (8 * (i % 4))) & 0xff);
+}
+
+/* An RGBA8 image, premultiplied. */
+struct rgba {
+    int width, height;
+    unsigned char *pixels;
+};
+
+/* Shrink to fit a box of size, never enlarging, averaging the source
+   pixels each covers. */
+static bool rgba_fit(const struct rgba *source, int size, struct rgba *out)
+{
+    double scale = fmin(1, fmin((double)size / source->width, (double)size / source->height));
+    int width = (int)fmax(1, lround(source->width * scale)), height = (int)fmax(1, lround(source->height * scale));
+    out->width = width;
+    out->height = height;
+    out->pixels = malloc((size_t)width * (size_t)height * 4);
+    if (!out->pixels)
+        return false;
+    for (int y = 0; y < height; ++y) {
+        int y0 = (int)((long long)y * source->height / height), y1 = (int)((long long)(y + 1) * source->height / height);
+        if (y1 <= y0)
+            y1 = y0 + 1;
+        for (int x = 0; x < width; ++x) {
+            int x0 = (int)((long long)x * source->width / width), x1 = (int)((long long)(x + 1) * source->width / width);
+            if (x1 <= x0)
+                x1 = x0 + 1;
+            unsigned long sum[4] = {0};
+            for (int sy = y0; sy < y1; ++sy) {
+                const unsigned char *p = source->pixels + ((size_t)sy * (size_t)source->width + (size_t)x0) * 4;
+                for (int sx = x0; sx < x1; ++sx, p += 4) {
+                    sum[0] += p[0];
+                    sum[1] += p[1];
+                    sum[2] += p[2];
+                    sum[3] += p[3];
+                }
+            }
+            unsigned long count = (unsigned long)(y1 - y0) * (unsigned long)(x1 - x0);
+            unsigned char *o = out->pixels + ((size_t)y * (size_t)width + (size_t)x) * 4;
+            for (int c = 0; c < 4; ++c)
+                o[c] = (unsigned char)((sum[c] + count / 2) / count);
+        }
+    }
+    return true;
+}
+
+/* Turn an image stored as EXIF orientation (2–8) says into upright. */
+static bool rgba_orient(struct rgba *image, int orientation)
+{
+    if (orientation < 2 || orientation > 8)
+        return true;
+    int w = image->width, h = image->height;
+    bool swap = orientation >= 5;
+    int ow = swap ? h : w, oh = swap ? w : h;
+    unsigned char *pixels = malloc((size_t)ow * (size_t)oh * 4);
+    if (!pixels)
+        return false;
+    for (int y = 0; y < oh; ++y) {
+        for (int x = 0; x < ow; ++x) {
+            int sx, sy;
+            switch (orientation) {
+            case 2: sx = w - 1 - x; sy = y; break;
+            case 3: sx = w - 1 - x; sy = h - 1 - y; break;
+            case 4: sx = x; sy = h - 1 - y; break;
+            case 5: sx = y; sy = x; break;
+            case 6: sx = y; sy = h - 1 - x; break;
+            case 7: sx = w - 1 - y; sy = h - 1 - x; break;
+            default: sx = w - 1 - y; sy = x; break;
+            }
+            memcpy(pixels + ((size_t)y * (size_t)ow + (size_t)x) * 4,
+                   image->pixels + ((size_t)sy * (size_t)w + (size_t)sx) * 4, 4);
+        }
+    }
+    free(image->pixels);
+    image->pixels = pixels;
+    image->width = ow;
+    image->height = oh;
+    return true;
+}
+
+/* A cached thumbnail, if it's there and still matches the file (its URI and
+   modification time). */
+static bool read_cached(const char *cache, const char *uri, time_t mtime, struct rgba *out)
+{
+    FILE *file = fopen(cache, "rbe");
+    if (!file)
+        return false;
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    png_bytep *rows = NULL;
+    out->pixels = NULL;
+    bool ok = false;
+    if (!info || setjmp(png_jmpbuf(png)))
+        goto done;
+    png_init_io(png, file);
+    png_read_info(png, info);
+    /* The keys come before the image in practice; check them before
+       decoding it. */
+    png_textp text;
+    int count = 0;
+    png_get_text(png, info, &text, &count);
+    bool uri_ok = false, mtime_ok = false;
+    for (int i = 0; i < count; ++i) {
+        if (strcmp(text[i].key, "Thumb::URI") == 0)
+            uri_ok = strcmp(text[i].text, uri) == 0;
+        else if (strcmp(text[i].key, "Thumb::MTime") == 0)
+            mtime_ok = strtoll(text[i].text, NULL, 10) == (long long)mtime;
+    }
+    if (!uri_ok || !mtime_ok)
+        goto done;
+    png_uint_32 width = png_get_image_width(png, info), height = png_get_image_height(png, info);
+    if (!width || !height || width > 4096 || height > 4096)
+        goto done;
+    png_set_expand(png);
+    png_set_strip_16(png);
+    png_set_gray_to_rgb(png);
+    png_set_add_alpha(png, 0xff, PNG_FILLER_AFTER);
+    png_set_interlace_handling(png);
+    png_read_update_info(png, info);
+    out->width = (int)width;
+    out->height = (int)height;
+    out->pixels = malloc((size_t)width * height * 4);
+    rows = malloc(height * sizeof *rows);
+    if (!out->pixels || !rows)
+        goto done;
+    for (png_uint_32 y = 0; y < height; ++y)
+        rows[y] = out->pixels + (size_t)y * width * 4;
+    png_read_image(png, rows);
+    /* Premultiply. */
+    for (size_t i = 0; i < (size_t)width * height; ++i) {
+        unsigned char *p = out->pixels + i * 4;
+        for (int c = 0; c < 3; ++c)
+            p[c] = (unsigned char)((p[c] * p[3] + 127) / 255);
+    }
+    ok = true;
+done:
+    if (!ok) {
+        free(out->pixels);
+        out->pixels = NULL;
+    }
+    free(rows);
+    png_destroy_read_struct(png ? &png : NULL, info ? &info : NULL, NULL);
+    fclose(file);
+    return ok;
+}
+
+/* Save a thumbnail to the cache: written to a temporary file beside it,
+   then renamed, so no one reads half of one. */
+static void write_cached(const char *cache, const char *uri, time_t mtime, off_t size, const struct rgba *image,
+                         int source_width, int source_height)
+{
+    char *temporary = NULL;
+    if (asprintf(&temporary, "%s.files-%ld", cache, (long)getpid()) < 0)
+        return;
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    FILE *file = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (!file) {
+        if (fd >= 0)
+            close(fd);
+        free(temporary);
+        return;
+    }
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    unsigned char *straight = malloc((size_t)image->width * (size_t)image->height * 4);
+    png_bytep *rows = malloc((size_t)image->height * sizeof *rows);
+    bool ok = false;
+    if (!info || !straight || !rows || setjmp(png_jmpbuf(png)))
+        goto done;
+    /* PNG holds straight alpha. */
+    for (size_t i = 0; i < (size_t)image->width * (size_t)image->height; ++i) {
+        const unsigned char *p = image->pixels + i * 4;
+        unsigned char *o = straight + i * 4;
+        for (int c = 0; c < 3; ++c)
+            o[c] = p[3] ? (unsigned char)((p[c] * 255 + p[3] / 2) / p[3]) : 0;
+        o[3] = p[3];
+    }
+    for (int y = 0; y < image->height; ++y)
+        rows[y] = straight + (size_t)y * (size_t)image->width * 4;
+    char mtime_text[32], size_text[32], width_text[16], height_text[16];
+    snprintf(mtime_text, sizeof mtime_text, "%lld", (long long)mtime);
+    snprintf(size_text, sizeof size_text, "%lld", (long long)size);
+    snprintf(width_text, sizeof width_text, "%d", source_width);
+    snprintf(height_text, sizeof height_text, "%d", source_height);
+    png_text text[] = {
+        {.compression = PNG_TEXT_COMPRESSION_NONE, .key = "Thumb::URI", .text = (char *)uri},
+        {.compression = PNG_TEXT_COMPRESSION_NONE, .key = "Thumb::MTime", .text = mtime_text},
+        {.compression = PNG_TEXT_COMPRESSION_NONE, .key = "Thumb::Size", .text = size_text},
+        {.compression = PNG_TEXT_COMPRESSION_NONE, .key = "Thumb::Image::Width", .text = width_text},
+        {.compression = PNG_TEXT_COMPRESSION_NONE, .key = "Thumb::Image::Height", .text = height_text},
+        {.compression = PNG_TEXT_COMPRESSION_NONE, .key = "Software", .text = "files " FILES_VERSION},
+    };
+    png_init_io(png, file);
+    png_set_IHDR(png, info, (png_uint_32)image->width, (png_uint_32)image->height, 8, PNG_COLOR_TYPE_RGBA,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_set_text(png, info, text, (int)(sizeof text / sizeof *text));
+    png_write_info(png, info);
+    png_write_image(png, rows);
+    png_write_end(png, NULL);
+    ok = true;
+done:
+    png_destroy_write_struct(png ? &png : NULL, info ? &info : NULL);
+    free(rows);
+    free(straight);
+    if (fclose(file) != 0)
+        ok = false;
+    if (!ok || rename(temporary, cache) != 0)
+        unlink(temporary);
+    free(temporary);
+}
+
+/* mkdir -p, private: the cache shows what you've looked at. */
+static void make_private_directories(char *path)
+{
+    for (char *at = path + 1; *at; ++at) {
+        if (*at == '/') {
+            *at = 0;
+            mkdir(path, 0700);
+            *at = '/';
+        }
+    }
+    mkdir(path, 0700);
+}
+
+/* Make a thumbnail of path for a box of size: from the cache when it's
+   there and current, else from the image, saving it to the cache. */
+static bool make_thumbnail(const char *thumbs_dir, const char *path, time_t mtime, off_t file_size, int size,
+                           struct rgba *out)
+{
+    size_t class = 0;
+    while (class + 1 < sizeof thumb_classes / sizeof *thumb_classes && thumb_classes[class].size < size)
+        ++class;
+    char *uri = path_uri(path), *cache = NULL;
+    char hash[33];
+    if (!uri)
+        return false;
+    md5_hex(uri, hash);
+    /* Never thumbnails of thumbnails, as the spec asks. */
+    size_t dir_length = thumbs_dir ? strlen(thumbs_dir) : 0;
+    bool cacheable = thumbs_dir && hash[0] && !(strncmp(path, thumbs_dir, dir_length) == 0 && path[dir_length] == '/');
+    if (cacheable && asprintf(&cache, "%s/%s/%s.png", thumbs_dir, thumb_classes[class].name, hash) < 0)
+        cache = NULL;
+
+    struct rgba stored = {0};
+    bool ok = cache && read_cached(cache, uri, mtime, &stored);
+    if (!ok) {
+        FILE *file = fopen(path, "rbe");
+        DeskImage image;
+        char error[128];
+        if (file && desk_image_load(file, &image, THUMB_MAX_BYTES, DESK_IMAGE_SHRINK, error, sizeof error)) {
+            struct rgba full = {(int)image.width, (int)image.height, image.pixels};
+            ok = rgba_fit(&full, thumb_classes[class].size, &stored) && rgba_orient(&stored, image.orientation);
+            bool turned = image.orientation >= 5 && image.orientation <= 8;
+            free(image.pixels);
+            if (ok && cache) {
+                char *directory = strdup(cache);
+                char *slash = directory ? strrchr(directory, '/') : NULL;
+                if (slash) {
+                    *slash = 0;
+                    make_private_directories(directory);
+                }
+                free(directory);
+                write_cached(cache, uri, mtime, file_size, &stored, turned ? (int)image.height : (int)image.width,
+                             turned ? (int)image.width : (int)image.height);
+            }
+        }
+        if (file)
+            fclose(file);
+    }
+    free(uri);
+    free(cache);
+    if (!ok) {
+        free(stored.pixels);
+        return false;
+    }
+    ok = rgba_fit(&stored, size, out);
+    free(stored.pixels);
+    return ok;
+}
+
+struct thumb_job {
+    unsigned long generation;
+    char *path;
+    time_t mtime;
+    off_t file_size;
+    int size;
+    /* The result. */
+    bool ok;
+    int width, height;
+    uint32_t *pixels;
+};
+
+struct thumbnailer {
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    int event;                     /* eventfd: results are waiting. */
+    unsigned long generation;      /* Jobs from before a change of directory are dropped. */
+    bool quit;
+    char *thumbs_dir;
+    struct thumb_job *jobs;        /* A stack: the latest asked for, on screen, first. */
+    size_t job_count, job_capacity;
+    struct thumb_job *results;
+    size_t result_count, result_capacity;
+};
+
+static bool push_job(struct thumb_job **list, size_t *count, size_t *capacity, struct thumb_job job)
+{
+    if (*count == *capacity) {
+        size_t grown = *capacity ? *capacity * 2 : 64;
+        struct thumb_job *bigger = realloc(*list, grown * sizeof *bigger);
+        if (!bigger)
+            return false;
+        *list = bigger;
+        *capacity = grown;
+    }
+    (*list)[(*count)++] = job;
+    return true;
+}
+
+static void *thumbnailer_main(void *data)
+{
+    struct thumbnailer *thumbnailer = data;
+    pthread_mutex_lock(&thumbnailer->lock);
+    while (!thumbnailer->quit) {
+        if (!thumbnailer->job_count) {
+            pthread_cond_wait(&thumbnailer->wake, &thumbnailer->lock);
+            continue;
+        }
+        struct thumb_job job = thumbnailer->jobs[--thumbnailer->job_count];
+        pthread_mutex_unlock(&thumbnailer->lock);
+        struct rgba image = {0};
+        job.ok = make_thumbnail(thumbnailer->thumbs_dir, job.path, job.mtime, job.file_size, job.size, &image);
+        if (job.ok) {
+            /* To the canvas's premultiplied ARGB. */
+            size_t count = (size_t)image.width * (size_t)image.height;
+            job.pixels = malloc(count * sizeof *job.pixels);
+            for (size_t i = 0; job.pixels && i < count; ++i) {
+                const unsigned char *p = image.pixels + i * 4;
+                job.pixels[i] = (uint32_t)p[3] << 24 | (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
+            }
+            job.ok = job.pixels != NULL;
+            job.width = image.width;
+            job.height = image.height;
+        }
+        free(image.pixels);
+        pthread_mutex_lock(&thumbnailer->lock);
+        if (job.generation != thumbnailer->generation ||
+            !push_job(&thumbnailer->results, &thumbnailer->result_count, &thumbnailer->result_capacity, job)) {
+            free(job.path);
+            free(job.pixels);
+            continue;
+        }
+        uint64_t one = 1;
+        (void)!write(thumbnailer->event, &one, sizeof one);
+    }
+    pthread_mutex_unlock(&thumbnailer->lock);
+    return NULL;
+}
+
+static struct thumbnailer *thumbnailer_create(const char *thumbs_dir)
+{
+    struct thumbnailer *thumbnailer = calloc(1, sizeof *thumbnailer);
+    if (!thumbnailer)
+        return NULL;
+    thumbnailer->thumbs_dir = thumbs_dir ? strdup(thumbs_dir) : NULL;
+    thumbnailer->event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    pthread_mutex_init(&thumbnailer->lock, NULL);
+    pthread_cond_init(&thumbnailer->wake, NULL);
+    if (thumbnailer->event < 0 || pthread_create(&thumbnailer->thread, NULL, thumbnailer_main, thumbnailer) != 0) {
+        if (thumbnailer->event >= 0)
+            close(thumbnailer->event);
+        pthread_mutex_destroy(&thumbnailer->lock);
+        pthread_cond_destroy(&thumbnailer->wake);
+        free(thumbnailer->thumbs_dir);
+        free(thumbnailer);
+        return NULL;
+    }
+    return thumbnailer;
+}
+
+static void free_jobs(struct thumb_job *jobs, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        free(jobs[i].path);
+        free(jobs[i].pixels);
+    }
+}
+
+static void thumbnailer_destroy(struct thumbnailer *thumbnailer)
+{
+    if (!thumbnailer)
+        return;
+    pthread_mutex_lock(&thumbnailer->lock);
+    thumbnailer->quit = true;
+    pthread_cond_signal(&thumbnailer->wake);
+    pthread_mutex_unlock(&thumbnailer->lock);
+    pthread_join(thumbnailer->thread, NULL);
+    free_jobs(thumbnailer->jobs, thumbnailer->job_count);
+    free_jobs(thumbnailer->results, thumbnailer->result_count);
+    free(thumbnailer->jobs);
+    free(thumbnailer->results);
+    close(thumbnailer->event);
+    pthread_mutex_destroy(&thumbnailer->lock);
+    pthread_cond_destroy(&thumbnailer->wake);
+    free(thumbnailer->thumbs_dir);
+    free(thumbnailer);
+}
+
+static size_t thumb_bucket(const char *path)
+{
+    uint32_t hash = 2166136261u;
+    for (const unsigned char *at = (const unsigned char *)path; *at; ++at)
+        hash = (hash ^ *at) * 16777619u;
+    return hash % THUMB_BUCKETS;
+}
+
+/* Forget every thumbnail, and every job not yet started. */
+static void thumbs_clear(struct files *files)
+{
+    for (size_t i = 0; i < THUMB_BUCKETS; ++i) {
+        for (struct thumb *thumb = files->thumbs[i], *next; thumb; thumb = next) {
+            next = thumb->next;
+            free(thumb->path);
+            free(thumb->pixels);
+            free(thumb);
+        }
+        files->thumbs[i] = NULL;
+    }
+    files->thumb_count = 0;
+    struct thumbnailer *thumbnailer = files->thumbnailer;
+    if (thumbnailer) {
+        pthread_mutex_lock(&thumbnailer->lock);
+        ++thumbnailer->generation;
+        free_jobs(thumbnailer->jobs, thumbnailer->job_count);
+        thumbnailer->job_count = 0;
+        pthread_mutex_unlock(&thumbnailer->lock);
+    }
+}
+
+/* The thumbnail of path for a box of size, asked for when there's none or
+   it's out of date. NULL when it can't be had at all. */
+static struct thumb *thumb_for(struct files *files, const char *path, const struct entry *entry, int size)
+{
+    if (!files->thumbnailer)
+        return NULL;
+    size_t bucket = thumb_bucket(path);
+    struct thumb *thumb = files->thumbs[bucket];
+    while (thumb && strcmp(thumb->path, path) != 0)
+        thumb = thumb->next;
+    if (thumb && thumb->mtime == entry->modified.tv_sec && thumb->size == size)
+        return thumb;
+    if (!thumb) {
+        if (files->thumb_count >= THUMBS_KEPT)
+            thumbs_clear(files);
+        thumb = calloc(1, sizeof *thumb);
+        if (!thumb || !(thumb->path = strdup(path))) {
+            free(thumb);
+            return NULL;
+        }
+        bucket = thumb_bucket(path);
+        thumb->next = files->thumbs[bucket];
+        files->thumbs[bucket] = thumb;
+        ++files->thumb_count;
+    }
+    /* Keep showing the old one, if any, until the new one comes. */
+    thumb->mtime = entry->modified.tv_sec;
+    thumb->size = size;
+    if (thumb->state == THUMB_FAILED)
+        thumb->state = THUMB_PENDING;
+    struct thumbnailer *thumbnailer = files->thumbnailer;
+    struct thumb_job job = {.path = strdup(path), .mtime = thumb->mtime, .file_size = entry->size, .size = size};
+    pthread_mutex_lock(&thumbnailer->lock);
+    job.generation = thumbnailer->generation;
+    if (job.path && push_job(&thumbnailer->jobs, &thumbnailer->job_count, &thumbnailer->job_capacity, job))
+        pthread_cond_signal(&thumbnailer->wake);
+    else
+        free(job.path);
+    pthread_mutex_unlock(&thumbnailer->lock);
+    return thumb;
+}
+
+/* Take the thumbnails the thread has made. */
+static void thumbs_arrived(struct files *files)
+{
+    struct thumbnailer *thumbnailer = files->thumbnailer;
+    uint64_t count;
+    (void)!read(thumbnailer->event, &count, sizeof count);
+    pthread_mutex_lock(&thumbnailer->lock);
+    struct thumb_job *results = thumbnailer->results;
+    size_t result_count = thumbnailer->result_count;
+    thumbnailer->results = NULL;
+    thumbnailer->result_count = thumbnailer->result_capacity = 0;
+    pthread_mutex_unlock(&thumbnailer->lock);
+    for (size_t i = 0; i < result_count; ++i) {
+        struct thumb_job *job = &results[i];
+        struct thumb *thumb = files->thumbs[thumb_bucket(job->path)];
+        while (thumb && strcmp(thumb->path, job->path) != 0)
+            thumb = thumb->next;
+        if (thumb && thumb->mtime == job->mtime && thumb->size == job->size) {
+            free(thumb->pixels);
+            thumb->pixels = job->pixels;
+            thumb->width = job->width;
+            thumb->height = job->height;
+            thumb->state = job->ok ? THUMB_READY : THUMB_FAILED;
+            job->pixels = NULL;
+        }
+        free(job->path);
+        free(job->pixels);
+    }
+    free(results);
+    desk_window_redraw(&files->window);
+}
+
 /* Navigation */
 
 static const char *field_text(const struct field *field);
@@ -1250,6 +1870,8 @@ static void load(struct files *files, const char *keep, size_t near, bool same)
 static void enter(struct files *files, char *path, const char *select)
 {
     remember(files);
+    if (!files->path || strcmp(files->path, path) != 0)
+        thumbs_clear(files);
     free(files->path);
     files->path = path;
     files->top = 0;
@@ -3023,6 +3645,13 @@ static size_t tile_break(DeskFont *font, const char *name, size_t length, int wi
     return fit;
 }
 
+/* Between an icon and its name: more as icons grow, since file glyphs
+   fill their whole square. */
+static int icon_gap(int icon, int pad)
+{
+    return icon / 12 > pad ? icon / 12 : pad;
+}
+
 /* The icon view: tiles of a big icon over the name in up to two lines. */
 static void paint_icons(struct files *files, DeskCanvas *canvas, const struct layout *ui, int x0, int y,
                         int rows)
@@ -3045,11 +3674,31 @@ static void paint_icons(struct files *files, DeskCanvas *canvas, const struct la
             int left = x0 + (int)column * tile, top = y + row * panes->line_height;
             uint32_t color = entry_color(files, entry, selected);
             draw_marks(files, canvas, marks, left + pad / 2, top, tile - pad, panes->line_height - pad / 2);
-            draw_icon(files->icon_font, canvas, left, left + tile, top + icon_baseline, entry_icon(entry),
-                      selected ? color : entry->broken ? color : entry->hidden ? files->colors.muted
-                                                                               : files->colors.directory);
+            /* An image's thumbnail, centered in the icon's square; its icon
+               until the thumbnail comes, or when there can't be one. */
+            struct thumb *thumb = NULL;
+            if (thumbnailable(entry)) {
+                char *path = join_path(files->path, entry->name);
+                thumb = path ? thumb_for(files, path, entry, icon) : NULL;
+                free(path);
+            }
+            if (thumb && thumb->pixels) {
+                desk_canvas_blit(canvas, left + (tile - thumb->width) / 2, top + pad + (icon - thumb->height) / 2,
+                                 thumb->pixels, thumb->width, thumb->height);
+            } else {
+                /* Centered by its ink: icon fonts sit glyphs differently on
+                   the baseline than the text font's metrics suggest. */
+                int above, below, baseline = icon_baseline;
+                desk_char_ink(files->icon_font, entry_icon(entry), &above, &below);
+                if (above + below > 0)
+                    baseline = pad + (icon - (above + below)) / 2 + above;
+                draw_icon(files->icon_font, canvas, left, left + tile, top + baseline, entry_icon(entry),
+                          selected ? color : entry->broken ? color : entry->hidden ? files->colors.muted
+                                                                                   : files->colors.directory);
+            }
             DeskFont *font = entry->link ? ui->italic : ui->font;
-            int text_width = tile - 2 * pad, baseline = top + pad + icon + pad + ui->baseline - (ui->row_height - line) / 2;
+            int text_width = tile - 2 * pad, baseline = top + pad + icon + icon_gap(icon, pad) + ui->baseline -
+                                                        (ui->row_height - line) / 2;
             size_t length = strlen(entry->name), cut = tile_break(font, entry->name, length, text_width);
             DeskCanvas clipped = *canvas;
             desk_canvas_clip(&clipped, left + pad > canvas->clip_left ? left + pad : canvas->clip_left,
@@ -3499,7 +4148,8 @@ static void paint(struct files *files, DeskCanvas *canvas)
         int least = (int)fmax(icon * 1.6, 7 * font_pixels(files));
         panes->columns = list_width / least > 1 ? list_width / least : 1;
         panes->tile_width = list_width / panes->columns;
-        panes->line_height = icon + ui.padding + 2 * desk_font_metrics(ui.font).height + ui.padding;
+        panes->line_height = ui.padding / 2 + icon + icon_gap(icon, ui.padding / 2) +
+                             2 * desk_font_metrics(ui.font).height + ui.padding;
     } else {
         panes->tile_width = list_width;
         panes->line_height = list.row_height;
@@ -5318,7 +5968,7 @@ static bool run(struct files *files)
             wl_display_cancel_read(display);
             return false;
         }
-        struct pollfd fds[7] = {
+        struct pollfd fds[8] = {
             {.fd = wl_display_get_fd(display), .events = POLLIN},
             {.fd = files->repeat.fd, .events = POLLIN},
             {.fd = files->inotify, .events = POLLIN},
@@ -5326,8 +5976,9 @@ static bool run(struct files *files)
             {.fd = files->palette_watch.fd, .events = POLLIN},
             {.fd = files->mounts, .events = POLLPRI},
             {.fd = files->sizer ? files->sizer->event : -1, .events = POLLIN},
+            {.fd = files->thumbnailer ? files->thumbnailer->event : -1, .events = POLLIN},
         };
-        if (poll(fds, 7, -1) < 0) {
+        if (poll(fds, 8, -1) < 0) {
             wl_display_cancel_read(display);
             if (errno == EINTR)
                 continue;
@@ -5366,6 +6017,8 @@ static bool run(struct files *files)
         }
         if (files->sizer && fds[6].revents & POLLIN)
             sizes_arrived(files);
+        if (files->thumbnailer && fds[7].revents & POLLIN)
+            thumbs_arrived(files);
         if (files->mounts >= 0 && fds[5].revents & (POLLPRI | POLLERR)) {
             build_places(files); /* A drive came or went. */
             desk_window_redraw(&files->window);
@@ -5481,6 +6134,8 @@ int main(int argc, char **argv)
 
     files.mounts = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
     files.sizer = sizer_create(); /* Without it, directories just show no size. */
+    files.thumbs_dir = thumbnails_directory(files.home);
+    files.thumbnailer = thumbnailer_create(files.thumbs_dir); /* Without it, images show their icon. */
     files.terminal = terminal_command();
     files.bookmarks_path = bookmarks_file();
     signal(SIGCHLD, SIG_IGN); /* Applications started are left to themselves. */
@@ -5509,6 +6164,9 @@ int main(int argc, char **argv)
     if (files.refresh >= 0)
         close(files.refresh);
     sizer_destroy(files.sizer);
+    thumbs_clear(&files);
+    thumbnailer_destroy(files.thumbnailer);
+    free(files.thumbs_dir);
     free(files.sized_path);
     free(files.terminal);
     free(files.bookmarks_path);

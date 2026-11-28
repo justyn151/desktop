@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.4.0"
+#define FILES_VERSION "0.4.1"
 
 /* Exit statuses. */
 enum {
@@ -159,6 +159,22 @@ struct tab {
     int close_left, close_right;
 };
 
+/* An image's thumbnail, as made for a box of size buffer pixels. Kept in
+   a hash by path while the directory is shown. */
+enum thumb_state { THUMB_PENDING, THUMB_READY, THUMB_FAILED };
+struct thumb {
+    struct thumb *next;     /* In its bucket. */
+    char *path;
+    time_t mtime;           /* The file's, when it was made. */
+    int size;
+    enum thumb_state state;
+    int width, height;
+    uint32_t *pixels;       /* Premultiplied ARGB when ready. */
+};
+#define THUMB_BUCKETS 1024
+#define THUMBS_KEPT 4096    /* More than this and they're all dropped. */
+struct thumbnailer;
+
 /* A text field as drawn: its text, and how far it's scrolled sideways. */
 struct field {
     DeskText text;
@@ -232,6 +248,10 @@ struct files {
     double column_width[COLUMN_COUNT]; /* Type, size and modified, logical pixels at zoom 1. */
     int resizing;             /* The COLUMN_ whose left edge is being dragged, or 0. */
     struct sizer *sizer;      /* Sums directories' sizes on a thread. */
+    struct thumbnailer *thumbnailer; /* Makes thumbnails on a thread. */
+    struct thumb *thumbs[THUMB_BUCKETS];
+    size_t thumb_count;
+    char *thumbs_dir;         /* ~/.cache/thumbnails, the freedesktop cache. */
     char *sized_path;         /* The directory whose sizes it's summing. */
     char typed[64];           /* Type to select: what's been typed lately... */
     uint64_t typed_at;        /* ...and when, monotonic ms. */
