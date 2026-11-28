@@ -17,11 +17,7 @@ Ground rules that apply to every phase:
 
 **Next, in order:**
 
-1. `files`: write [docs/files-roadmap.md](docs/files-roadmap.md) first, as for view and mark, then build it milestone by milestone. Questions the roadmap has to settle:
-   - The first milestone: a single-pane list with H/J/K/L navigation (H up a directory, L into one or open the file), on desk's Wayland layer and shm buffers like view.
-   - Opening files: through `xdg-open`/`mimeapps.list`, so images go to view and markdown to mark in deal. xdg-utils isn't installed yet.
-   - Text rendering: view draws no text, so files needs the first shared text drawing (FreeType and fontconfig, as in deal and bar). This is where `toolkit` (#25) starts to take shape.
-   - Previews (images through `desk_image_load`, markdown through mark's renderer, text), thumbnails, file operations (copy, move, rename, trash), and later the FileChooser portal backend.
+1. `files`: 0.1 from [docs/files-roadmap.md](docs/files-roadmap.md): one directory with keyboard navigation and live refresh. It brings desk's font layer (`-DDESK_FONT`, Phase 3 step 5 started early), a shared xkb keyboard and an xdg-shell window helper, with view moved onto the last two in the same change. Worth installing `shared-mime-info` before 0.3, which reads its MIME globs to pick applications.
 2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
 3. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
@@ -229,6 +225,19 @@ The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on d
 | 0.5 | Config, palette background, start directory, dwl float rule, desktop entry, shot's open-after-capture | Code done, live checks pending |
 | 1.0 | Live checks, a week of use, fuzzing the decoders, README, tag | In progress alongside `mark` |
 
+### files
+
+A graphical file manager with Miller columns (parent, current, preview) and H/J/K/L navigation, pulled forward after view and mark. The detailed plan is in [docs/files-roadmap.md](docs/files-roadmap.md). Icons are Nerd Font glyphs in palette colors, so it needs no icon theme; opening files resolves `mimeapps.list` and desktop entries itself, so it doesn't need xdg-utils.
+
+| Version | Milestone | Status |
+|---|---|---|
+| 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Not started |
+| 0.2 | Miller columns, previews of directories, images and text, status line | Not started |
+| 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
+| 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
+| 0.5 | Mouse and drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
+| 1.0 | Checklists, a week of use, fuzzing, README, tag | Not started |
+
 ### mark
 
 A terminal markdown viewer, started once `view`'s features were done (0.5), while view 1.0's week of use runs. It renders headings, emphasis, lists, tables, code blocks and links in a pager, using deal's text attributes (real bold and italic faces, strikethrough, colored underlines, OSC 8 links). The detailed plan is in [docs/mark-roadmap.md](docs/mark-roadmap.md). Built on desk's Layer 0 only (INI config, palette, file watch), so it links nothing beyond libc.
@@ -299,7 +308,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 | 14 | `power` | Session and power controls: logout, suspend, reboot, shutdown |
 | 15 | `mount` | Storage and removable-device manager (udisks2) |
 | 16 | `view` | Image viewer |
-| 17 | `files` | Graphical file manager with H/J/K/L navigation |
+| 17 | `files` | Graphical file manager with Miller columns and H/J/K/L navigation; roadmap in `docs/files-roadmap.md` |
 | 18 | `ctl` | Desktop configuration tool for fonts, theme and shared settings |
 | 19 | `music` | Local music player |
 | 20 | `video` | Video frontend, with mpv as the playback backend |
