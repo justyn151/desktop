@@ -2,6 +2,7 @@ CC ?= cc
 PKG_CONFIG ?= pkg-config
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share
 
 CFLAGS ?= -O2
 BLUE_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -I$(DESK) $(shell $(PKG_CONFIG) --cflags libsystemd)
@@ -32,8 +33,9 @@ clean:
 
 install: blue
 	install -Dm755 blue "$(DESTDIR)$(BINDIR)/blue"
+	install -Dm644 blue.desktop "$(DESTDIR)$(DATADIR)/applications/blue.desktop"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/blue"
+	rm -f "$(DESTDIR)$(BINDIR)/blue" "$(DESTDIR)$(DATADIR)/applications/blue.desktop"
 
 .PHONY: all clean install uninstall

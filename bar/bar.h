@@ -14,6 +14,7 @@ enum {
     BAR_NETWORK_TEXT_SIZE = 64,
     BAR_NETWORK_COMMAND_SIZE = 1024,
     BAR_VOLUME_TEXT_SIZE = 64,
+    BAR_BLUETOOTH_TEXT_SIZE = 64,
 };
 
 /* How the active workspace stands out besides its color. */
@@ -48,6 +49,11 @@ struct bar_config {
     char volume_middle_click[BAR_NETWORK_COMMAND_SIZE];
     char volume_scroll_up[BAR_NETWORK_COMMAND_SIZE];
     char volume_scroll_down[BAR_NETWORK_COMMAND_SIZE];
+    bool bluetooth_enabled, bluetooth_show_device, bluetooth_show_battery;
+    bool bluetooth_click_enabled;
+    uint32_t bluetooth_off_color;
+    char bluetooth_custom_text[BAR_BLUETOOTH_TEXT_SIZE];
+    char bluetooth_command[BAR_NETWORK_COMMAND_SIZE];
 };
 
 static const struct bar_config bar_defaults = {
@@ -80,6 +86,13 @@ static const struct bar_config bar_defaults = {
     .volume_middle_click = "vol mute",
     .volume_scroll_up = "vol up",
     .volume_scroll_down = "vol down",
+    .bluetooth_enabled = true,
+    .bluetooth_show_device = true,
+    .bluetooth_show_battery = true,
+    .bluetooth_click_enabled = true,
+    .bluetooth_off_color = 0x887d69u,
+    .bluetooth_custom_text = "BT",
+    .bluetooth_command = "deal --app-id blue --columns 84 --rows 26 -e blue",
 };
 
 #endif

@@ -114,6 +114,7 @@ dwl -s 'exec bar'
 The default key table binds **Super+D** to `run` on the session's `PATH`
 and **Super+W** to the wallpaper browser. The browser opens centered and
 floating on the current monitor, like the Wi-Fi selector, and can be resized.
+`blue`, the Bluetooth manager (app ID `blue`), opens the same way.
 
 The bar keeps its existing `-s` status input and IPC connection. dwl
 starts the renderer separately after creating the session’s Wayland

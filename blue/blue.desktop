@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=blue
+GenericName=Bluetooth Manager
+Comment=Pair and connect Bluetooth devices
+Exec=deal --app-id blue --columns 84 --rows 26 -e blue
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=bluetooth;pair;headphones;

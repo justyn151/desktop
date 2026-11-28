@@ -55,12 +55,30 @@ static const enum desk_role color_roles[COLOR_COUNT] = {
 struct Config {
     uint32_t rgb[COLOR_COUNT];
     bool wallpaper_theme;
+    bool show_unnamed;          /* [scan] list nearby devices without a name too */
+    unsigned scan_seconds;      /* [scan] timeout: how long s searches */
+    bool show_battery;          /* [list] the Battery column */
+    bool connected_first;       /* [list] sort = connected, or name */
 };
 
 static const struct Config config_defaults = {
     .rgb = { 0x353535, 0xc5ad81, 0xead4aa, 0x887d69, 0xc5ad81, 0x353535 },
     .wallpaper_theme = true,
+    .scan_seconds = 60,
+    .show_battery = true,
+    .connected_first = true,
 };
+
+static bool parse_bool(const char *value, bool *out)
+{
+    if (!strcmp(value, "true") || !strcmp(value, "yes") || !strcmp(value, "on"))
+        *out = true;
+    else if (!strcmp(value, "false") || !strcmp(value, "no") || !strcmp(value, "off"))
+        *out = false;
+    else
+        return false;
+    return true;
+}
 
 struct Theme {
     char normal[48], highlight[48], muted[48], selection[48];
@@ -220,6 +238,28 @@ static void config_entry(void *data, const char *section, const char *key, const
                 fprintf(stderr, "blue: %s:%d: %s must be #RRGGBB\n", parse->path, line, key);
             return;
         }
+    } else if (!strcmp(section, "scan") && !strcmp(key, "show_unnamed")) {
+        if (!parse_bool(value, &parse->config->show_unnamed))
+            fprintf(stderr, "blue: %s:%d: show_unnamed must be true or false\n", parse->path, line);
+        return;
+    } else if (!strcmp(section, "scan") && !strcmp(key, "timeout")) {
+        char *end;
+        unsigned long seconds = strtoul(value, &end, 10);
+        if (*value >= '0' && *value <= '9' && !*end && seconds >= 5 && seconds <= 600)
+            parse->config->scan_seconds = (unsigned)seconds;
+        else
+            fprintf(stderr, "blue: %s:%d: timeout must be 5 to 600 seconds\n", parse->path, line);
+        return;
+    } else if (!strcmp(section, "list") && !strcmp(key, "show_battery")) {
+        if (!parse_bool(value, &parse->config->show_battery))
+            fprintf(stderr, "blue: %s:%d: show_battery must be true or false\n", parse->path, line);
+        return;
+    } else if (!strcmp(section, "list") && !strcmp(key, "sort")) {
+        if (!strcmp(value, "connected") || !strcmp(value, "name"))
+            parse->config->connected_first = !strcmp(value, "connected");
+        else
+            fprintf(stderr, "blue: %s:%d: sort must be connected or name\n", parse->path, line);
+        return;
     } else if (!strcmp(section, "theme") && !strcmp(key, "source")) {
         if (!strcmp(value, "wallpaper") || !strcmp(value, "manual"))
             parse->config->wallpaper_theme = !strcmp(value, "wallpaper");
@@ -523,10 +563,12 @@ static bool known(const struct Device *device)
     return device->paired || device->bonded || device->trusted || device->connected;
 }
 
+static bool sort_connected_first = true;
+
 static int compare_known(const void *left, const void *right)
 {
     const struct Device *a = *(struct Device *const *)left, *b = *(struct Device *const *)right;
-    if (a->connected != b->connected)
+    if (sort_connected_first && a->connected != b->connected)
         return a->connected ? -1 : 1;
     int order = strcasecmp(device_name(a), device_name(b));
     return order ? order : strcmp(a->path, b->path);
@@ -572,6 +614,7 @@ static void rebuild_rows(struct App *app)
         if (known(device))
             sorted[known_count++] = device;
     }
+    sort_connected_first = app->config.connected_first;
     qsort(sorted, known_count, sizeof *sorted, compare_known);
     for (size_t i = 0; i < known_count; i++)
         add_item(app)->device = sorted[i];
@@ -581,7 +624,7 @@ static void rebuild_rows(struct App *app)
         struct Device *device = app->devices[i];
         if (!device->adapter || strcmp(device->adapter, adapter->path) || known(device))
             continue;
-        if (device->name || device->request)
+        if (device->name || device->request || app->config.show_unnamed)
             sorted[nearby_count++] = device;
         else
             unnamed++;
@@ -1025,9 +1068,9 @@ static void start_scan(struct App *app)
         return;
     }
     app->scanning = true;
-    app->scan_deadline = monotonic_us() + SCAN_TIMEOUT_US;
+    app->scan_deadline = monotonic_us() + (uint64_t)app->config.scan_seconds * 1000000;
     app->model_dirty = true;
-    set_notice(app, "Searching for a minute. Put the device in pairing mode");
+    set_notice(app, "Searching for %u seconds. Put the device in pairing mode", app->config.scan_seconds);
 }
 
 /* The pairing agent */
@@ -1581,10 +1624,10 @@ static const char *device_state(const struct Device *device)
 }
 
 /* One row of the table, or its headings when device is NULL. */
-static void device_line(char *text, unsigned width, const struct Device *device)
+static void device_line(char *text, unsigned width, const struct Device *device, bool show_battery)
 {
     unsigned state_width = width >= 30 ? 13 : 0;
-    unsigned battery_width = width >= 44 ? 9 : 0;
+    unsigned battery_width = show_battery && width >= 44 ? 9 : 0;
     unsigned kind_width = width >= 56 ? 12 : 0;
     unsigned name_width = width - state_width - battery_width - kind_width;
     if (name_width > 36 && state_width)
@@ -1752,7 +1795,7 @@ static int render(struct App *app)
             style = app->theme.normal;
             value = bluetooth_status(app, text, sizeof text);
         } else if (row == 3 && headings) {
-            device_line(fitted, width, NULL);
+            device_line(fitted, width, NULL, app->config.show_battery);
             paint_line(app, row, style, fitted);
             continue;
         } else if (app->item_count) {
@@ -1760,7 +1803,7 @@ static int render(struct App *app)
             if (index < app->item_count) {
                 const struct Item *item = &app->items[index];
                 if (item->device) {
-                    device_line(fitted, width, item->device);
+                    device_line(fitted, width, item->device, app->config.show_battery);
                     style = index == app->selected ? app->theme.selection :
                             item->device->connected ? app->theme.highlight : app->theme.normal;
                     paint_line(app, row, style, fitted);
@@ -1955,7 +1998,7 @@ static int event_loop(struct App *app, const sigset_t *wait_mask)
             terminal_size(app);
         }
         if (app->scanning && monotonic_us() >= app->scan_deadline)
-            stop_scan(app, "Stopped searching after a minute");
+            stop_scan(app, "Stopped searching");
         if (app->model_dirty)
             rebuild_rows(app);
         if (app->screen_dirty && render(app) < 0)
@@ -2049,7 +2092,7 @@ static void usage(FILE *out)
           "\n"
           "Bluetooth devices in the terminal, over BlueZ.\n"
           "Enter pairs a nearby device, or connects or disconnects a known one.\n"
-          "s searches for a minute, t trusts, r renames, x removes, v makes this\n"
+          "s searches nearby, t trusts, r renames, x removes, v makes this\n"
           "computer visible, p turns Bluetooth on or off. Arrows or j/k move,\n"
           "Home/End or g/G jump, q or Escape quits. While blue runs, pairing\n"
           "requests are answered here.\n"

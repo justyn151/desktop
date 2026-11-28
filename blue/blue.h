@@ -1,7 +1,7 @@
 #ifndef BLUE_H
 #define BLUE_H
 
-#define BLUE_VERSION "0.2.0"
+#define BLUE_VERSION "0.3.0"
 
 #define BLUEZ "org.bluez"
 #define BLUEZ_ADAPTER BLUEZ ".Adapter1"
@@ -25,8 +25,6 @@ enum {
     CALL_TIMEOUT_US = 25 * 1000000ull,
     /* Pairing waits for someone to compare or type a code. */
     PAIR_TIMEOUT_US = 90 * 1000000ull,
-    /* Searching stops by itself after a minute. */
-    SCAN_TIMEOUT_US = 60 * 1000000ull,
     /* How long Escape waits for the rest of an escape sequence. */
     ESCAPE_TIMEOUT_US = 50000,
     MAX_ADAPTERS = 8,

@@ -4,8 +4,8 @@ A Bluetooth manager for the terminal, over BlueZ's D-Bus API. It looks and
 works like `net`: it lists the devices the adapter knows and the ones nearby,
 pairs, connects, trusts, renames and removes them, and turns Bluetooth on and
 off. While it runs it is BlueZ's pairing agent, so codes are asked for and
-shown here. The bar module and dwl rule come in 0.3; the plan is in
-[docs/sound-roadmap.md](../docs/sound-roadmap.md).
+shown here. bar shows Bluetooth and opens blue on click, and dwl floats it.
+The plan is in [docs/sound-roadmap.md](../docs/sound-roadmap.md).
 
 ## Usage
 
@@ -16,7 +16,7 @@ deal --app-id blue --columns 84 --rows 26 -e blue
 | Key | Action |
 | --- | --- |
 | Enter | Pair a nearby device, or connect or disconnect a known one |
-| s | Search for nearby devices for a minute, or stop |
+| s | Search for nearby devices (a minute by default), or stop |
 | t | Trust or untrust: a trusted device may connect on its own |
 | r | Rename (an empty name gives back the one the device announces) |
 | x | Remove the device; it will need pairing again |
@@ -60,13 +60,31 @@ untrusted device wants, are asked about here as well. Only BlueZ may ask:
 the D-Bus policy refuses other callers, and blue checks the sender too.
 
 Searching makes the adapter pairable if it wasn't, and puts that back when
-the search stops or blue quits. Searching ends after a minute, or with `s`.
+the search stops or blue quits. Searching ends after `[scan] timeout`, or
+with `s`.
+
+## bar and dwl
+
+bar's `[bluetooth]` module shows `BT off`, `BT`, or the connected device and
+its battery, and a left click runs
+`deal --app-id blue --columns 84 --rows 26 -e blue`, as `blue.desktop`
+does. dwl floats and centers app ID `blue` like `net` (an exact match, so
+other app IDs containing "blue" are untouched); the rule is in
+`dwl/config.h`, so dwl needs a rebuild and restart to pick it up.
 
 ## Configuration
 
-`~/.config/blue/blue.conf` is optional, with the same keys as net's:
+`~/.config/blue/blue.conf` is optional:
 
 ```ini
+[scan]
+show_unnamed = false   # list nearby devices without a name too
+timeout = 60           # seconds s searches, 5 to 600
+
+[list]
+show_battery = true    # the Battery column
+sort = connected       # connected devices first, or name
+
 [appearance]
 background = #353535
 foreground = #c5ad81
@@ -80,12 +98,13 @@ source = wallpaper   # or manual for the colors above
 ```
 
 With `source = wallpaper` (the default), the colors come from wall's
-palette and change while blue is open when the wallpaper does. `-c PATH`
-reads another file.
+palette and change while blue is open when the wallpaper does. The other
+keys are read at start. Bad values are reported on stderr and the default
+kept. `-c PATH` reads another file.
 
 ## Build and install
 
-Needs libsystemd for sd-bus.
+Needs libsystemd for sd-bus. `make install` also installs `blue.desktop`.
 
 ```sh
 make
@@ -93,6 +112,14 @@ make install PREFIX=~/.local
 ```
 
 ## Checks
+
+0.3:
+
+- [x] `[scan] show_unnamed`, `timeout`, `[list] show_battery`, `sort` with a
+      test config; bad values reported and the defaults kept
+- [x] bar: `BT` when on, `BT off` dimmed when off, live as the power changes
+- [ ] bar with headphones connected: the name and battery; a click opens blue
+- [ ] After a dwl restart, blue opens floating and centered
 
 0.2:
 

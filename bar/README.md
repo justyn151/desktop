@@ -55,16 +55,17 @@ fill in settings omitted from the file that was loaded.
 
 | Section | Options |
 | --- | --- |
-| `[bar]` | `height` (1–4096 logical pixels), `position` (`top` or `bottom`), `background`, `opacity` (0–1), `scale` (positive multiplier, default 1.0), `foreground` (volume, network and clock color), `padding` (0–4096 pixels per side) |
+| `[bar]` | `height` (1–4096 logical pixels), `position` (`top` or `bottom`), `background`, `opacity` (0–1), `scale` (positive multiplier, default 1.0), `foreground` (volume, Bluetooth, network and clock color), `padding` (0–4096 pixels per side) |
 | `[font]` | `family` (an installed Fontconfig family or a generic family such as `monospace`), `size` (1–256 pixels) |
 | `[workspaces]` | `labels` (1–32 comma-separated labels in tag order, up to 63 bytes each), `hide_empty` (`true` or `false`), `active_style` (`box` for an opaque box in the workspace color with the label in the background color, `underline`, or `none`), `active_color`, `occupied_color`, `inactive_color`, `urgent_color`, `spacing` (0–4096 pixels) |
 | `[clock]` | `format` (a `strftime` format, including glibc extensions such as `%l` and `%P`) |
 | `[network]` | `enabled`, `show_ssid`, `show_strength`, `click_enabled` (`true` or `false`), `custom_text` (Wi-Fi label), `separator` (up to 63 bytes each, quote to preserve spaces), `command` (up to 1023 bytes) |
 | `[volume]` | `enabled` (`true` or `false`), `custom_text` (label before the level, up to 63 bytes), `muted_color`, `command`, `click`, `middle_click`, `scroll_up`, `scroll_down` (up to 1023 bytes each; empty does nothing) |
+| `[bluetooth]` | `enabled`, `show_device`, `show_battery`, `click_enabled` (`true` or `false`), `custom_text` (label, up to 63 bytes), `off_color`, `command` (up to 1023 bytes) |
 
 Colors use `#RRGGBB`. Full-line comments begin with `#` or `;`. Spaces
 inside values are preserved. The clock uses the process locale and local
-time. Volume, network and clock share a right-aligned text group, joined by
+time. Volume, Bluetooth, network and clock share a right-aligned text group, joined by
 the network `separator`, and the workspace list stops before it.
 
 `scale` multiplies the height, font size, padding, and workspace spacing.
@@ -108,6 +109,18 @@ wheel step (five at most per event), middle click runs `middle_click`
 (mute by default), and left click runs `click`, empty until `vol` has a
 mixer. These are fire-and-forget: they can overlap, unlike the network
 command.
+
+The Bluetooth indicator follows BlueZ on the system bus, for the first
+adapter. It is hidden when `bluetooth.service` isn't running or there is no
+adapter, shows `BT off` in `off_color` (the palette's muted role under the
+wallpaper theme) when the adapter is off, `BT` when it's on with nothing
+connected, and `BT WH-1000XM4 80%` when a device is connected: the name
+with `show_device`, the battery with `show_battery` when the device reports
+one, and `+1` for each further connected device. Without `show_device` a
+connection shows as `BT on`. Signal changes while `blue` searches don't
+redraw the bar. Left-click opens `blue`, the same way as `net`; the default
+is `command = deal --app-id blue --columns 84 --rows 26 -e blue`. See
+[../blue/README.md](../blue/README.md).
 
 After editing the file, reload the running bar:
 

@@ -78,7 +78,7 @@ struct hit_span {
 struct hit_map {
     int height;
     struct hit_span tags[BAR_MAX_WORKSPACES];
-    struct hit_span network, volume;
+    struct hit_span network, volume, bluetooth;
 };
 
 struct command {
@@ -120,19 +120,39 @@ struct volume_feed {
     char raw[VOLUME_LABEL_SIZE];  /* A line that isn't wpctl's format, shown as it is. */
 };
 
+enum { BLUETOOTH_NAME_SIZE = 64, BLUETOOTH_LABEL_SIZE = BAR_BLUETOOTH_TEXT_SIZE + BLUETOOTH_NAME_SIZE + 16 };
+
+/* What bar shows of BlueZ: the first adapter and its connected devices. */
+struct bluetooth {
+    sd_bus *bus;
+    sd_bus_slot *request;
+    int64_t retry, next_refresh;
+    bool refresh, changed;
+    bool present, powered;      /* present: bluetoothd runs and has an adapter. */
+    unsigned connected;
+    int battery;                /* Of the device shown, or -1. */
+    char device[BLUETOOTH_NAME_SIZE];
+};
+
+/* The right side, in order. Each part is drawn on its own so it can have its
+   own color and click area. */
+enum { SEGMENT_VOLUME, SEGMENT_BLUETOOTH, SEGMENT_NETWORK, SEGMENT_CLOCK, SEGMENT_COUNT };
+
+struct segment {
+    size_t offset, length;      /* In right_text. */
+    bool dim;                   /* Muted volume, Bluetooth off. */
+};
+
 struct appearance {
     struct bar_config config;
     FT_Face font;
-    struct text_bounds labels[BAR_MAX_WORKSPACES], right_bounds, network_bounds, volume_bounds;
-    /* The right text is volume, network and clock; these place the first two in it. */
-    size_t network_length, network_offset, volume_length;
-    int network_x, volume_advance;
-    bool volume_muted;
-    struct command network_command;
+    struct text_bounds labels[BAR_MAX_WORKSPACES], right_bounds;
+    struct segment segments[SEGMENT_COUNT];
+    struct command network_command, bluetooth_command;
     struct command volume_command, volume_click, volume_middle_click;
     struct command volume_scroll_up, volume_scroll_down;
-    char right_text[BAR_CLOCK_TEXT_SIZE + 2 * BAR_NETWORK_SEPARATOR_SIZE + NETWORK_LABEL_SIZE +
-                    VOLUME_LABEL_SIZE];
+    char right_text[BAR_CLOCK_TEXT_SIZE + 3 * BAR_NETWORK_SEPARATOR_SIZE + NETWORK_LABEL_SIZE +
+                    VOLUME_LABEL_SIZE + BLUETOOTH_LABEL_SIZE];
     uint32_t background;
 };
 
@@ -296,8 +316,9 @@ struct bar {
     FT_Library freetype;
     struct appearance appearance, pending;
     struct network network;
-    pid_t network_child;
+    pid_t network_child, bluetooth_child;
     struct volume_feed volume;
+    struct bluetooth bluetooth;
     sigset_t child_mask;
     FcConfig *font_config;
     char *config_path;
@@ -409,8 +430,8 @@ static bool load_theme_palette(const char *path, uint32_t rgb[THEME_ROLE_COUNT])
     return ok;
 }
 
-enum section { BAR_SECTION, FONT_SECTION, WORKSPACE_SECTION, CLOCK_SECTION, NETWORK_SECTION, VOLUME_SECTION, THEME_SECTION };
-static const char *const sections[] = {"bar", "font", "workspaces", "clock", "network", "volume", "theme"};
+enum section { BAR_SECTION, FONT_SECTION, WORKSPACE_SECTION, CLOCK_SECTION, NETWORK_SECTION, VOLUME_SECTION, BLUETOOTH_SECTION, THEME_SECTION };
+static const char *const sections[] = {"bar", "font", "workspaces", "clock", "network", "volume", "bluetooth", "theme"};
 
 enum value_type { PIXELS, COLOR, OPACITY, SCALE, POSITION, BOOLEAN, STRING, LABELS, QUOTED_STRING, THEME_SOURCE, ACTIVE_STYLE };
 
@@ -458,6 +479,13 @@ static const struct config_key keys[] = {
     KEY(VOLUME_SECTION, "middle_click", STRING, volume_middle_click, 0, BAR_NETWORK_COMMAND_SIZE - 1),
     KEY(VOLUME_SECTION, "scroll_up", STRING, volume_scroll_up, 0, BAR_NETWORK_COMMAND_SIZE - 1),
     KEY(VOLUME_SECTION, "scroll_down", STRING, volume_scroll_down, 0, BAR_NETWORK_COMMAND_SIZE - 1),
+    KEY(BLUETOOTH_SECTION, "enabled", BOOLEAN, bluetooth_enabled, 0, 0),
+    KEY(BLUETOOTH_SECTION, "custom_text", QUOTED_STRING, bluetooth_custom_text, 0, BAR_BLUETOOTH_TEXT_SIZE - 1),
+    KEY(BLUETOOTH_SECTION, "show_device", BOOLEAN, bluetooth_show_device, 0, 0),
+    KEY(BLUETOOTH_SECTION, "show_battery", BOOLEAN, bluetooth_show_battery, 0, 0),
+    KEY(BLUETOOTH_SECTION, "off_color", COLOR, bluetooth_off_color, 0, 0),
+    KEY(BLUETOOTH_SECTION, "click_enabled", BOOLEAN, bluetooth_click_enabled, 0, 0),
+    KEY(BLUETOOTH_SECTION, "command", STRING, bluetooth_command, 1, BAR_NETWORK_COMMAND_SIZE - 1),
     KEY(THEME_SECTION, "source", THEME_SOURCE, wallpaper_theme, 0, 0),
 };
 #undef KEY
@@ -1176,6 +1204,309 @@ static void service_network(struct network *network, bool enabled, struct pollfd
         *deadline = network->retry;
 }
 
+#define BLUEZ "org.bluez"
+
+/* Signal strength and similar chatter while searching don't change what bar shows. */
+static bool bluetooth_relevant(const char *interface, sd_bus_message *message)
+{
+    if (!strcmp(interface, BLUEZ ".Adapter1") || !strcmp(interface, BLUEZ ".Battery1"))
+        return true;
+    if (strcmp(interface, BLUEZ ".Device1") || sd_bus_message_enter_container(message, 'a', "{sv}") <= 0)
+        return false;
+    bool relevant = false;
+    while (!relevant && sd_bus_message_enter_container(message, 'e', "sv") > 0) {
+        const char *name;
+        if (sd_bus_message_read(message, "s", &name) <= 0)
+            break;
+        relevant = !strcmp(name, "Connected") || !strcmp(name, "Alias");
+        if (sd_bus_message_skip(message, "v") < 0 || sd_bus_message_exit_container(message) < 0)
+            break;
+    }
+    return relevant;
+}
+
+static int bluetooth_properties_changed(sd_bus_message *message, void *data, sd_bus_error *error)
+{
+    (void)error;
+    struct bluetooth *bluetooth = data;
+    const char *interface;
+    if (sd_bus_message_read(message, "s", &interface) > 0 && bluetooth_relevant(interface, message))
+        bluetooth->refresh = true;
+    return 0;
+}
+
+static int bluetooth_interfaces_changed(sd_bus_message *message, void *data, sd_bus_error *error)
+{
+    (void)error;
+    struct bluetooth *bluetooth = data;
+    bool added = !strcmp(sd_bus_message_get_member(message), "InterfacesAdded");
+    const char *path, *interface;
+    if (sd_bus_message_read(message, "o", &path) <= 0 ||
+        sd_bus_message_enter_container(message, 'a', added ? "{sa{sv}}" : "s") <= 0)
+        return 0;
+    /* A device found while searching isn't connected yet: only adapters, batteries and
+       removed devices matter. */
+    for (;;) {
+        if (added && sd_bus_message_enter_container(message, 'e', "sa{sv}") <= 0)
+            break;
+        if (sd_bus_message_read(message, "s", &interface) <= 0)
+            break;
+        if (!strcmp(interface, BLUEZ ".Adapter1") || !strcmp(interface, BLUEZ ".Battery1") ||
+            (!added && !strcmp(interface, BLUEZ ".Device1")))
+            bluetooth->refresh = true;
+        if (added && (sd_bus_message_skip(message, "a{sv}") < 0 || sd_bus_message_exit_container(message) < 0))
+            break;
+    }
+    return 0;
+}
+
+static int bluetooth_owner_changed(sd_bus_message *message, void *data, sd_bus_error *error)
+{
+    (void)error;
+    struct bluetooth *bluetooth = data;
+    bluetooth->request = sd_bus_slot_unref(bluetooth->request);
+    bluetooth->refresh = true;
+    (void)message;
+    return 0;
+}
+
+/* Copy at most size - 1 bytes, cutting only between UTF-8 characters. */
+static void copy_utf8(char *dest, size_t size, const char *text)
+{
+    size_t length = strlen(text);
+    if (length >= size) {
+        length = size - 1;
+        while (length && ((unsigned char)text[length] & 0xc0) == 0x80)
+            --length;
+    }
+    memcpy(dest, text, length);
+    dest[length] = '\0';
+}
+
+static void bluetooth_result(struct bluetooth *bluetooth, bool present, bool powered,
+                             unsigned connected, int battery, const char *device)
+{
+    char name[BLUETOOTH_NAME_SIZE];
+    copy_utf8(name, sizeof name, device ? device : "");
+    if (bluetooth->present != present || bluetooth->powered != powered ||
+        bluetooth->connected != connected || bluetooth->battery != battery ||
+        strcmp(bluetooth->device, name))
+        bluetooth->changed = true;
+    bluetooth->present = present;
+    bluetooth->powered = powered;
+    bluetooth->connected = connected;
+    bluetooth->battery = battery;
+    strcpy(bluetooth->device, name);
+}
+
+/* GetManagedObjects: the first adapter by path, and its connected devices.
+   The device shown is the first connected one by path, so it doesn't jump around. */
+static int bluetooth_reply(sd_bus_message *message, void *data, sd_bus_error *error)
+{
+    (void)error;
+    struct bluetooth *bluetooth = data;
+    bluetooth->request = sd_bus_slot_unref(bluetooth->request);
+    if (sd_bus_message_is_method_error(message, NULL) ||
+        sd_bus_message_enter_container(message, 'a', "{oa{sa{sv}}}") <= 0) {
+        bluetooth_result(bluetooth, false, false, 0, -1, NULL);
+        return 0;
+    }
+    /* Objects come in no particular order, so connected devices are kept until the
+       adapter is known. */
+    enum { MAX_LINKS = 16 };
+    struct { char path[NM_PATH_SIZE], owner[NM_PATH_SIZE], name[BLUETOOTH_NAME_SIZE]; int battery; } links[MAX_LINKS];
+    size_t link_count = 0;
+    char adapter[NM_PATH_SIZE] = "";
+    bool powered = false;
+    while (sd_bus_message_enter_container(message, 'e', "oa{sa{sv}}") > 0) {
+        const char *path, *alias = NULL, *owner = NULL;
+        bool is_adapter = false, is_device = false, on = false, link = false;
+        int percent = -1;
+        if (sd_bus_message_read(message, "o", &path) <= 0 ||
+            sd_bus_message_enter_container(message, 'a', "{sa{sv}}") <= 0)
+            break;
+        while (sd_bus_message_enter_container(message, 'e', "sa{sv}") > 0) {
+            const char *interface, *key, *type;
+            if (sd_bus_message_read(message, "s", &interface) <= 0)
+                break;
+            bool adapter_props = !strcmp(interface, BLUEZ ".Adapter1");
+            bool device_props = !strcmp(interface, BLUEZ ".Device1");
+            bool battery_props = !strcmp(interface, BLUEZ ".Battery1");
+            is_adapter |= adapter_props;
+            is_device |= device_props;
+            if (sd_bus_message_enter_container(message, 'a', "{sv}") <= 0)
+                break;
+            while (next_property(message, &key, &type) > 0) {
+                int read = 0;
+                int flag;
+                uint8_t level;
+                if (adapter_props && !strcmp(key, "Powered") && !strcmp(type, "b")) {
+                    read = sd_bus_message_read(message, "b", &flag);
+                    on = read > 0 && flag;
+                } else if (device_props && !strcmp(key, "Connected") && !strcmp(type, "b")) {
+                    read = sd_bus_message_read(message, "b", &flag);
+                    link = read > 0 && flag;
+                } else if (device_props && !strcmp(key, "Alias") && !strcmp(type, "s")) {
+                    read = sd_bus_message_read(message, "s", &alias);
+                } else if (device_props && !strcmp(key, "Adapter") && !strcmp(type, "o")) {
+                    read = sd_bus_message_read(message, "o", &owner);
+                } else if (battery_props && !strcmp(key, "Percentage") && !strcmp(type, "y")) {
+                    read = sd_bus_message_read(message, "y", &level);
+                    if (read > 0 && level <= 100)
+                        percent = level;
+                }
+                if (!finish_property(message, read, type))
+                    break;
+            }
+            if (sd_bus_message_exit_container(message) < 0 || sd_bus_message_exit_container(message) < 0)
+                break;
+        }
+        sd_bus_message_exit_container(message);
+        sd_bus_message_exit_container(message);
+
+        if (is_adapter && strlen(path) < sizeof adapter && (!*adapter || strcmp(path, adapter) < 0)) {
+            strcpy(adapter, path);
+            powered = on;
+        }
+        if (is_device && link && owner && link_count < MAX_LINKS &&
+            strlen(path) < NM_PATH_SIZE && strlen(owner) < NM_PATH_SIZE) {
+            strcpy(links[link_count].path, path);
+            strcpy(links[link_count].owner, owner);
+            copy_utf8(links[link_count].name, BLUETOOTH_NAME_SIZE, alias ? alias : "");
+            links[link_count++].battery = percent;
+        }
+    }
+    unsigned connected = 0;
+    size_t shown = MAX_LINKS;
+    for (size_t i = 0; i < link_count; ++i) {
+        if (strcmp(links[i].owner, adapter))
+            continue;
+        ++connected;
+        if (shown == MAX_LINKS || strcmp(links[i].path, links[shown].path) < 0)
+            shown = i;
+    }
+    bluetooth_result(bluetooth, *adapter != '\0', powered, connected,
+                     shown < MAX_LINKS ? links[shown].battery : -1,
+                     shown < MAX_LINKS ? links[shown].name : NULL);
+    return 0;
+}
+
+static void bluetooth_disconnect(struct bluetooth *bluetooth)
+{
+    bluetooth->request = sd_bus_slot_unref(bluetooth->request);
+    bluetooth->bus = sd_bus_close_unref(bluetooth->bus);
+    bluetooth->refresh = false;
+    bluetooth_result(bluetooth, false, false, 0, -1, NULL);
+}
+
+static bool bluetooth_connect(struct bluetooth *bluetooth)
+{
+    if (sd_bus_open_system(&bluetooth->bus) < 0)
+        return false;
+    sd_bus_set_method_call_timeout(bluetooth->bus, 3000000);
+    if (sd_bus_add_match_async(bluetooth->bus, NULL,
+            "type='signal',sender='" BLUEZ "',interface='" DBUS_PROPERTIES "',member='PropertiesChanged'",
+            bluetooth_properties_changed, NULL, bluetooth) < 0 ||
+        sd_bus_add_match_async(bluetooth->bus, NULL,
+            "type='signal',sender='" BLUEZ "',interface='org.freedesktop.DBus.ObjectManager'",
+            bluetooth_interfaces_changed, NULL, bluetooth) < 0 ||
+        sd_bus_add_match_async(bluetooth->bus, NULL,
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+            "member='NameOwnerChanged',arg0='" BLUEZ "'", bluetooth_owner_changed, NULL, bluetooth) < 0)
+        return false;
+    bluetooth->refresh = true;
+    return true;
+}
+
+/* Like service_network. A refresh reads everything again, at most four times a second. */
+static void service_bluetooth(struct bluetooth *bluetooth, bool enabled, struct pollfd *fd,
+                              int64_t now, int64_t *deadline)
+{
+    *fd = (struct pollfd){.fd = -1};
+    if (!enabled) {
+        if (bluetooth->bus || bluetooth->retry) {
+            bluetooth_disconnect(bluetooth);
+            bluetooth->retry = 0;
+        }
+        return;
+    }
+    if (!bluetooth->bus && now >= bluetooth->retry && !bluetooth_connect(bluetooth)) {
+        bluetooth_disconnect(bluetooth);
+        bluetooth->retry = now + 3000;
+    }
+    if (bluetooth->bus) {
+        int result = 0;
+        for (int i = 0; i < 32; ++i) {
+            result = sd_bus_process(bluetooth->bus, NULL);
+            if (result <= 0)
+                break;
+        }
+        if (result > 0)
+            *deadline = now;
+        if (result >= 0 && bluetooth->refresh && !bluetooth->request) {
+            if (now >= bluetooth->next_refresh) {
+                bluetooth->refresh = false;
+                bluetooth->next_refresh = now + 250;
+                sd_bus_message *call = NULL;
+                result = sd_bus_message_new_method_call(bluetooth->bus, &call, BLUEZ, "/",
+                                                        "org.freedesktop.DBus.ObjectManager",
+                                                        "GetManagedObjects");
+                if (result >= 0)
+                    result = sd_bus_message_set_auto_start(call, 0);
+                if (result >= 0)
+                    result = sd_bus_call_async(bluetooth->bus, &bluetooth->request, call,
+                                               bluetooth_reply, bluetooth, 0);
+                sd_bus_message_unref(call);
+            } else if (bluetooth->next_refresh < *deadline) {
+                *deadline = bluetooth->next_refresh;
+            }
+        }
+        int bus_fd = sd_bus_get_fd(bluetooth->bus);
+        int events = sd_bus_get_events(bluetooth->bus);
+        uint64_t timeout;
+        if (result >= 0 && bus_fd >= 0 && events >= 0 &&
+            sd_bus_get_timeout(bluetooth->bus, &timeout) >= 0) {
+            *fd = (struct pollfd){.fd = bus_fd, .events = (short)events};
+            if (timeout != UINT64_MAX) {
+                int64_t wake = (int64_t)(timeout / 1000 + (timeout % 1000 != 0));
+                if (wake < *deadline)
+                    *deadline = wake;
+            }
+            return;
+        }
+        bluetooth_disconnect(bluetooth);
+        bluetooth->retry = now + 3000;
+    }
+    if (bluetooth->retry < *deadline)
+        *deadline = bluetooth->retry;
+}
+
+/* "BT off", "BT", or "BT WH-1000XM4 80%" with "+1" for a second device. */
+static void bluetooth_label(const struct bar_config *config, const struct bluetooth *bluetooth,
+                            char label[BLUETOOTH_LABEL_SIZE])
+{
+    label[0] = '\0';
+    if (!config->bluetooth_enabled || !bluetooth->present)
+        return;
+    const char *prefix = config->bluetooth_custom_text;
+    size_t length = (size_t)snprintf(label, BLUETOOTH_LABEL_SIZE, "%s", *prefix ? prefix : "Bluetooth");
+    if (!bluetooth->powered) {
+        snprintf(label + length, BLUETOOTH_LABEL_SIZE - length, " off");
+        return;
+    }
+    if (!bluetooth->connected)
+        return;
+    if (config->bluetooth_show_device && bluetooth->device[0])
+        length += (size_t)snprintf(label + length, BLUETOOTH_LABEL_SIZE - length, " %s", bluetooth->device);
+    else if (!config->bluetooth_show_device)
+        length += (size_t)snprintf(label + length, BLUETOOTH_LABEL_SIZE - length, " on");
+    if (length < BLUETOOTH_LABEL_SIZE && bluetooth->connected > 1)
+        length += (size_t)snprintf(label + length, BLUETOOTH_LABEL_SIZE - length, " +%u",
+                                   bluetooth->connected - 1);
+    if (length < BLUETOOTH_LABEL_SIZE && config->bluetooth_show_battery && bluetooth->battery >= 0)
+        snprintf(label + length, BLUETOOTH_LABEL_SIZE - length, " %d%%", bluetooth->battery);
+}
+
 static void volume_label(const struct bar_config *config, const struct volume_feed *volume,
                          char label[VOLUME_LABEL_SIZE])
 {
@@ -1192,7 +1523,7 @@ static void volume_label(const struct bar_config *config, const struct volume_fe
 }
 
 static bool update_right_text(struct appearance *appearance, const struct network *network,
-                              const struct volume_feed *volume)
+                              const struct volume_feed *volume, const struct bluetooth *bluetooth)
 {
     const struct bar_config *config = &appearance->config;
     char clock[BAR_CLOCK_TEXT_SIZE] = "";
@@ -1224,44 +1555,44 @@ static bool update_right_text(struct appearance *appearance, const struct networ
             break;
         }
     }
-    char sound[VOLUME_LABEL_SIZE];
+    char sound[VOLUME_LABEL_SIZE], radio[BLUETOOTH_LABEL_SIZE];
     volume_label(config, volume, sound);
-    bool muted = sound[0] && !volume->raw[0] && volume->muted;
+    bluetooth_label(config, bluetooth, radio);
+    const bool dim[SEGMENT_COUNT] = {
+        [SEGMENT_VOLUME] = sound[0] && !volume->raw[0] && volume->muted,
+        [SEGMENT_BLUETOOTH] = radio[0] && !bluetooth->powered,
+    };
 
-    /* Volume, network and clock, with the separator between those present. */
+    /* The parts present, joined by the separator. */
     char text[sizeof appearance->right_text];
-    const char *parts[] = {sound, label, clock};
-    size_t starts[3] = {0}, length = 0;
+    const char *parts[SEGMENT_COUNT] = {
+        [SEGMENT_VOLUME] = sound, [SEGMENT_BLUETOOTH] = radio,
+        [SEGMENT_NETWORK] = label, [SEGMENT_CLOCK] = clock,
+    };
+    struct segment segments[SEGMENT_COUNT] = {0};
+    size_t length = 0;
     text[0] = '\0';
-    for (size_t i = 0; i < 3; ++i) {
-        if (!*parts[i]) {
-            starts[i] = length;
+    for (size_t i = 0; i < SEGMENT_COUNT; ++i) {
+        segments[i].offset = length;
+        if (!*parts[i])
             continue;
-        }
         if (length)
             length += (size_t)snprintf(text + length, sizeof text - length, "%s",
                                        config->network_separator);
         if (length >= sizeof text)
             length = sizeof text - 1;
-        starts[i] = length;
+        segments[i] = (struct segment){.offset = length, .dim = dim[i]};
         length += (size_t)snprintf(text + length, sizeof text - length, "%s", parts[i]);
         if (length >= sizeof text)
             length = sizeof text - 1;
+        segments[i].length = length - segments[i].offset;
     }
-    size_t network_length = strlen(label), volume_length = strlen(sound);
-    if (!strcmp(appearance->right_text, text) && appearance->network_length == network_length &&
-        appearance->volume_length == volume_length && appearance->volume_muted == muted)
+    if (!strcmp(appearance->right_text, text) &&
+        !memcmp(appearance->segments, segments, sizeof segments))
         return false;
     strcpy(appearance->right_text, text);
+    memcpy(appearance->segments, segments, sizeof segments);
     appearance->right_bounds = draw_text(appearance->font, text, 0, NULL, 0, 0, 0, 0);
-    appearance->network_bounds = draw_text(appearance->font, label, 0, NULL, 0, 0, 0, 0);
-    appearance->volume_bounds = draw_text(appearance->font, sound, 0, NULL, 0, 0, 0, 0);
-    appearance->network_length = network_length;
-    appearance->network_offset = starts[1];
-    appearance->network_x = text_advance(appearance->font, text, starts[1]);
-    appearance->volume_length = volume_length;
-    appearance->volume_advance = text_advance(appearance->font, text, volume_length);
-    appearance->volume_muted = muted;
     return true;
 }
 
@@ -1347,7 +1678,7 @@ static bool apply_bar_palette(struct appearance *appearance, const uint32_t pale
         {&config->background, THEME_BACKGROUND}, {&config->foreground, THEME_FOREGROUND},
         {&config->active_color, THEME_HIGHLIGHT}, {&config->occupied_color, THEME_ACCENT},
         {&config->inactive_color, THEME_MUTED}, {&config->urgent_color, THEME_URGENT},
-        {&config->volume_muted_color, THEME_MUTED},
+        {&config->volume_muted_color, THEME_MUTED}, {&config->bluetooth_off_color, THEME_MUTED},
     };
     bool changed = false;
     for (size_t i = 0; i < sizeof mapping / sizeof mapping[0]; ++i) {
@@ -1398,6 +1729,11 @@ static bool load_appearance(struct bar *bar, struct appearance *appearance)
                 bar->config_path ? bar->config_path : "defaults");
         return false;
     }
+    if (!parse_command(&candidate.bluetooth_command, config->bluetooth_command)) {
+        fprintf(stderr, "bar: %s: invalid [bluetooth] command\n",
+                bar->config_path ? bar->config_path : "defaults");
+        return false;
+    }
     const struct {
         struct command *command;
         const char *text, *name;
@@ -1440,7 +1776,7 @@ static bool load_appearance(struct bar *bar, struct appearance *appearance)
     }
     for (size_t i = 0; i < config->label_count; ++i)
         candidate.labels[i] = draw_text(candidate.font, config->labels[i], 0, NULL, 0, 0, 0, 0);
-    update_right_text(&candidate, &bar->network, &bar->volume);
+    update_right_text(&candidate, &bar->network, &bar->volume, &bar->bluetooth);
     *appearance = candidate;
     return true;
 }
@@ -1665,38 +2001,47 @@ static void paint(const struct bar *bar, const struct appearance *appearance,
         x += bounds.width + config->spacing;
     }
 
+    /* Each part and each separator on its own, so parts can differ in color. */
     int pen = right_start(bar, appearance) - appearance->right_bounds.left;
-    if (appearance->volume_length) {
-        char sound[VOLUME_LABEL_SIZE];
-        memcpy(sound, appearance->right_text, appearance->volume_length);
-        sound[appearance->volume_length] = '\0';
-        draw_text(appearance->font, sound,
-                  appearance->volume_muted ? config->volume_muted_color : config->foreground,
-                  pixels, width, height, pen, config->padding);
-        draw_text(appearance->font, appearance->right_text + appearance->volume_length,
-                  config->foreground, pixels, width, height, pen + appearance->volume_advance,
-                  config->padding);
-        int start = pen + appearance->volume_bounds.left;
-        int end = start + appearance->volume_bounds.width;
+    const char *text = appearance->right_text;
+    const struct segment *segments = appearance->segments;
+    const uint32_t dim_colors[SEGMENT_COUNT] = {
+        [SEGMENT_VOLUME] = config->volume_muted_color,
+        [SEGMENT_BLUETOOTH] = config->bluetooth_off_color,
+    };
+    struct hit_span *spans[SEGMENT_COUNT] = {
+        [SEGMENT_VOLUME] = &hits->volume,
+        [SEGMENT_BLUETOOTH] = config->bluetooth_click_enabled ? &hits->bluetooth : NULL,
+        [SEGMENT_NETWORK] = config->network_click_enabled ? &hits->network : NULL,
+    };
+    char piece[sizeof appearance->right_text];
+    size_t drawn = 0;
+    for (size_t i = 0; i < SEGMENT_COUNT; ++i) {
+        const struct segment *segment = &segments[i];
+        if (!segment->length)
+            continue;
+        if (segment->offset > drawn) {
+            memcpy(piece, text + drawn, segment->offset - drawn);
+            piece[segment->offset - drawn] = '\0';
+            draw_text(appearance->font, piece, config->foreground, pixels, width, height,
+                      pen + text_advance(appearance->font, text, drawn), config->padding);
+        }
+        memcpy(piece, text + segment->offset, segment->length);
+        piece[segment->length] = '\0';
+        int x = pen + text_advance(appearance->font, text, segment->offset);
+        struct text_bounds bounds = draw_text(appearance->font, piece,
+                                              segment->dim ? dim_colors[i] : config->foreground,
+                                              pixels, width, height, x, config->padding);
+        drawn = segment->offset + segment->length;
+        if (!spans[i] || bounds.width <= 0)
+            continue;
+        int start = x + bounds.left, end = start + bounds.width;
         if (start < config->padding)
             start = config->padding;
         if (end > width)
             end = width;
         if (start < end)
-            hits->volume = (struct hit_span){start, end};
-    } else {
-        draw_text(appearance->font, appearance->right_text, config->foreground, pixels, width,
-                  height, pen, config->padding);
-    }
-    if (config->network_click_enabled && appearance->network_bounds.width > 0) {
-        int start = pen + appearance->network_x + appearance->network_bounds.left;
-        int end = start + appearance->network_bounds.width;
-        if (start < 0)
-            start = 0;
-        if (end > width)
-            end = width;
-        if (start < end)
-            hits->network = (struct hit_span){start, end};
+            *spans[i] = (struct hit_span){start, end};
     }
 }
 
@@ -1804,6 +2149,8 @@ static bool set_input_region(struct bar *bar, const struct hit_map *hits)
         wl_region_add(region, hits->network.start, 0, hits->network.end - hits->network.start, hits->height);
     if (hits->volume.end > hits->volume.start)
         wl_region_add(region, hits->volume.start, 0, hits->volume.end - hits->volume.start, hits->height);
+    if (hits->bluetooth.end > hits->bluetooth.start)
+        wl_region_add(region, hits->bluetooth.start, 0, hits->bluetooth.end - hits->bluetooth.start, hits->height);
     wl_surface_set_input_region(bar->surface, region);
     wl_region_destroy(region);
     return true;
@@ -1855,7 +2202,7 @@ static void queue_reload(struct bar *bar)
 
 static void apply_reload(struct bar *bar)
 {
-    update_right_text(&bar->pending, &bar->network, &bar->volume);
+    update_right_text(&bar->pending, &bar->network, &bar->volume, &bar->bluetooth);
     struct workspace_view view = layout_workspaces(bar, &bar->pending);
     const struct bar_config *old = &bar->appearance.config;
     const struct bar_config *next = &bar->pending.config;
@@ -2060,11 +2407,13 @@ static void reap_children(struct bar *bar)
         if (pid < 0 && errno == EINTR)
             continue;
         if (pid < 0 && errno == ECHILD)
-            bar->network_child = bar->volume.pid = 0;
+            bar->network_child = bar->bluetooth_child = bar->volume.pid = 0;
         if (pid <= 0)
             return;
         if (pid == bar->network_child)
             bar->network_child = 0;
+        if (pid == bar->bluetooth_child)
+            bar->bluetooth_child = 0;
         if (pid == bar->volume.pid)
             bar->volume.pid = 0;
     }
@@ -2104,15 +2453,15 @@ static int spawn_command(struct bar *bar, const struct command *command, int out
     return error;
 }
 
-static void launch_network(struct bar *bar)
+/* One window at a time: a second click while it's open does nothing. */
+static void launch(struct bar *bar, const struct command *command, pid_t *child, const char *section)
 {
     reap_children(bar);
-    if (bar->network_child)
+    if (*child)
         return;
-
-    int error = spawn_command(bar, &bar->appearance.network_command, -1, &bar->network_child);
+    int error = spawn_command(bar, command, -1, child);
     if (error)
-        fprintf(stderr, "bar: could not launch [network] command: %s\n", strerror(error));
+        fprintf(stderr, "bar: could not launch [%s] command: %s\n", section, strerror(error));
 }
 
 /* One-shot commands for clicks and scrolling; SIGCHLD reaps them. */
@@ -2275,7 +2624,11 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
         return;
 
     if (button == BTN_LEFT && pointer_hits(bar, bar->hits.network)) {
-        launch_network(bar);
+        launch(bar, &bar->appearance.network_command, &bar->network_child, "network");
+        return;
+    }
+    if (button == BTN_LEFT && pointer_hits(bar, bar->hits.bluetooth)) {
+        launch(bar, &bar->appearance.bluetooth_command, &bar->bluetooth_child, "bluetooth");
         return;
     }
 
@@ -2640,7 +2993,7 @@ static int status_input_flags(void)
     return flags;
 }
 
-enum { POLL_WAYLAND, POLL_SIGNALS, POLL_STATUS, POLL_NETWORK, POLL_VOLUME, POLL_THEME, POLL_COUNT };
+enum { POLL_WAYLAND, POLL_SIGNALS, POLL_STATUS, POLL_NETWORK, POLL_BLUETOOTH, POLL_VOLUME, POLL_THEME, POLL_COUNT };
 
 static bool handle_signals(struct bar *bar, int fd)
 {
@@ -2681,13 +3034,16 @@ static int run(struct bar *bar, int signals, int status_fd)
         bool enabled = bar->appearance.config.network_enabled;
         int64_t deadline = INT64_MAX;
         service_network(&bar->network, enabled, &fds[POLL_NETWORK], now, &deadline);
+        bool bluetooth_enabled = bar->appearance.config.bluetooth_enabled;
+        service_bluetooth(&bar->bluetooth, bluetooth_enabled, &fds[POLL_BLUETOOTH], now, &deadline);
         service_volume(bar, &fds[POLL_VOLUME], now, &deadline);
-        if (now >= bar->clock_next || bar->network.changed || bar->volume.changed) {
-            if (update_right_text(&bar->appearance, &bar->network, &bar->volume)) {
+        if (now >= bar->clock_next || bar->network.changed || bar->volume.changed ||
+            bar->bluetooth.changed) {
+            if (update_right_text(&bar->appearance, &bar->network, &bar->volume, &bar->bluetooth)) {
                 bar->redraw = true;
                 bar->layout_dirty = true;
             }
-            bar->network.changed = bar->volume.changed = false;
+            bar->network.changed = bar->volume.changed = bar->bluetooth.changed = false;
             if (now >= bar->clock_next)
                 bar->clock_next = now + 1000;
         }
@@ -2716,7 +3072,8 @@ static int run(struct bar *bar, int signals, int status_fd)
             bar->error = "could not read the monotonic clock";
             return 0;
         }
-        if (enabled != bar->appearance.config.network_enabled)
+        if (enabled != bar->appearance.config.network_enabled ||
+            bluetooth_enabled != bar->appearance.config.bluetooth_enabled)
             deadline = now;
         if (bar->clock_next < deadline)
             deadline = bar->clock_next;
@@ -2758,6 +3115,7 @@ static void cleanup(struct bar *bar)
     stop_volume(&bar->volume);
     reap_children(bar);
     network_disconnect(&bar->network);
+    bluetooth_disconnect(&bar->bluetooth);
     release_seat(bar);
     if (bar->ipc_output)
         zdwl_ipc_output_v2_release(bar->ipc_output);
@@ -2862,7 +3220,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    struct bar bar = {.theme_watch = {.fd = -1}, .volume = {.fd = -1}};
+    struct bar bar = {.theme_watch = {.fd = -1}, .volume = {.fd = -1}, .bluetooth = {.battery = -1}};
     bar.child_mask = child_mask;
     wl_list_init(&bar.buffers);
     wl_list_init(&bar.outputs);

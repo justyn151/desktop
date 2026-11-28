@@ -1161,7 +1161,7 @@ applyrules(Client *c)
 
 	for (r = rules; r < END(rules); r++) {
 		if ((!r->title || strstr(title, r->title))
-				&& (!r->id || ((r->id == net_app_id || r->id == wall_browser_app_id)
+				&& (!r->id || ((r->id == net_app_id || r->id == blue_app_id || r->id == wall_browser_app_id)
 					? c->type == XDGShell && strcmp(appid, r->id) == 0
 					: strstr(appid, r->id) != NULL))) {
 			c->isfloating = r->isfloating;
@@ -1191,6 +1191,7 @@ applyrules(Client *c)
 	}
 	if (mon && c->type == XDGShell && c->isfloating && !c->isfullscreen
 			&& client_surface(c)->mapped && (wallpaper_browser || strcmp(appid, net_app_id) == 0
+				|| strcmp(appid, blue_app_id) == 0
 				|| strcmp(appid, "files-picker") == 0)) {
 		if (wallpaper_browser) {
 			struct wlr_box min, max;
