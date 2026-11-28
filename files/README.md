@@ -53,7 +53,7 @@ Movement keys repeat while held, at the compositor's rate. Enter doesn't repeat,
 ## What it shows
 
 - Directories first, then files, in natural order (`file2` before `file10`) and case-insensitively. Letters fold by ASCII case only; other characters compare by code point.
-- Each row has an icon, the name, and on the right the size (or a directory's entry count) and the modified time. The time is shown as `14:03` for today, `28 Nov` for this year, and `2024-03-01` before that. The details are hidden when the window is too narrow for them.
+- Each row has an icon, the name, and on the right the size (or a directory's entry count) and the modified time. The time is the date and time, as `2026-11-28 14:03`. The details are hidden when the window is too narrow for them.
 - Directories are in the palette's accent color and hidden entries are muted. Symlinks are in italic and broken links in the urgent color, marked `broken`. A directory that can't be read counts as `?`.
 - A name that doesn't fit is cut in the middle for files, keeping the extension (`a-very-long-na…me.tar.gz`), and at the end for directories.
 - Names that aren't valid UTF-8 show `�` for the bad bytes, but are kept as they are on disk, so they can still be entered.

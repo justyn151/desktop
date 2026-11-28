@@ -675,18 +675,15 @@ static void format_size(off_t size, char *out, size_t length)
         snprintf(out, length, "%.0f %c", value, units[unit]);
 }
 
-/* Today as the time, this year as day and month, older as the date. */
-static void format_date(const struct timespec *when, const struct tm *now, char *out, size_t length)
+/* The date and time, "2026-11-28 14:03". */
+static void format_date(const struct timespec *when, char *out, size_t length)
 {
     struct tm local;
     if (when->tv_sec == 0 || !localtime_r(&when->tv_sec, &local)) {
         snprintf(out, length, "-");
         return;
     }
-    const char *format = local.tm_year != now->tm_year ? "%Y-%m-%d"
-                       : local.tm_yday != now->tm_yday ? "%d %b"
-                                                       : "%H:%M";
-    if (!strftime(out, length, format, &local))
+    if (!strftime(out, length, "%Y-%m-%d %H:%M", &local))
         snprintf(out, length, "-");
 }
 
@@ -779,13 +776,10 @@ static void paint(struct files *files, DeskCanvas *canvas)
     }
 
     scroll_to_cursor(files, rows);
-    time_t now_seconds = time(NULL);
-    struct tm now;
-    localtime_r(&now_seconds, &now);
 
     /* Details column: size or count, then the date, right-aligned in fixed widths. */
     int size_width = desk_text_width(files->mono, "1023 K", 6);
-    int date_width = desk_text_width(files->mono, "2026-11-28", 10);
+    int date_width = desk_text_width(files->mono, "2026-11-28 14:03", 16);
     int details_width = size_width + gap + date_width;
     int icon_width = (int)lround(metrics.height * 1.4);
     int left = padding, right = canvas->width - padding;
@@ -839,7 +833,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
         } else {
             format_size(entry->size, size, sizeof size);
         }
-        format_date(&entry->modified, &now, date, sizeof date);
+        format_date(&entry->modified, date, sizeof date);
         int date_x = right - padding / 2 - desk_text_width(files->mono, date, strlen(date));
         int size_x = right - padding / 2 - date_width - gap - desk_text_width(files->mono, size, strlen(size));
         desk_text_draw(files->mono, canvas, size_x, baseline, size, strlen(size), detail_color);
