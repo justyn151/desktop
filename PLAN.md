@@ -13,18 +13,23 @@ Ground rules that apply to every phase:
 
 ## Where things stand (2026-11-28)
 
-**Now:** `mark`, the terminal markdown viewer: 0.1 (parse and print), 0.2 (tables and the other GitHub extensions), 0.3 (the pager), 0.4 (links, search, navigation) and 0.5 (config, palette, reload, editor, desktop entry) are done. 1.0 is next: mostly a week of use and the live checks. `view`'s features are all in (0.1 to 0.5); what's left for it is 1.0, which is mostly a week of daily use, so it runs alongside `mark` instead of blocking it. Details for view are in [docs/view-roadmap.md](docs/view-roadmap.md).
+**Now:** `mark`'s features are all in (0.1 to 0.5: parser, GitHub extensions, pager, links and search, config and palette), and so are `view`'s. What's left for both is 1.0, mostly live checks and a week of daily use, so they run alongside the next app instead of blocking it. The next app is `files`, the graphical file manager, pulled forward from Phase 5 the way view and mark were: it's the last big piece of daily use still handled by something outside the desktop. Details for view and mark are in [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
 
 **Next, in order:**
 
-1. `mark`: the 0.1 to 0.5 live checks in deal (`mark/README.md`), then 1.0 from [docs/mark-roadmap.md](docs/mark-roadmap.md), alongside view's week of use
-2. Alongside `mark`, `view` toward 1.0:
+1. `files`: write [docs/files-roadmap.md](docs/files-roadmap.md) first, as for view and mark, then build it milestone by milestone. Questions the roadmap has to settle:
+   - The first milestone: a single-pane list with H/J/K/L navigation (H up a directory, L into one or open the file), on desk's Wayland layer and shm buffers like view.
+   - Opening files: through `xdg-open`/`mimeapps.list`, so images go to view and markdown to mark in deal. xdg-utils isn't installed yet.
+   - Text rendering: view draws no text, so files needs the first shared text drawing (FreeType and fontconfig, as in deal and bar). This is where `toolkit` (#25) starts to take shape.
+   - Previews (images through `desk_image_load`, markdown through mark's renderer, text), thumbnails, file operations (copy, move, rename, trash), and later the FileChooser portal backend.
+2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
+3. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
    - 0.4 live checks once there are sample files: a portrait phone photo, a WebP, an animated GIF
    - A week as the default image viewer, with annoyances in `docs/view-papercuts.md`
    - Fuzz `desk_image_load` (PNG, JPEG, GIF, WebP, EXIF) under ASan/UBSan for a few hours, especially the hand-written GIF decoder
    - Final README pass and tag `view-1.0.0`
-3. Back to the open items: deal 0.10.4 and 0.11.0 (Phase 1), the week on deal and removing foot (Phase 1.4), shot 0.5 and 1.0 (Phase 4), then Phase 3
+4. Back to the open items: deal 0.10.4 and 0.11.0 (Phase 1), the week on deal and removing foot (Phase 1.4), shot 0.5 and 1.0 (Phase 4), then Phase 3
 
 **Recently finished:**
 
@@ -38,9 +43,11 @@ Ground rules that apply to every phase:
 | view 0.5 | `view.conf` (background, transparency, fit_enlarge, filter, start, wrap, sort), palette background that follows the wallpaper, no-argument start directory, dwl float rule, `view.desktop` and `make default`, shot's `[save] open` |
 | mark 0.1 | CommonMark parser (all 652 spec examples), wrapped output with deal's bold, italic, underline colors and OSC 8 links, shaded code |
 | mark 0.2 | GitHub tables (box drawn, columns fitted to the width), strikethrough, task lists, bare-URL autolinks; all 21 GitHub examples |
-| mark 0.5 | `mark.conf`, colors from the wallpaper's palette that follow it live, reload on save as a live preview, `e` to edit in lead at the current line (lead learned `+N`), desktop entry |
+| mark 0.3 | The pager: scrolling by key and wheel, resize reflow that keeps your place, sideways scrolling of wide tables, status line with the current heading, clean exit on every key and signal. Code blocks got padding and wrap instead of being cut |
 | mark 0.4 | Tab through links and follow them (other markdown files open in the pager, anchors jump, the rest go to `xdg-open`), Backspace back, `/` and `?` search with highlights, `]`/`[` heading jumps, an outline on `o` |
-| mark 0.3 | The pager: scrolling by key and wheel, resize reflow that keeps your place, sideways scrolling of wide tables, status line with the current heading, clean exit on every key and signal |
+| mark 0.5 | `mark.conf`, colors from the wallpaper's palette that follow it live, reload on save as a live preview, `e` to edit in lead at the current line (lead learned `+N`), desktop entry |
+| deal 0.13.3 | Box-drawing characters drawn from the cell size instead of the font, so table and frame lines meet exactly |
+| Fonts | monospace is Noto Sans Mono, sans-serif Noto Sans, serif Libertinus Serif, with Nerd Font symbols as a fallback (`~/.config/fontconfig/fonts.conf`); bar, wall and run follow `monospace` |
 | desk | Image decoding moved from wall (`desk_image_load`), key repeat (`DeskRepeat`), alongside shot's atomic files, shm, INI config and buffer pool |
 
 ---
@@ -203,9 +210,9 @@ Rough order, based on what gets touched most often day to day:
 4. `vol`
 5. `power`
 6. `mount`
-7. `view`: pulled forward and in progress (see below)
-   - `mark` follows `view`, ahead of the rest of this list. It starts now, while `view` 1.0's week of use runs
-8. `files`
+7. `view`: pulled forward; features done, 1.0 in progress (see below)
+   - `mark` followed `view`, ahead of the rest of this list; features done, 1.0 in progress
+8. `files`: pulled forward next, ahead of `lock` to `mount`
 9. `ctl`
 10. Then everything else from the project list below
 
@@ -233,7 +240,7 @@ A terminal markdown viewer, started once `view`'s features were done (0.5), whil
 | 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Done (live checks in deal pending) |
 | 0.4 | Following links, back stack, search, heading jumps, outline | Done (live checks in deal pending) |
 | 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Done (live checks in deal pending) |
-| 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Not started |
+| 1.0 | Spec corpus, fuzzing, a week of use, README, tag | In progress alongside `files` |
 
 ### note (idea, not scheduled)
 
@@ -276,7 +283,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 | 3 | `run` | Launcher for desktop entries and `$PATH` commands, with fuzzy search | Daily driver |
 | 4 | `wall` | Wallpaper renderer and browser, transitions, palette generation | Daily driver |
 | 5 | `net` | Wi-Fi manager TUI over NetworkManager | Daily driver |
-| 6 | `deal` | Terminal emulator, migrating from X11 to native Wayland | 0.10.3, Phase 1 |
+| 6 | `deal` | Terminal emulator, native Wayland, tabs, wallpaper colors | 0.13.3, Phase 1 |
 | 7 | `lead` | Modal terminal text editor (installed as `editor`) | Early (Phase 0.3) |
 
 ### Planned (20)
