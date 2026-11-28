@@ -359,7 +359,7 @@ How applications pick up the portal (to confirm against the installed versions):
 
 | Version | Theme | Status |
 |---|---|---|
-| 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Not started |
+| 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Miller columns, previews of directories, images and text, status line | Not started |
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |

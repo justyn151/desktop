@@ -9,7 +9,7 @@ PACKAGES = wayland-client xkbcommon libpng libjpeg libwebp
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PKG_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 CFLAGS ?= -O2
-VIEW_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_IMAGE -DDESK_IMAGE_GIF -DDESK_IMAGE_WEBP -I$(BUILD) -I$(DESK)
+VIEW_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_WINDOW -DDESK_KEYBOARD -DDESK_IMAGE -DDESK_IMAGE_GIF -DDESK_IMAGE_WEBP -I$(BUILD) -I$(DESK)
 
 DESK = ../desk
 BUILD = .build
@@ -34,7 +34,7 @@ view: $(OBJECTS)
 $(BUILD)/view.o: view.c view.h $(HEADERS) $(BUILD)/default-config.h $(DESK)/desk.h
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(VIEW_CFLAGS) -c -o $@ view.c
 
-$(BUILD)/desk.o: $(DESK)/desk.c $(DESK)/desk.h | $(BUILD)
+$(BUILD)/desk.o: $(DESK)/desk.c $(DESK)/desk.h $(HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(VIEW_CFLAGS) -c -o $@ $(DESK)/desk.c
 
 $(BUILD)/%-protocol.o: $(BUILD)/%-protocol.c

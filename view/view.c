@@ -445,23 +445,10 @@ static void layout(struct view *view, int width, int height)
     view->center_y = clamp_axis(view->center_y, image->height, height, view->zoom);
 }
 
-/* The logical size as buffer pixels, and the wl_surface buffer scale. */
-static void physical_size(const struct view *view, int *width, int *height, int *buffer_scale)
+/* The window's size in buffer pixels. */
+static void physical_size(const struct view *view, int *width, int *height)
 {
-    if (view->viewport) {
-        double scale = view->fraction ? view->fraction / 120.0 : view->buffer_scale;
-        *width = (int)lround(view->width * scale);
-        *height = (int)lround(view->height * scale);
-        *buffer_scale = 1;
-    } else {
-        *width = view->width * view->buffer_scale;
-        *height = view->height * view->buffer_scale;
-        *buffer_scale = view->buffer_scale;
-    }
-    if (*width < 1)
-        *width = 1;
-    if (*height < 1)
-        *height = 1;
+    desk_window_buffer_size(&view->window, width, height);
 }
 
 /* Sampling */
@@ -701,7 +688,7 @@ static void paint(struct view *view, uint32_t *pixels, int width, int height)
         .checker = !picture->opaque && view->config.checker,
         .left = left,
         .top = top,
-        .cell = (int)lround(CHECKER_CELL * (view->width > 0 ? (double)width / view->width : 1)),
+        .cell = (int)lround(CHECKER_CELL * (view->window.width > 0 ? (double)width / view->window.width : 1)),
     };
     if (sampler.cell < 1)
         sampler.cell = 1;
@@ -760,7 +747,7 @@ static const char *base_name(const char *path)
 static void update_title(struct view *view)
 {
     const struct level *image = &view->current.picture.levels[0];
-    char title[sizeof view->title], position[32] = "";
+    char title[512], position[32] = "";
     if (view->count > 1)
         snprintf(position, sizeof position, " — %d/%d", view->current.index + 1, view->count);
     const char *name = base_name(view->paths[view->current.index]);
@@ -769,55 +756,25 @@ static void update_title(struct view *view)
                  image->height, view->zoom * 100);
     else
         snprintf(title, sizeof title, "%s%s — %s", name, position, view->current.error);
-    if (strcmp(title, view->title) != 0) {
-        memcpy(view->title, title, sizeof title);
-        xdg_toplevel_set_title(view->toplevel, title);
-    }
+    desk_window_set_title(&view->window, title);
 }
 
-static const struct wl_callback_listener frame_listener;
-
-static void draw(struct view *view)
+/* DeskWindow's draw: paint into a free buffer and commit it. */
+static void draw(void *data, DeskWindow *window)
 {
-    int width, height, buffer_scale;
-    physical_size(view, &width, &height, &buffer_scale);
-    DeskBuffer *buffer = desk_buffer_get(&view->buffers, view->shm, width, height, WL_SHM_FORMAT_XRGB8888);
+    struct view *view = data;
+    DeskBuffer *buffer = desk_window_buffer(window, WL_SHM_FORMAT_XRGB8888);
     if (!buffer)
         return; /* Both busy: retried after a release. */
-    paint(view, buffer->pixels, width, height);
+    paint(view, buffer->pixels, buffer->width, buffer->height);
     update_title(view);
-
-    if (view->viewport)
-        wp_viewport_set_destination(view->viewport, view->width, view->height);
-    wl_surface_set_buffer_scale(view->surface, buffer_scale);
-    wl_surface_attach(view->surface, buffer->buffer, 0, 0);
-    wl_surface_damage_buffer(view->surface, 0, 0, width, height);
-    if (view->frame_callback)
-        wl_callback_destroy(view->frame_callback);
-    view->frame_callback = wl_surface_frame(view->surface);
-    wl_callback_add_listener(view->frame_callback, &frame_listener, view);
-    wl_surface_commit(view->surface);
-    view->dirty = false;
+    desk_window_commit(window, buffer);
 }
-
-static void frame_done(void *data, struct wl_callback *callback, uint32_t time)
-{
-    (void)time;
-    struct view *view = data;
-    wl_callback_destroy(callback);
-    view->frame_callback = NULL;
-    if (view->dirty)
-        draw(view);
-}
-
-static const struct wl_callback_listener frame_listener = {.done = frame_done};
 
 /* Redraw on the next frame, or now when none is pending. */
 static void mark_dirty(struct view *view)
 {
-    view->dirty = true;
-    if (view->configured && !view->frame_callback)
-        draw(view);
+    desk_window_redraw(&view->window);
 }
 
 /* Actions */
@@ -827,8 +784,8 @@ static void zoom_at(struct view *view, double zoom, double x, double y)
 {
     if (!has_image(view))
         return;
-    int width, height, scale;
-    physical_size(view, &width, &height, &scale);
+    int width, height;
+    physical_size(view, &width, &height);
     layout(view, width, height);
     double old = view->zoom;
     double lowest = fmin(MIN_ZOOM, fit_zoom(view, width, height));
@@ -850,8 +807,8 @@ static void zoom_at(struct view *view, double zoom, double x, double y)
 
 static void zoom_centered(struct view *view, double zoom)
 {
-    int width, height, scale;
-    physical_size(view, &width, &height, &scale);
+    int width, height;
+    physical_size(view, &width, &height);
     zoom_at(view, zoom, width / 2.0, height / 2.0);
 }
 
@@ -860,8 +817,8 @@ static void pan(struct view *view, double dx, double dy)
 {
     if (!has_image(view))
         return;
-    int width, height, scale;
-    physical_size(view, &width, &height, &scale);
+    int width, height;
+    physical_size(view, &width, &height);
     layout(view, width, height);
     double x = view->center_x, y = view->center_y;
     view->center_x += dx / view->zoom;
@@ -873,8 +830,8 @@ static void pan(struct view *view, double dx, double dy)
 
 static void pan_step(struct view *view, int columns, int rows)
 {
-    int width, height, scale;
-    physical_size(view, &width, &height, &scale);
+    int width, height;
+    physical_size(view, &width, &height);
     pan(view, columns * PAN_STEP * width, rows * PAN_STEP * height);
 }
 
@@ -1090,8 +1047,8 @@ static bool can_pan_across(struct view *view)
 {
     if (!has_image(view))
         return false;
-    int width, height, scale;
-    physical_size(view, &width, &height, &scale);
+    int width, height;
+    physical_size(view, &width, &height);
     layout(view, width, height);
     return view->current.picture.levels[0].width * view->zoom > width + 0.5;
 }
@@ -1204,12 +1161,13 @@ static bool key_action(struct view *view, xkb_keysym_t sym)
 
 /* The size to ask for when the compositor leaves it to us: the image at one
    pixel per logical pixel, shrunk to fit a share of the output. */
-static void initial_size(const struct view *view, int *width, int *height)
+static void initial_size(void *data, DeskWindow *window, int *width, int *height)
 {
+    const struct view *view = data;
     const struct level *image = &view->current.picture.levels[0];
-    double bound_width = view->bounds_width > 0 ? view->bounds_width : FALLBACK_WIDTH / INITIAL_SHARE;
-    double bound_height = view->bounds_height > 0 ? view->bounds_height : FALLBACK_HEIGHT / INITIAL_SHARE;
-    double scale = view->fraction ? view->fraction / 120.0 : view->buffer_scale;
+    double bound_width = window->bounds_width > 0 ? window->bounds_width : FALLBACK_WIDTH / INITIAL_SHARE;
+    double bound_height = window->bounds_height > 0 ? window->bounds_height : FALLBACK_HEIGHT / INITIAL_SHARE;
+    double scale = desk_window_scale(window);
     double image_width = has_image(view) ? image->width / scale : FALLBACK_WIDTH;
     double image_height = has_image(view) ? image->height / scale : FALLBACK_HEIGHT;
     double fit = fmin(1.0, fmin(bound_width * INITIAL_SHARE / image_width,
@@ -1222,129 +1180,17 @@ static void initial_size(const struct view *view, int *width, int *height)
         *height = MIN_INITIAL_HEIGHT;
 }
 
-static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial)
+static void window_close(void *data, DeskWindow *window)
 {
-    struct view *view = data;
-    xdg_surface_ack_configure(xdg_surface, serial);
-    int width = view->pending_width, height = view->pending_height;
-    if (width <= 0 || height <= 0) {
-        if (view->configured) {
-            width = view->width;
-            height = view->height;
-        } else {
-            initial_size(view, &width, &height);
-        }
-    }
-    bool changed = !view->configured || width != view->width || height != view->height;
-    view->width = width;
-    view->height = height;
-    view->configured = true;
-    if (changed || view->dirty)
-        draw(view); /* Commit now, without waiting for a frame, to answer the configure. */
-}
-
-static const struct xdg_surface_listener xdg_surface_listener = {.configure = xdg_surface_configure};
-
-static void toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height,
-                               struct wl_array *states)
-{
-    (void)toplevel;
-    (void)states;
-    struct view *view = data;
-    view->pending_width = width;
-    view->pending_height = height;
-}
-
-static void toplevel_close(void *data, struct xdg_toplevel *toplevel)
-{
-    (void)toplevel;
+    (void)window;
     struct view *view = data;
     view->running = false;
 }
 
-static void toplevel_configure_bounds(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height)
-{
-    (void)toplevel;
-    struct view *view = data;
-    view->bounds_width = width;
-    view->bounds_height = height;
-}
-
-static void toplevel_wm_capabilities(void *data, struct xdg_toplevel *toplevel, struct wl_array *capabilities)
-{
-    (void)data;
-    (void)toplevel;
-    (void)capabilities;
-}
-
-static const struct xdg_toplevel_listener toplevel_listener = {
-    .configure = toplevel_configure,
-    .close = toplevel_close,
-    .configure_bounds = toplevel_configure_bounds,
-    .wm_capabilities = toplevel_wm_capabilities,
-};
-
-static void wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial)
-{
-    (void)data;
-    xdg_wm_base_pong(wm_base, serial);
-}
-
-static const struct xdg_wm_base_listener wm_base_listener = {.ping = wm_base_ping};
-
-/* Scale */
-
-static void fractional_preferred_scale(void *data, struct wp_fractional_scale_v1 *fractional, uint32_t scale)
-{
-    (void)fractional;
-    struct view *view = data;
-    if (scale == view->fraction)
-        return;
-    view->fraction = scale;
-    mark_dirty(view);
-}
-
-static const struct wp_fractional_scale_v1_listener fractional_listener = {
-    .preferred_scale = fractional_preferred_scale,
-};
-
-static void surface_enter(void *data, struct wl_surface *surface, struct wl_output *output)
-{
-    (void)data;
-    (void)surface;
-    (void)output;
-}
-
-static void surface_leave(void *data, struct wl_surface *surface, struct wl_output *output)
-{
-    (void)data;
-    (void)surface;
-    (void)output;
-}
-
-static void surface_preferred_buffer_scale(void *data, struct wl_surface *surface, int32_t factor)
-{
-    (void)surface;
-    struct view *view = data;
-    if (factor < 1 || factor == view->buffer_scale)
-        return;
-    view->buffer_scale = factor;
-    if (!view->fraction)
-        mark_dirty(view);
-}
-
-static void surface_preferred_buffer_transform(void *data, struct wl_surface *surface, uint32_t transform)
-{
-    (void)data;
-    (void)surface;
-    (void)transform;
-}
-
-static const struct wl_surface_listener surface_listener = {
-    .enter = surface_enter,
-    .leave = surface_leave,
-    .preferred_buffer_scale = surface_preferred_buffer_scale,
-    .preferred_buffer_transform = surface_preferred_buffer_transform,
+static const DeskWindowListener window_listener = {
+    .draw = draw,
+    .close = window_close,
+    .initial_size = initial_size,
 };
 
 /* Keyboard */
@@ -1353,28 +1199,7 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 {
     (void)keyboard;
     struct view *view = data;
-    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0) {
-        close(fd);
-        return;
-    }
-    char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED)
-        return;
-    struct xkb_keymap *keymap = xkb_keymap_new_from_buffer(view->xkb, map, strnlen(map, size),
-                                                           XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    munmap(map, size);
-    if (!keymap)
-        return;
-    struct xkb_state *keys = xkb_state_new(keymap);
-    if (!keys) {
-        xkb_keymap_unref(keymap);
-        return;
-    }
-    xkb_state_unref(view->keys);
-    xkb_keymap_unref(view->keymap);
-    view->keymap = keymap;
-    view->keys = keys;
+    desk_keyboard_keymap(&view->keyboard, format, fd, size);
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
@@ -1407,11 +1232,10 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
         desk_repeat_release(&view->repeat, key);
         return;
     }
-    if (!view->keys)
+    if (!view->keyboard.state)
         return;
-    xkb_keycode_t code = key + 8;
-    bool repeats = key_action(view, xkb_state_key_get_one_sym(view->keys, code));
-    if (repeats && xkb_keymap_key_repeats(view->keymap, code))
+    bool repeats = key_action(view, desk_keyboard_sym(&view->keyboard, key));
+    if (repeats && desk_keyboard_repeats(&view->keyboard, key))
         desk_repeat_start(&view->repeat, key);
     else
         desk_repeat_cancel(&view->repeat);
@@ -1423,8 +1247,7 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_
     (void)keyboard;
     (void)serial;
     struct view *view = data;
-    if (view->keys)
-        xkb_state_update_mask(view->keys, depressed, latched, locked, 0, 0, group);
+    desk_keyboard_modifiers(&view->keyboard, depressed, latched, locked, group);
 }
 
 static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay)
@@ -1454,9 +1277,9 @@ static void set_cursor(struct view *view, enum wp_cursor_shape_device_v1_shape s
 /* Buffer pixels per logical surface unit. */
 static double buffer_units(const struct view *view)
 {
-    int width, height, scale;
-    physical_size(view, &width, &height, &scale);
-    return view->width > 0 ? (double)width / view->width : 1;
+    int width, height;
+    physical_size(view, &width, &height);
+    return view->window.width > 0 ? (double)width / view->window.width : 1;
 }
 
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface,
@@ -1601,13 +1424,13 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
 {
     struct view *view = data;
     bool has_keyboard = capabilities & WL_SEAT_CAPABILITY_KEYBOARD;
-    if (has_keyboard && !view->keyboard) {
-        view->keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(view->keyboard, &keyboard_listener, view);
-    } else if (!has_keyboard && view->keyboard) {
+    if (has_keyboard && !view->wl_keyboard) {
+        view->wl_keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(view->wl_keyboard, &keyboard_listener, view);
+    } else if (!has_keyboard && view->wl_keyboard) {
         desk_repeat_cancel(&view->repeat);
-        wl_keyboard_release(view->keyboard);
-        view->keyboard = NULL;
+        wl_keyboard_release(view->wl_keyboard);
+        view->wl_keyboard = NULL;
     }
 
     bool has_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
@@ -1649,20 +1472,8 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
                             uint32_t version)
 {
     struct view *view = data;
-    if (strcmp(interface, wl_compositor_interface.name) == 0) {
-        /* Version 6 adds preferred_buffer_scale. */
-        view->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, min_version(version, 6));
-    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
-        view->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
-    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
-        /* Version 4 adds configure_bounds and 5 wm_capabilities. */
-        view->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, min_version(version, 5));
-        xdg_wm_base_add_listener(view->wm_base, &wm_base_listener, view);
-    } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
-        view->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
-    } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
-        view->fractional_manager =
-            wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+    if (desk_globals_bind(&view->globals, registry, name, interface, version)) {
+        return;
     } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
         view->cursor_shape_manager = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (strcmp(interface, wl_seat_interface.name) == 0 && !view->seat) {
@@ -1691,17 +1502,17 @@ static bool open_window(struct view *view)
         fprintf(stderr, "view: cannot connect to the Wayland display\n");
         return false;
     }
-    view->xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (desk_keyboard_open(&view->keyboard) != 0) {
+        fprintf(stderr, "view: out of memory\n");
+        return false;
+    }
     view->registry = wl_display_get_registry(view->display);
     wl_registry_add_listener(view->registry, &registry_listener, view);
     if (wl_display_roundtrip(view->display) < 0) {
         fprintf(stderr, "view: lost the Wayland connection\n");
         return false;
     }
-    const char *missing = !view->compositor ? "wl_compositor"
-                        : !view->shm        ? "wl_shm"
-                        : !view->wm_base    ? "xdg_wm_base"
-                                            : NULL;
+    const char *missing = desk_globals_missing(&view->globals);
     if (missing) {
         fprintf(stderr, "view: the compositor doesn't offer %s\n", missing);
         return false;
@@ -1710,51 +1521,31 @@ static bool open_window(struct view *view)
     if (view->pointer && view->cursor_shape_manager && !view->cursor_shape)
         view->cursor_shape = wp_cursor_shape_manager_v1_get_pointer(view->cursor_shape_manager, view->pointer);
 
-    view->surface = wl_compositor_create_surface(view->compositor);
-    wl_surface_add_listener(view->surface, &surface_listener, view);
-    if (view->viewporter) {
-        view->viewport = wp_viewporter_get_viewport(view->viewporter, view->surface);
-        /* Fractional scale is only usable through a viewport. */
-        if (view->fractional_manager) {
-            view->fractional = wp_fractional_scale_manager_v1_get_fractional_scale(view->fractional_manager,
-                                                                                    view->surface);
-            wp_fractional_scale_v1_add_listener(view->fractional, &fractional_listener, view);
-        }
+    if (!desk_window_open(&view->window, &view->globals, "view", &window_listener, view)) {
+        fprintf(stderr, "view: out of memory\n");
+        return false;
     }
-    view->xdg_surface = xdg_wm_base_get_xdg_surface(view->wm_base, view->surface);
-    xdg_surface_add_listener(view->xdg_surface, &xdg_surface_listener, view);
-    view->toplevel = xdg_surface_get_toplevel(view->xdg_surface);
-    xdg_toplevel_add_listener(view->toplevel, &toplevel_listener, view);
-    xdg_toplevel_set_app_id(view->toplevel, "view");
     update_title(view);
-    wl_surface_commit(view->surface);
     return true;
 }
 
 static void close_window(struct view *view)
 {
-    if (view->frame_callback)
-        wl_callback_destroy(view->frame_callback);
-    desk_buffer_pool_finish(&view->buffers);
-    if (view->toplevel)
-        xdg_toplevel_destroy(view->toplevel);
-    if (view->xdg_surface)
-        xdg_surface_destroy(view->xdg_surface);
-    if (view->fractional)
-        wp_fractional_scale_v1_destroy(view->fractional);
-    if (view->viewport)
-        wp_viewport_destroy(view->viewport);
-    if (view->surface)
-        wl_surface_destroy(view->surface);
+    desk_window_close(&view->window);
     if (view->cursor_shape)
         wp_cursor_shape_device_v1_destroy(view->cursor_shape);
     if (view->pointer)
         wl_pointer_release(view->pointer);
-    if (view->keyboard)
-        wl_keyboard_release(view->keyboard);
-    xkb_state_unref(view->keys);
-    xkb_keymap_unref(view->keymap);
-    xkb_context_unref(view->xkb);
+    if (view->wl_keyboard)
+        wl_keyboard_release(view->wl_keyboard);
+    desk_keyboard_close(&view->keyboard);
+    if (view->cursor_shape_manager)
+        wp_cursor_shape_manager_v1_destroy(view->cursor_shape_manager);
+    if (view->seat)
+        wl_seat_destroy(view->seat);
+    desk_globals_finish(&view->globals);
+    if (view->registry)
+        wl_registry_destroy(view->registry);
     if (view->display)
         wl_display_disconnect(view->display);
 }
@@ -1774,7 +1565,7 @@ static bool run(struct view *view)
         }
         /* Preload a neighbour once the current image is on screen and nothing else is waiting. */
         int next;
-        bool idle_work = view->configured && !view->dirty && !view->frame_callback && preload_wanted(view, &next);
+        bool idle_work = desk_window_idle(&view->window) && preload_wanted(view, &next);
         struct pollfd fds[4] = {
             { .fd = wl_display_get_fd(display), .events = POLLIN },
             { .fd = view->repeat.fd, .events = POLLIN },
@@ -1803,8 +1594,8 @@ static bool run(struct view *view)
             unsigned count = desk_repeat_fired(&view->repeat);
             if (count > MAX_REPEATS)
                 count = MAX_REPEATS;
-            for (unsigned i = 0; i < count && view->repeat.active && view->keys; ++i)
-                key_action(view, xkb_state_key_get_one_sym(view->keys, view->repeat.key + 8));
+            for (unsigned i = 0; i < count && view->repeat.active && view->keyboard.state; ++i)
+                key_action(view, desk_keyboard_sym(&view->keyboard, view->repeat.key));
         }
         if (view->watch.fd >= 0 && fds[2].revents && desk_watch_changed(&view->watch, fds[2].revents))
             reload_current(view);
@@ -1820,8 +1611,7 @@ static bool run(struct view *view)
         if (ready == 0 && idle_work)
             preload(view);
         /* A buffer may have been released since a skipped draw. */
-        if (view->dirty && view->configured && !view->frame_callback)
-            draw(view);
+        desk_window_update(&view->window);
     }
     return true;
 }
@@ -2082,7 +1872,7 @@ int main(int argc, char **argv)
     struct view view = {
         .config = config, .paths = list.paths, .count = list.count, .direction = 1,
         .watch = { .fd = -1 }, .palette_watch = { .fd = -1 }, .repeat = { .fd = -1 },
-        .buffer_scale = 1, .running = true, .fit = true, .zoom = 1,
+        .running = true, .fit = true, .zoom = 1,
     };
     if (config.background_palette) {
         view.palette_path = desk_palette_path();

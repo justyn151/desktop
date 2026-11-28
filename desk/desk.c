@@ -15,6 +15,22 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+#if defined DESK_FONT || defined DESK_WINDOW
+#include <math.h>
+#endif
+
+#ifdef DESK_WINDOW
+#include "fractional-scale-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
+#endif
+
+#ifdef DESK_FONT
+#include <fontconfig/fontconfig.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#endif
+
 /* Palette */
 
 static const char *const role_names[DESK_ROLE_COUNT] = {
@@ -510,6 +526,525 @@ void desk_repeat_close(DeskRepeat *repeat)
     *repeat = (DeskRepeat){ .fd = -1 };
 }
 
+/* UTF-8 */
+
+uint32_t desk_utf8_next(const char **text, const char *end)
+{
+    const unsigned char *s = (const unsigned char *)*text;
+    size_t left = (size_t)(end - *text);
+    unsigned char first = s[0];
+    int length;
+    uint32_t code, minimum;
+    if (first < 0x80) {
+        *text += 1;
+        return first;
+    } else if (first >= 0xc2 && first <= 0xdf) {
+        length = 2, code = first & 0x1f, minimum = 0x80;
+    } else if (first >= 0xe0 && first <= 0xef) {
+        length = 3, code = first & 0x0f, minimum = 0x800;
+    } else if (first >= 0xf0 && first <= 0xf4) {
+        length = 4, code = first & 0x07, minimum = 0x10000;
+    } else {
+        *text += 1;
+        return 0xfffd;
+    }
+    if (left < (size_t)length) {
+        *text += 1;
+        return 0xfffd;
+    }
+    for (int i = 1; i < length; ++i) {
+        if ((s[i] & 0xc0) != 0x80) {
+            *text += 1;
+            return 0xfffd;
+        }
+        code = code << 6 | (s[i] & 0x3f);
+    }
+    if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {
+        *text += 1;
+        return 0xfffd;
+    }
+    *text += length;
+    return code;
+}
+
+/* Canvas */
+
+DeskCanvas desk_canvas(uint32_t *pixels, int width, int height)
+{
+    return (DeskCanvas){
+        .pixels = pixels, .width = width, .height = height, .stride = width,
+        .clip_right = width, .clip_bottom = height,
+    };
+}
+
+void desk_canvas_clip(DeskCanvas *canvas, int left, int top, int right, int bottom)
+{
+    canvas->clip_left = left < 0 ? 0 : left;
+    canvas->clip_top = top < 0 ? 0 : top;
+    canvas->clip_right = right > canvas->width ? canvas->width : right;
+    canvas->clip_bottom = bottom > canvas->height ? canvas->height : bottom;
+}
+
+/* Blend premultiplied src over dst with coverage 0–255. */
+static inline uint32_t blend_over(uint32_t dst, uint32_t color, unsigned coverage)
+{
+    unsigned alpha = ((color >> 24) * coverage + 127) / 255;
+    if (alpha == 0)
+        return dst;
+    if (alpha == 255)
+        return color | 0xff000000u;
+    unsigned inverse = 255 - alpha;
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        unsigned source = shift == 24 ? 255 : (color >> shift) & 0xff;
+        unsigned value = (source * alpha + ((dst >> shift) & 0xff) * inverse + 127) / 255;
+        out |= (uint32_t)value << shift;
+    }
+    return out;
+}
+
+void desk_canvas_fill(DeskCanvas *canvas, int x, int y, int width, int height, uint32_t argb)
+{
+    int left = x > canvas->clip_left ? x : canvas->clip_left;
+    int top = y > canvas->clip_top ? y : canvas->clip_top;
+    int right = x + width < canvas->clip_right ? x + width : canvas->clip_right;
+    int bottom = y + height < canvas->clip_bottom ? y + height : canvas->clip_bottom;
+    if (left >= right || top >= bottom)
+        return;
+    bool opaque = argb >> 24 == 0xff;
+    for (int row = top; row < bottom; ++row) {
+        uint32_t *line = canvas->pixels + (size_t)row * (size_t)canvas->stride;
+        for (int column = left; column < right; ++column)
+            line[column] = opaque ? argb : blend_over(line[column], argb, 255);
+    }
+}
+
+#ifdef DESK_KEYBOARD
+/* Keyboard */
+
+int desk_keyboard_open(DeskKeyboard *keyboard)
+{
+    *keyboard = (DeskKeyboard){0};
+    keyboard->context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    return keyboard->context ? 0 : ENOMEM;
+}
+
+int desk_keyboard_keymap(DeskKeyboard *keyboard, uint32_t format, int fd, uint32_t size)
+{
+    if (format != 1 /* WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 */ || size == 0 || !keyboard->context) {
+        close(fd);
+        return EINVAL;
+    }
+    char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    int error = errno;
+    close(fd);
+    if (map == MAP_FAILED)
+        return error;
+    struct xkb_keymap *keymap = xkb_keymap_new_from_buffer(keyboard->context, map, strnlen(map, size),
+                                                           XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(map, size);
+    if (!keymap)
+        return EINVAL;
+    struct xkb_state *state = xkb_state_new(keymap);
+    if (!state) {
+        xkb_keymap_unref(keymap);
+        return ENOMEM;
+    }
+    xkb_state_unref(keyboard->state);
+    xkb_keymap_unref(keyboard->keymap);
+    keyboard->keymap = keymap;
+    keyboard->state = state;
+    return 0;
+}
+
+void desk_keyboard_modifiers(DeskKeyboard *keyboard, uint32_t depressed, uint32_t latched, uint32_t locked,
+                             uint32_t group)
+{
+    if (keyboard->state)
+        xkb_state_update_mask(keyboard->state, depressed, latched, locked, 0, 0, group);
+}
+
+xkb_keysym_t desk_keyboard_sym(const DeskKeyboard *keyboard, uint32_t key)
+{
+    return keyboard->state ? xkb_state_key_get_one_sym(keyboard->state, key + 8) : XKB_KEY_NoSymbol;
+}
+
+unsigned desk_keyboard_mods(const DeskKeyboard *keyboard)
+{
+    static const struct { const char *name; unsigned flag; } names[] = {
+        { XKB_MOD_NAME_SHIFT, DESK_MOD_SHIFT },
+        { XKB_MOD_NAME_CTRL, DESK_MOD_CTRL },
+        { XKB_MOD_NAME_ALT, DESK_MOD_ALT },
+        { XKB_MOD_NAME_LOGO, DESK_MOD_LOGO },
+    };
+    unsigned mods = 0;
+    if (!keyboard->state)
+        return 0;
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        if (xkb_state_mod_name_is_active(keyboard->state, names[i].name, XKB_STATE_MODS_EFFECTIVE) > 0)
+            mods |= names[i].flag;
+    }
+    return mods;
+}
+
+bool desk_keyboard_repeats(const DeskKeyboard *keyboard, uint32_t key)
+{
+    return keyboard->keymap && xkb_keymap_key_repeats(keyboard->keymap, key + 8);
+}
+
+void desk_keyboard_close(DeskKeyboard *keyboard)
+{
+    xkb_state_unref(keyboard->state);
+    xkb_keymap_unref(keyboard->keymap);
+    xkb_context_unref(keyboard->context);
+    *keyboard = (DeskKeyboard){0};
+}
+#endif
+
+#ifdef DESK_FONT
+/* Fonts */
+
+struct glyph {
+    uint32_t code; /* The key; used is separate because U+0000 is valid. */
+    bool used;
+    int face;      /* Index in the font set, or -1 for nothing drawn. */
+    int advance;   /* 26.6 pixels. */
+    int left, top; /* Bitmap offset from the pen and baseline. */
+    int width, height;
+    unsigned char *coverage; /* width × height, or NULL when empty. */
+};
+
+struct DeskFont {
+    FT_Library library;
+    FcFontSet *set;          /* Faces in preference order. */
+    FcCharSet **charsets;    /* Borrowed from set, NULL when absent. */
+    FT_Face *faces;          /* Loaded on first use. */
+    bool *failed;            /* Couldn't load, or not scalable: skip it. */
+    int face_count;
+    double size;
+    DeskFontMetrics metrics;
+    struct glyph *glyphs;    /* Open addressing, power-of-two capacity. */
+    size_t glyph_count, glyph_capacity;
+};
+
+static void font_error(char *error, size_t size, const char *message, const char *pattern)
+{
+    if (error && size)
+        snprintf(error, size, message, pattern);
+}
+
+static FT_Face font_face(DeskFont *font, int index)
+{
+    if (font->faces[index] || font->failed[index])
+        return font->faces[index];
+    FcPattern *pattern = font->set->fonts[index];
+    FcChar8 *file;
+    int face_index = 0;
+    FcBool scalable = FcTrue;
+    FcPatternGetBool(pattern, FC_SCALABLE, 0, &scalable);
+    FcPatternGetInteger(pattern, FC_INDEX, 0, &face_index);
+    FT_Face face = NULL;
+    if (!scalable || FcPatternGetString(pattern, FC_FILE, 0, &file) != FcResultMatch ||
+        FT_New_Face(font->library, (const char *)file, face_index, &face) ||
+        FT_Set_Char_Size(face, 0, (FT_F26Dot6)lround(font->size * 64), 0, 0)) {
+        if (face)
+            FT_Done_Face(face);
+        font->failed[index] = true;
+        return NULL;
+    }
+    font->faces[index] = face;
+    return face;
+}
+
+static void font_measure(DeskFont *font)
+{
+    FT_Face face = font->faces[0];
+    FT_Size_Metrics *size = &face->size->metrics;
+    int ascent = (int)((size->ascender + 63) >> 6);
+    int descent = (int)((-size->descender + 63) >> 6);
+    int height = (int)((size->height + 63) >> 6);
+    font->metrics = (DeskFontMetrics){ascent, descent, height > ascent + descent ? height : ascent + descent};
+}
+
+DeskFont *desk_font_open(const char *pattern_text, double pixel_size, char *error, size_t error_size)
+{
+    if (!(pixel_size > 0) || pixel_size > 4096) {
+        font_error(error, error_size, "bad font size for %s", pattern_text);
+        return NULL;
+    }
+    DeskFont *font = calloc(1, sizeof *font);
+    if (!font) {
+        font_error(error, error_size, "out of memory loading %s", pattern_text);
+        return NULL;
+    }
+    font->size = pixel_size;
+    if (FT_Init_FreeType(&font->library)) {
+        font_error(error, error_size, "can't start FreeType for %s", pattern_text);
+        free(font);
+        return NULL;
+    }
+    FcPattern *pattern = FcNameParse((const FcChar8 *)pattern_text);
+    FcResult result;
+    if (!FcInit() || !pattern || !FcConfigSubstitute(NULL, pattern, FcMatchPattern)) {
+        font_error(error, error_size, "can't match the font %s", pattern_text);
+        if (pattern)
+            FcPatternDestroy(pattern);
+        desk_font_close(font);
+        return NULL;
+    }
+    FcDefaultSubstitute(pattern);
+    font->set = FcFontSort(NULL, pattern, FcTrue, NULL, &result);
+    FcPatternDestroy(pattern);
+    if (!font->set || font->set->nfont == 0) {
+        font_error(error, error_size, "no font matches %s", pattern_text);
+        desk_font_close(font);
+        return NULL;
+    }
+    font->face_count = font->set->nfont;
+    font->charsets = calloc((size_t)font->face_count, sizeof *font->charsets);
+    font->faces = calloc((size_t)font->face_count, sizeof *font->faces);
+    font->failed = calloc((size_t)font->face_count, sizeof *font->failed);
+    if (!font->charsets || !font->faces || !font->failed) {
+        font_error(error, error_size, "out of memory loading %s", pattern_text);
+        desk_font_close(font);
+        return NULL;
+    }
+    for (int i = 0; i < font->face_count; ++i) {
+        if (FcPatternGetCharSet(font->set->fonts[i], FC_CHARSET, 0, &font->charsets[i]) != FcResultMatch)
+            font->charsets[i] = NULL;
+    }
+    /* The first face that loads sets the metrics; usually the first one. */
+    int first = -1;
+    for (int i = 0; i < font->face_count && first < 0; ++i) {
+        if (font_face(font, i))
+            first = i;
+    }
+    if (first < 0) {
+        font_error(error, error_size, "can't load a face for %s", pattern_text);
+        desk_font_close(font);
+        return NULL;
+    }
+    if (first > 0) {
+        /* Move it to the front so fallback order starts with it. */
+        FT_Face face = font->faces[first];
+        FcCharSet *charset = font->charsets[first];
+        FcPattern *swap = font->set->fonts[first];
+        font->faces[first] = font->faces[0], font->faces[0] = face;
+        font->charsets[first] = font->charsets[0], font->charsets[0] = charset;
+        font->set->fonts[first] = font->set->fonts[0], font->set->fonts[0] = swap;
+        font->failed[first] = font->failed[0], font->failed[0] = false;
+    }
+    font_measure(font);
+    return font;
+}
+
+static void glyphs_clear(DeskFont *font)
+{
+    for (size_t i = 0; i < font->glyph_capacity; ++i)
+        free(font->glyphs[i].coverage);
+    free(font->glyphs);
+    font->glyphs = NULL;
+    font->glyph_count = font->glyph_capacity = 0;
+}
+
+int desk_font_resize(DeskFont *font, double pixel_size)
+{
+    if (!(pixel_size > 0) || pixel_size > 4096)
+        return EINVAL;
+    if (pixel_size == font->size)
+        return 0;
+    font->size = pixel_size;
+    glyphs_clear(font);
+    for (int i = 0; i < font->face_count; ++i) {
+        if (font->faces[i] && FT_Set_Char_Size(font->faces[i], 0, (FT_F26Dot6)lround(pixel_size * 64), 0, 0)) {
+            if (i == 0)
+                return EINVAL;
+            FT_Done_Face(font->faces[i]);
+            font->faces[i] = NULL;
+            font->failed[i] = true;
+        }
+    }
+    font_measure(font);
+    return 0;
+}
+
+double desk_font_size(const DeskFont *font)
+{
+    return font->size;
+}
+
+DeskFontMetrics desk_font_metrics(const DeskFont *font)
+{
+    return font->metrics;
+}
+
+static size_t glyph_hash(uint32_t code)
+{
+    uint32_t h = code * 2654435761u;
+    return h ^ h >> 16;
+}
+
+static bool glyphs_grow(DeskFont *font)
+{
+    size_t capacity = font->glyph_capacity ? font->glyph_capacity * 2 : 256;
+    struct glyph *glyphs = calloc(capacity, sizeof *glyphs);
+    if (!glyphs)
+        return false;
+    for (size_t i = 0; i < font->glyph_capacity; ++i) {
+        struct glyph *old = &font->glyphs[i];
+        if (!old->used)
+            continue;
+        size_t slot = glyph_hash(old->code) & (capacity - 1);
+        while (glyphs[slot].used)
+            slot = (slot + 1) & (capacity - 1);
+        glyphs[slot] = *old;
+    }
+    free(font->glyphs);
+    font->glyphs = glyphs;
+    font->glyph_capacity = capacity;
+    return true;
+}
+
+/* Render code into glyph from the first face that has it. */
+static void glyph_render(DeskFont *font, uint32_t code, struct glyph *glyph)
+{
+    *glyph = (struct glyph){.code = code, .used = true, .face = -1};
+    FT_Face face = NULL;
+    FT_UInt index = 0;
+    for (int i = 0; i < font->face_count && !index; ++i) {
+        if (font->failed[i] || (font->charsets[i] && !FcCharSetHasChar(font->charsets[i], code)))
+            continue;
+        face = font_face(font, i);
+        if (face && (index = FT_Get_Char_Index(face, code)) != 0)
+            glyph->face = i;
+    }
+    if (!index) {
+        /* Nobody has it: the first face's missing-glyph box. */
+        face = font->faces[0];
+        glyph->face = 0;
+    }
+    if (FT_Load_Glyph(face, index, FT_LOAD_TARGET_LIGHT | FT_LOAD_NO_BITMAP) ||
+        FT_Render_Glyph(face->glyph, FT_RENDER_MODE_LIGHT))
+        return;
+    FT_GlyphSlot slot = face->glyph;
+    glyph->advance = (int)slot->advance.x;
+    const FT_Bitmap *bitmap = &slot->bitmap;
+    if (bitmap->pixel_mode != FT_PIXEL_MODE_GRAY || !bitmap->width || !bitmap->rows)
+        return;
+    glyph->coverage = malloc((size_t)bitmap->width * bitmap->rows);
+    if (!glyph->coverage)
+        return;
+    for (unsigned row = 0; row < bitmap->rows; ++row)
+        memcpy(glyph->coverage + (size_t)row * bitmap->width, bitmap->buffer + (ptrdiff_t)row * bitmap->pitch,
+               bitmap->width);
+    glyph->width = (int)bitmap->width;
+    glyph->height = (int)bitmap->rows;
+    glyph->left = slot->bitmap_left;
+    glyph->top = slot->bitmap_top;
+}
+
+static const struct glyph *font_glyph(DeskFont *font, uint32_t code)
+{
+    static const struct glyph empty = {.face = -1};
+    if (font->glyph_count + 1 > font->glyph_capacity / 2 && !glyphs_grow(font))
+        return &empty;
+    size_t mask = font->glyph_capacity - 1, slot = glyph_hash(code) & mask;
+    while (font->glyphs[slot].used) {
+        if (font->glyphs[slot].code == code)
+            return &font->glyphs[slot];
+        slot = (slot + 1) & mask;
+    }
+    glyph_render(font, code, &font->glyphs[slot]);
+    font->glyph_count++;
+    return &font->glyphs[slot];
+}
+
+/* Control characters, such as a newline in a file name, show as U+FFFD. */
+static uint32_t visible_code(uint32_t code)
+{
+    return code < 0x20 || code == 0x7f ? 0xfffd : code;
+}
+
+int desk_char_width(DeskFont *font, uint32_t code)
+{
+    return (font_glyph(font, visible_code(code))->advance + 32) >> 6;
+}
+
+int desk_text_width(DeskFont *font, const char *text, size_t length)
+{
+    const char *end = text + length;
+    long pen = 0;
+    while (text < end)
+        pen += font_glyph(font, visible_code(desk_utf8_next(&text, end)))->advance;
+    return (int)((pen + 32) >> 6);
+}
+
+size_t desk_text_fit(DeskFont *font, const char *text, size_t length, int max_width)
+{
+    const char *start = text, *end = text + length;
+    long pen = 0, limit = (long)max_width << 6;
+    while (text < end) {
+        const char *next = text;
+        long advance = font_glyph(font, visible_code(desk_utf8_next(&next, end)))->advance;
+        if (pen + advance > limit + 32)
+            break;
+        pen += advance;
+        text = next;
+    }
+    return (size_t)(text - start);
+}
+
+int desk_text_draw(DeskFont *font, DeskCanvas *canvas, int x, int y, const char *text, size_t length,
+                   uint32_t argb)
+{
+    const char *end = text + length;
+    long pen = (long)x << 6;
+    uint32_t color = argb & 0x00ffffffu;
+    unsigned alpha = argb >> 24;
+    while (text < end) {
+        const struct glyph *glyph = font_glyph(font, visible_code(desk_utf8_next(&text, end)));
+        int left = (int)((pen + 32) >> 6) + glyph->left, top = y - glyph->top;
+        pen += glyph->advance;
+        if (!glyph->coverage || left >= canvas->clip_right || top >= canvas->clip_bottom ||
+            left + glyph->width <= canvas->clip_left || top + glyph->height <= canvas->clip_top)
+            continue;
+        int row0 = top < canvas->clip_top ? canvas->clip_top - top : 0;
+        int row1 = top + glyph->height > canvas->clip_bottom ? canvas->clip_bottom - top : glyph->height;
+        int col0 = left < canvas->clip_left ? canvas->clip_left - left : 0;
+        int col1 = left + glyph->width > canvas->clip_right ? canvas->clip_right - left : glyph->width;
+        for (int row = row0; row < row1; ++row) {
+            uint32_t *line = canvas->pixels + (size_t)(top + row) * (size_t)canvas->stride + left;
+            const unsigned char *coverage = glyph->coverage + (size_t)row * (size_t)glyph->width;
+            for (int column = col0; column < col1; ++column) {
+                unsigned c = coverage[column];
+                if (c)
+                    line[column] = blend_over(line[column], color | (uint32_t)alpha << 24, c);
+            }
+        }
+    }
+    return (int)((pen + 32) >> 6);
+}
+
+void desk_font_close(DeskFont *font)
+{
+    if (!font)
+        return;
+    glyphs_clear(font);
+    for (int i = 0; i < font->face_count; ++i) {
+        if (font->faces && font->faces[i])
+            FT_Done_Face(font->faces[i]);
+    }
+    free(font->faces);
+    free(font->failed);
+    free(font->charsets);
+    if (font->set)
+        FcFontSetDestroy(font->set);
+    if (font->library)
+        FT_Done_FreeType(font->library);
+    free(font);
+}
+#endif
+
 #ifdef DESK_WAYLAND
 /* shm buffers */
 
@@ -567,6 +1102,330 @@ void desk_buffer_pool_finish(DeskBufferPool *pool)
 {
     for (int i = 0; i < 2; ++i) buffer_slot_free(&pool->slots[i]);
 }
+
+#ifdef DESK_WINDOW
+/* Window */
+
+static uint32_t min_version(uint32_t offered, uint32_t wanted)
+{
+    return offered < wanted ? offered : wanted;
+}
+
+static void wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial)
+{
+    (void)data;
+    xdg_wm_base_pong(wm_base, serial);
+}
+
+static const struct xdg_wm_base_listener wm_base_listener = {.ping = wm_base_ping};
+
+bool desk_globals_bind(DeskGlobals *globals, struct wl_registry *registry, uint32_t name, const char *interface,
+                       uint32_t version)
+{
+    if (strcmp(interface, wl_compositor_interface.name) == 0 && !globals->compositor) {
+        /* Version 6 adds preferred_buffer_scale. */
+        globals->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, min_version(version, 6));
+    } else if (strcmp(interface, wl_shm_interface.name) == 0 && !globals->shm) {
+        globals->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0 && !globals->wm_base) {
+        /* Version 4 adds configure_bounds and 5 wm_capabilities. */
+        globals->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, min_version(version, 5));
+        xdg_wm_base_add_listener(globals->wm_base, &wm_base_listener, NULL);
+    } else if (strcmp(interface, wp_viewporter_interface.name) == 0 && !globals->viewporter) {
+        globals->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+    } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0 &&
+               !globals->fractional_manager) {
+        globals->fractional_manager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+const char *desk_globals_missing(const DeskGlobals *globals)
+{
+    return !globals->compositor ? wl_compositor_interface.name
+         : !globals->shm        ? wl_shm_interface.name
+         : !globals->wm_base    ? xdg_wm_base_interface.name
+                                : NULL;
+}
+
+void desk_globals_finish(DeskGlobals *globals)
+{
+    if (globals->fractional_manager)
+        wp_fractional_scale_manager_v1_destroy(globals->fractional_manager);
+    if (globals->viewporter)
+        wp_viewporter_destroy(globals->viewporter);
+    if (globals->wm_base)
+        xdg_wm_base_destroy(globals->wm_base);
+    if (globals->shm)
+        wl_shm_destroy(globals->shm);
+    if (globals->compositor)
+        wl_compositor_destroy(globals->compositor);
+    *globals = (DeskGlobals){0};
+}
+
+static void window_draw(DeskWindow *window)
+{
+    window->listener->draw(window->data, window);
+}
+
+static void window_frame_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+    (void)time;
+    DeskWindow *window = data;
+    wl_callback_destroy(callback);
+    window->frame_callback = NULL;
+    if (window->dirty)
+        window_draw(window);
+}
+
+static const struct wl_callback_listener window_frame_listener = {.done = window_frame_done};
+
+static void window_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial)
+{
+    DeskWindow *window = data;
+    xdg_surface_ack_configure(xdg_surface, serial);
+    int width = window->pending_width, height = window->pending_height;
+    if (width <= 0 || height <= 0) {
+        if (window->configured) {
+            width = window->width;
+            height = window->height;
+        } else {
+            width = 800, height = 600;
+            if (window->listener->initial_size)
+                window->listener->initial_size(window->data, window, &width, &height);
+        }
+    }
+    bool changed = !window->configured || width != window->width || height != window->height;
+    window->width = width;
+    window->height = height;
+    window->configured = true;
+    if (changed || window->dirty) {
+        window->dirty = true;
+        window_draw(window); /* Commit now, without waiting for a frame, to answer the configure. */
+    }
+}
+
+static const struct xdg_surface_listener window_surface_listener = {.configure = window_configure};
+
+static void toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height,
+                               struct wl_array *states)
+{
+    (void)toplevel;
+    DeskWindow *window = data;
+    window->pending_width = width;
+    window->pending_height = height;
+    window->activated = false;
+    uint32_t *state;
+    wl_array_for_each(state, states) {
+        if (*state == XDG_TOPLEVEL_STATE_ACTIVATED)
+            window->activated = true;
+    }
+}
+
+static void toplevel_close(void *data, struct xdg_toplevel *toplevel)
+{
+    (void)toplevel;
+    DeskWindow *window = data;
+    if (window->listener->close)
+        window->listener->close(window->data, window);
+}
+
+static void toplevel_configure_bounds(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height)
+{
+    (void)toplevel;
+    DeskWindow *window = data;
+    window->bounds_width = width;
+    window->bounds_height = height;
+}
+
+static void toplevel_wm_capabilities(void *data, struct xdg_toplevel *toplevel, struct wl_array *capabilities)
+{
+    (void)data;
+    (void)toplevel;
+    (void)capabilities;
+}
+
+static const struct xdg_toplevel_listener window_toplevel_listener = {
+    .configure = toplevel_configure,
+    .close = toplevel_close,
+    .configure_bounds = toplevel_configure_bounds,
+    .wm_capabilities = toplevel_wm_capabilities,
+};
+
+static void fractional_preferred_scale(void *data, struct wp_fractional_scale_v1 *fractional, uint32_t scale)
+{
+    (void)fractional;
+    DeskWindow *window = data;
+    if (scale == window->fraction)
+        return;
+    window->fraction = scale;
+    desk_window_redraw(window);
+}
+
+static const struct wp_fractional_scale_v1_listener window_fractional_listener = {
+    .preferred_scale = fractional_preferred_scale,
+};
+
+static void surface_enter(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+    (void)data;
+    (void)surface;
+    (void)output;
+}
+
+static void surface_leave(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+    (void)data;
+    (void)surface;
+    (void)output;
+}
+
+static void surface_preferred_buffer_scale(void *data, struct wl_surface *surface, int32_t factor)
+{
+    (void)surface;
+    DeskWindow *window = data;
+    if (factor < 1 || factor == window->buffer_scale)
+        return;
+    window->buffer_scale = factor;
+    if (!window->fraction)
+        desk_window_redraw(window);
+}
+
+static void surface_preferred_buffer_transform(void *data, struct wl_surface *surface, uint32_t transform)
+{
+    (void)data;
+    (void)surface;
+    (void)transform;
+}
+
+static const struct wl_surface_listener window_surface_scale_listener = {
+    .enter = surface_enter,
+    .leave = surface_leave,
+    .preferred_buffer_scale = surface_preferred_buffer_scale,
+    .preferred_buffer_transform = surface_preferred_buffer_transform,
+};
+
+bool desk_window_open(DeskWindow *window, const DeskGlobals *globals, const char *app_id,
+                      const DeskWindowListener *listener, void *data)
+{
+    *window = (DeskWindow){.shm = globals->shm, .buffer_scale = 1, .listener = listener, .data = data};
+    window->surface = wl_compositor_create_surface(globals->compositor);
+    if (!window->surface)
+        return false;
+    wl_surface_add_listener(window->surface, &window_surface_scale_listener, window);
+    if (globals->viewporter) {
+        window->viewport = wp_viewporter_get_viewport(globals->viewporter, window->surface);
+        /* Fractional scale is only usable through a viewport. */
+        if (globals->fractional_manager) {
+            window->fractional = wp_fractional_scale_manager_v1_get_fractional_scale(globals->fractional_manager,
+                                                                                      window->surface);
+            wp_fractional_scale_v1_add_listener(window->fractional, &window_fractional_listener, window);
+        }
+    }
+    window->xdg_surface = xdg_wm_base_get_xdg_surface(globals->wm_base, window->surface);
+    xdg_surface_add_listener(window->xdg_surface, &window_surface_listener, window);
+    window->toplevel = xdg_surface_get_toplevel(window->xdg_surface);
+    xdg_toplevel_add_listener(window->toplevel, &window_toplevel_listener, window);
+    xdg_toplevel_set_app_id(window->toplevel, app_id);
+    wl_surface_commit(window->surface);
+    return true;
+}
+
+void desk_window_set_title(DeskWindow *window, const char *title)
+{
+    if (window->title && strcmp(window->title, title) == 0)
+        return;
+    char *copy = strdup(title);
+    if (!copy)
+        return;
+    free(window->title);
+    window->title = copy;
+    xdg_toplevel_set_title(window->toplevel, title);
+}
+
+double desk_window_scale(const DeskWindow *window)
+{
+    if (window->viewport && window->fraction)
+        return window->fraction / 120.0;
+    return window->buffer_scale;
+}
+
+void desk_window_buffer_size(const DeskWindow *window, int *width, int *height)
+{
+    if (window->viewport) {
+        double scale = desk_window_scale(window);
+        *width = (int)lround(window->width * scale);
+        *height = (int)lround(window->height * scale);
+    } else {
+        *width = window->width * window->buffer_scale;
+        *height = window->height * window->buffer_scale;
+    }
+    if (*width < 1)
+        *width = 1;
+    if (*height < 1)
+        *height = 1;
+}
+
+DeskBuffer *desk_window_buffer(DeskWindow *window, uint32_t format)
+{
+    int width, height;
+    desk_window_buffer_size(window, &width, &height);
+    return desk_buffer_get(&window->buffers, window->shm, width, height, format);
+}
+
+void desk_window_commit(DeskWindow *window, DeskBuffer *buffer)
+{
+    if (window->viewport)
+        wp_viewport_set_destination(window->viewport, window->width, window->height);
+    wl_surface_set_buffer_scale(window->surface, window->viewport ? 1 : window->buffer_scale);
+    wl_surface_attach(window->surface, buffer->buffer, 0, 0);
+    wl_surface_damage_buffer(window->surface, 0, 0, buffer->width, buffer->height);
+    if (window->frame_callback)
+        wl_callback_destroy(window->frame_callback);
+    window->frame_callback = wl_surface_frame(window->surface);
+    wl_callback_add_listener(window->frame_callback, &window_frame_listener, window);
+    wl_surface_commit(window->surface);
+    window->dirty = false;
+}
+
+void desk_window_redraw(DeskWindow *window)
+{
+    window->dirty = true;
+    desk_window_update(window);
+}
+
+void desk_window_update(DeskWindow *window)
+{
+    if (window->dirty && window->configured && !window->frame_callback)
+        window_draw(window);
+}
+
+bool desk_window_idle(const DeskWindow *window)
+{
+    return window->configured && !window->dirty && !window->frame_callback;
+}
+
+void desk_window_close(DeskWindow *window)
+{
+    if (window->frame_callback)
+        wl_callback_destroy(window->frame_callback);
+    desk_buffer_pool_finish(&window->buffers);
+    if (window->toplevel)
+        xdg_toplevel_destroy(window->toplevel);
+    if (window->xdg_surface)
+        xdg_surface_destroy(window->xdg_surface);
+    if (window->fractional)
+        wp_fractional_scale_v1_destroy(window->fractional);
+    if (window->viewport)
+        wp_viewport_destroy(window->viewport);
+    if (window->surface)
+        wl_surface_destroy(window->surface);
+    free(window->title);
+    *window = (DeskWindow){0};
+}
+#endif
 #endif
 
 #ifdef DESK_IMAGE

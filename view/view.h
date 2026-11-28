@@ -108,7 +108,6 @@ struct view {
     DeskWatch watch;      /* The current file, to reload it when replaced. */
     struct signature signature;
     struct frame frame;
-    char title[512];
 
     /* What's shown. zoom is buffer pixels per image pixel; the centre is in
        image pixels. While fit is set, both follow the window size. */
@@ -117,35 +116,17 @@ struct view {
 
     struct wl_display *display;
     struct wl_registry *registry;
-    struct wl_compositor *compositor;
-    struct wl_shm *shm;
-    struct xdg_wm_base *wm_base;
-    struct wp_viewporter *viewporter;
-    struct wp_fractional_scale_manager_v1 *fractional_manager;
+    DeskGlobals globals;
     struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
     struct wl_seat *seat;
-    struct wl_keyboard *keyboard;
+    struct wl_keyboard *wl_keyboard;
     struct wl_pointer *pointer;
     struct wp_cursor_shape_device_v1 *cursor_shape;
 
-    struct wl_surface *surface;
-    struct xdg_surface *xdg_surface;
-    struct xdg_toplevel *toplevel;
-    struct wp_viewport *viewport;
-    struct wp_fractional_scale_v1 *fractional;
-    struct wl_callback *frame_callback;
-    DeskBufferPool buffers;
+    DeskWindow window;
+    bool running;
 
-    int width, height;                 /* Logical size in use. */
-    int pending_width, pending_height; /* From the latest toplevel configure. */
-    int bounds_width, bounds_height;   /* configure_bounds, 0 when unknown. */
-    uint32_t fraction;                 /* Preferred scale × 120, 0 when unknown. */
-    int buffer_scale;                  /* Preferred integer scale. */
-    bool configured, dirty, running;
-
-    struct xkb_context *xkb;
-    struct xkb_keymap *keymap;
-    struct xkb_state *keys;
+    DeskKeyboard keyboard;
     DeskRepeat repeat;
 
     /* Pointer, in logical surface coordinates. */

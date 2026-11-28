@@ -2,7 +2,7 @@
 
 `view` is an image viewer for dwl. Version 0.5 browses PNG, JPEG, GIF and WebP images: a file and the images beside it, a directory, or a list. It zooms, pans, rotates and flips them, and reloads an image when its file is replaced. What's left is in [docs/view-roadmap.md](../docs/view-roadmap.md).
 
-It's a normal xdg-shell window with app ID `view`, so dwl tiles or floats it like any other client. It renders at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so images stay sharp at fractional scales, and uses `cursor-shape-v1` for the drag cursor. It's built on [desk](../desk/README.md): image decoding, shm buffers, key repeat, the file watch, the palette and the INI parser.
+It's a normal xdg-shell window with app ID `view`, so dwl tiles or floats it like any other client. It renders at the output's physical resolution through `wp-viewporter` and `wp-fractional-scale-v1`, so images stay sharp at fractional scales, and uses `cursor-shape-v1` for the drag cursor. It's built on [desk](../desk/README.md): the window, keyboard, image decoding, shm buffers, key repeat, the file watch, the palette and the INI parser.
 
 ## Build
 

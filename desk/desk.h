@@ -159,6 +159,123 @@ unsigned desk_repeat_fired(DeskRepeat *repeat);
 
 void desk_repeat_close(DeskRepeat *repeat);
 
+/* UTF-8 */
+
+/* Decode the code point at *text, which must be before end, and advance
+   past it. Each byte of an invalid or truncated sequence, an overlong form,
+   a surrogate or anything above U+10FFFF decodes as U+FFFD, so every byte
+   string can be shown. */
+uint32_t desk_utf8_next(const char **text, const char *end);
+
+/* Canvas */
+
+/* A 32-bit premultiplied ARGB buffer and a clip rectangle, which every
+   drawing function stays inside. */
+typedef struct {
+    uint32_t *pixels;
+    int width, height, stride;               /* stride in pixels. */
+    int clip_left, clip_top, clip_right, clip_bottom; /* right and bottom exclusive. */
+} DeskCanvas;
+
+/* A canvas over pixels with a stride of width, clipped to all of it. */
+DeskCanvas desk_canvas(uint32_t *pixels, int width, int height);
+
+/* Clip to the rectangle, intersected with the whole canvas (not with the
+   previous clip). */
+void desk_canvas_clip(DeskCanvas *canvas, int left, int top, int right, int bottom);
+
+/* Blend a rectangle of color 0xAARRGGBB (not premultiplied) over the canvas.
+   Alpha 0xff replaces. */
+void desk_canvas_fill(DeskCanvas *canvas, int x, int y, int width, int height, uint32_t argb);
+
+#ifdef DESK_KEYBOARD
+/* Layer 1: needs xkbcommon, but not wayland-client. */
+#include <xkbcommon/xkbcommon.h>
+
+/* A keymap from wl_keyboard and the modifier state. */
+typedef struct {
+    struct xkb_context *context;
+    struct xkb_keymap *keymap; /* NULL until the first keymap event. */
+    struct xkb_state *state;
+} DeskKeyboard;
+
+enum {
+    DESK_MOD_SHIFT = 1 << 0,
+    DESK_MOD_CTRL = 1 << 1,
+    DESK_MOD_ALT = 1 << 2,
+    DESK_MOD_LOGO = 1 << 3,
+};
+
+/* Return 0 or ENOMEM. */
+int desk_keyboard_open(DeskKeyboard *keyboard);
+
+/* Take wl_keyboard.keymap. format must be WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 (1).
+   fd is always closed. On failure the previous keymap stays. Return 0 or
+   an errno value (EINVAL for another format or a keymap that won't compile). */
+int desk_keyboard_keymap(DeskKeyboard *keyboard, uint32_t format, int fd, uint32_t size);
+
+/* Take wl_keyboard.modifiers. */
+void desk_keyboard_modifiers(DeskKeyboard *keyboard, uint32_t depressed, uint32_t latched, uint32_t locked,
+                             uint32_t group);
+
+/* The keysym for an evdev key code from wl_keyboard.key (shifted by the
+   current modifiers, so Shift+g is G), or XKB_KEY_NoSymbol before a keymap. */
+xkb_keysym_t desk_keyboard_sym(const DeskKeyboard *keyboard, uint32_t key);
+
+/* The active DESK_MOD_* modifiers. */
+unsigned desk_keyboard_mods(const DeskKeyboard *keyboard);
+
+/* Whether the keymap says the key repeats. */
+bool desk_keyboard_repeats(const DeskKeyboard *keyboard, uint32_t key);
+
+void desk_keyboard_close(DeskKeyboard *keyboard);
+#endif
+
+#ifdef DESK_FONT
+/* Layer 2: needs freetype2 and fontconfig. */
+
+/* A fontconfig match with its fallback faces, at one pixel size, and a
+   cache of rendered glyphs. Characters the first face lacks come from the
+   next face that has them, so symbols (Nerd Font icons) and other scripts
+   work without the caller knowing which font holds them. */
+typedef struct DeskFont DeskFont;
+
+typedef struct {
+    int ascent, descent; /* Pixels above and below the baseline. */
+    int height;          /* Line height in pixels, at least ascent + descent. */
+} DeskFontMetrics;
+
+/* Match a fontconfig pattern such as "sans-serif" or "monospace:bold" at a
+   size in pixels. Return NULL with a message in error when nothing matches
+   or the first face won't load. */
+DeskFont *desk_font_open(const char *pattern, double pixel_size, char *error, size_t error_size);
+
+/* Change the size, such as when the window's scale changes. Clears the
+   glyph cache. Return 0 or an errno value. */
+int desk_font_resize(DeskFont *font, double pixel_size);
+
+double desk_font_size(const DeskFont *font);
+
+DeskFontMetrics desk_font_metrics(const DeskFont *font);
+
+/* The advance of length bytes of UTF-8 text, in pixels. */
+int desk_text_width(DeskFont *font, const char *text, size_t length);
+
+/* The width of one character. */
+int desk_char_width(DeskFont *font, uint32_t code);
+
+/* How many bytes from the start of text fit in max_width pixels, ending on a
+   character boundary. */
+size_t desk_text_fit(DeskFont *font, const char *text, size_t length, int max_width);
+
+/* Draw text with its baseline at y, starting at x, in color 0xAARRGGBB.
+   Return the x after the last character. */
+int desk_text_draw(DeskFont *font, DeskCanvas *canvas, int x, int y, const char *text, size_t length,
+                   uint32_t argb);
+
+void desk_font_close(DeskFont *font);
+#endif
+
 #ifdef DESK_WAYLAND
 /* Layer 1: needs wayland-client. */
 #include <wayland-client.h>
@@ -182,6 +299,108 @@ typedef struct {
 DeskBuffer *desk_buffer_get(DeskBufferPool *pool, struct wl_shm *shm, int width, int height, uint32_t format);
 
 void desk_buffer_pool_finish(DeskBufferPool *pool);
+
+#ifdef DESK_WINDOW
+/* A plain xdg-shell window. Needs the xdg-shell, viewporter and
+   fractional-scale-v1 client headers on the include path and their protocol
+   code linked, both generated by the application's build. */
+
+struct xdg_wm_base;
+struct xdg_surface;
+struct xdg_toplevel;
+struct wp_viewporter;
+struct wp_viewport;
+struct wp_fractional_scale_manager_v1;
+struct wp_fractional_scale_v1;
+
+/* The globals a window needs. The last two are optional. */
+typedef struct {
+    struct wl_compositor *compositor;
+    struct wl_shm *shm;
+    struct xdg_wm_base *wm_base; /* Pings are answered. */
+    struct wp_viewporter *viewporter;
+    struct wp_fractional_scale_manager_v1 *fractional_manager;
+} DeskGlobals;
+
+/* Call from wl_registry.global. Return true when the global was one of these
+   and is now bound. */
+bool desk_globals_bind(DeskGlobals *globals, struct wl_registry *registry, uint32_t name, const char *interface,
+                       uint32_t version);
+
+/* The interface name of the first required global that's missing, or NULL. */
+const char *desk_globals_missing(const DeskGlobals *globals);
+
+void desk_globals_finish(DeskGlobals *globals);
+
+typedef struct DeskWindow DeskWindow;
+
+typedef struct {
+    /* Draw a frame: get a buffer with desk_window_buffer, paint it and give
+       it to desk_window_commit. Called after configures, scale changes and
+       desk_window_redraw, at most once per frame. Returning without
+       committing (no free buffer) keeps the window dirty for later. */
+    void (*draw)(void *data, DeskWindow *window);
+    /* The compositor asked the window to close. */
+    void (*close)(void *data, DeskWindow *window);
+    /* Optional: the size to start at when the compositor leaves it to the
+       window, in logical pixels. 800×600 otherwise. */
+    void (*initial_size)(void *data, DeskWindow *window, int *width, int *height);
+} DeskWindowListener;
+
+struct DeskWindow {
+    struct wl_surface *surface;
+    struct xdg_surface *xdg_surface;
+    struct xdg_toplevel *toplevel;
+    struct wp_viewport *viewport;            /* NULL without wp_viewporter. */
+    struct wp_fractional_scale_v1 *fractional;
+    struct wl_callback *frame_callback;
+    struct wl_shm *shm;
+    DeskBufferPool buffers;
+    int width, height;                 /* Logical size in use. */
+    int pending_width, pending_height; /* From the latest toplevel configure. */
+    int bounds_width, bounds_height;   /* configure_bounds, 0 when unknown. */
+    uint32_t fraction;                 /* Preferred scale × 120, 0 when unknown. */
+    int buffer_scale;                  /* Preferred integer scale. */
+    bool configured, dirty, activated;
+    char *title;
+    const DeskWindowListener *listener;
+    void *data;
+};
+
+/* Create the toplevel and commit it unmapped; the first configure maps it.
+   Return false when memory runs out. */
+bool desk_window_open(DeskWindow *window, const DeskGlobals *globals, const char *app_id,
+                      const DeskWindowListener *listener, void *data);
+
+/* Set the title, sending it only when it changed. */
+void desk_window_set_title(DeskWindow *window, const char *title);
+
+/* Buffer pixels per logical pixel: the fractional scale through the
+   viewport, or the integer buffer scale. */
+double desk_window_scale(const DeskWindow *window);
+
+/* The window's size in buffer pixels, at least 1×1. */
+void desk_window_buffer_size(const DeskWindow *window, int *width, int *height);
+
+/* A free buffer of the window's buffer size, or NULL when both are busy. */
+DeskBuffer *desk_window_buffer(DeskWindow *window, uint32_t format);
+
+/* Attach the painted buffer, damage all of it, ask for a frame callback and
+   commit. Clears dirty. */
+void desk_window_commit(DeskWindow *window, DeskBuffer *buffer);
+
+/* Mark the window dirty and draw now if no frame is pending. */
+void desk_window_redraw(DeskWindow *window);
+
+/* Draw if dirty and nothing is in the way: call after dispatching, so a
+   draw skipped for lack of a free buffer happens once one is released. */
+void desk_window_update(DeskWindow *window);
+
+/* Configured, drawn and no frame pending: a good time for background work. */
+bool desk_window_idle(const DeskWindow *window);
+
+void desk_window_close(DeskWindow *window);
+#endif
 #endif
 
 #ifdef DESK_IMAGE
