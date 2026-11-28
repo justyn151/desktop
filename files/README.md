@@ -56,12 +56,22 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Ctrl+Tab, Ctrl+Shift+Tab (or Ctrl+Page Down, Page Up) | Next, previous tab |
 | Alt+1 … Alt+8, Alt+9 | That tab, the last tab |
 | Ctrl+F | Search |
+| Ctrl+L | Type a path (see below) |
 | Escape | Clear the search |
 | Ctrl+1, Ctrl+2 | List, icons |
 | Ctrl+plus, Ctrl+minus, Ctrl+0 | Zoom in, out (switching view at either end), back to normal |
 | Ctrl+Q | Quit |
 
-While the search field has the focus, typing goes into it: Left, Right, Home and End move, Backspace and Delete delete (a word with Ctrl), Escape clears it, and Enter, Tab or Down give the focus back to the list with the search kept. Ctrl shortcuts still work.
+While the search field has the focus, typing goes into it: Left, Right, Home and End move (a word at a time with Ctrl, selecting with Shift), Backspace and Delete delete (a word with Ctrl), Ctrl+A selects it all, Ctrl+C, Ctrl+X and Ctrl+V copy, cut and paste, Escape clears it, and Enter, Tab or Down give the focus back to the list with the search kept. Other Ctrl shortcuts still work.
+
+### Typing a path
+
+Ctrl+L, or a click on the empty part of the path, turns the path into a field holding the full path, all selected so typing replaces it. It edits like the search field. As you type, the folders in the directory you're typing in that start with what follows the last `/` (ignoring case; hidden ones only once you type a `.`) drop down below it, up to ten.
+
+- **Tab** completes: the chosen suggestion, or the only one, or as much as they all share; on a whole folder name it adds the `/`.
+- **Up and Down** choose a suggestion; a click on one goes there.
+- **Enter** goes to what's typed. `~` is home, and a path not starting with `/` is taken from the current directory; `.` and `..` work. A file opens its folder with the file selected. A path that doesn't exist says so and leaves the field open.
+- **Escape**, or a click anywhere else, gives the path pieces back.
 
 Type to select works like other explorers: typing letters within a second of each other jumps to the first name starting with them, ignoring case; typing the same letter again moves on to the next name starting with it. After a second without typing it starts over.
 
@@ -103,7 +113,8 @@ It's a popup the compositor places, so it flips or slides to stay on screen; a c
 | Back, forward, up buttons | As Alt+Left, Alt+Right, Alt+Up; a button is dimmed when there's nowhere to go |
 | A piece of the path | Goes to that directory, with the one you came through selected |
 | A place in the sidebar | Goes there |
-| The search field | Focuses it, with the cursor where you clicked; its × clears it |
+| The empty part of the path | Type a path, as Ctrl+L |
+| The search field | Focuses it, with the cursor where you clicked; drag to select, double-click to select it all; its × clears it |
 | The list and icon buttons (right end) | Switch the view |
 | An entry | Selects it; double-click opens it (goes into a directory, or opens a file) |
 | Right-click | The menu for an entry, a place, or the empty part of the list (see below) |
@@ -213,4 +224,6 @@ files will only change things inside your home directory: that's the rule every 
 - [ ] Narrowing the window narrows the columns instead of hiding them.
 - [ ] Tabs open, close and switch by clicking, middle-click and keys, each keeping its place.
 - [ ] Typing in the search field filters as you type; its × clears it.
+- [ ] Shift+arrows and dragging select in the search field; Ctrl+C and Ctrl+V copy and paste, including from another app.
+- [ ] Ctrl+L or a click on the empty part of the path gives a field; suggestions follow typing; Tab completes; Enter goes there; Escape or a click elsewhere puts the pieces back.
 - [ ] Ctrl+wheel zooms the list and the icons, crossing from one to the other at the ends, and the zoom comes back after a restart.

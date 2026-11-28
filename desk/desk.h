@@ -167,6 +167,41 @@ void desk_repeat_close(DeskRepeat *repeat);
    string can be shown. */
 uint32_t desk_utf8_next(const char **text, const char *end);
 
+/* One line of editable text: UTF-8, a cursor and a selection, the editing
+   behind text fields. Drawing is the application's. */
+typedef struct {
+    char *text;             /* Always NUL-terminated; "" when empty. */
+    size_t length, capacity;
+    size_t cursor;          /* Byte offset, on a character boundary. */
+    size_t anchor;          /* The selection's other end; == cursor when nothing is selected. */
+} DeskText;
+
+/* Replace the text, cursor at the end, nothing selected. Return false when
+   memory runs out. */
+bool desk_text_set(DeskText *text, const char *value);
+void desk_text_free(DeskText *text);
+
+/* The selection as [start, end); false when there is none. */
+bool desk_text_selection(const DeskText *text, size_t *start, size_t *end);
+void desk_text_select_all(DeskText *text);
+
+/* Insert at the cursor, replacing the selection. Return false when memory
+   runs out. */
+bool desk_text_insert(DeskText *text, const char *insert, size_t length);
+
+/* Delete the selection, or else a character (or with word a word) before
+   the cursor (direction < 0) or after it (> 0). Return whether anything
+   was deleted. */
+bool desk_text_delete(DeskText *text, int direction, bool word);
+
+/* Move by a character, or a word, left (< 0) or right (> 0); extend keeps
+   the anchor, selecting. Without extend, a selection collapses to its
+   side. */
+void desk_text_move(DeskText *text, int direction, bool word, bool extend);
+
+/* Move to a byte offset (clamped to the text, snapped to a character). */
+void desk_text_move_to(DeskText *text, size_t offset, bool extend);
+
 /* Canvas */
 
 /* A 32-bit premultiplied ARGB buffer and a clip rectangle, which every
@@ -233,6 +268,15 @@ unsigned desk_keyboard_mods(const DeskKeyboard *keyboard);
 bool desk_keyboard_repeats(const DeskKeyboard *keyboard, uint32_t key);
 
 void desk_keyboard_close(DeskKeyboard *keyboard);
+
+/* What desk_text_key did. */
+enum { DESK_TEXT_IGNORED, DESK_TEXT_MOVED, DESK_TEXT_CHANGED };
+
+/* The usual editing keys for a text field: Left and Right (by word with
+   Ctrl, selecting with Shift), Home and End, Backspace and Delete (a word
+   with Ctrl), Ctrl+A to select all, and typing (utf8, the key's text, may
+   be NULL). Clipboard keys, Enter, Escape and Tab are left to the caller. */
+int desk_text_key(DeskText *text, uint32_t sym, unsigned mods, const char *utf8);
 #endif
 
 #ifdef DESK_FONT

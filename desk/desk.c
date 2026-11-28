@@ -567,6 +567,146 @@ uint32_t desk_utf8_next(const char **text, const char *end)
     return code;
 }
 
+/* Text */
+
+bool desk_text_set(DeskText *text, const char *value)
+{
+    size_t length = strlen(value);
+    if (length + 1 > text->capacity) {
+        char *grown = realloc(text->text, length + 1);
+        if (!grown)
+            return false;
+        text->text = grown;
+        text->capacity = length + 1;
+    }
+    memcpy(text->text, value, length + 1);
+    text->length = length;
+    text->cursor = text->anchor = length;
+    return true;
+}
+
+void desk_text_free(DeskText *text)
+{
+    free(text->text);
+    *text = (DeskText){0};
+}
+
+bool desk_text_selection(const DeskText *text, size_t *start, size_t *end)
+{
+    *start = text->cursor < text->anchor ? text->cursor : text->anchor;
+    *end = text->cursor < text->anchor ? text->anchor : text->cursor;
+    return *start != *end;
+}
+
+void desk_text_select_all(DeskText *text)
+{
+    text->anchor = 0;
+    text->cursor = text->length;
+}
+
+static bool text_continuation(const DeskText *text, size_t at)
+{
+    return at < text->length && ((unsigned char)text->text[at] & 0xc0) == 0x80;
+}
+
+static size_t text_step(const DeskText *text, size_t at, int direction, bool word)
+{
+    const char *s = text->text;
+    if (direction < 0) {
+        if (word) {
+            while (at > 0 && !isalnum((unsigned char)s[at - 1]) && (unsigned char)s[at - 1] < 0x80)
+                --at;
+            while (at > 0 && (isalnum((unsigned char)s[at - 1]) || (unsigned char)s[at - 1] >= 0x80))
+                --at;
+            return at;
+        }
+        while (at > 0 && text_continuation(text, --at))
+            ;
+        return at;
+    }
+    if (word) {
+        while (at < text->length && !isalnum((unsigned char)s[at]) && (unsigned char)s[at] < 0x80)
+            ++at;
+        while (at < text->length && (isalnum((unsigned char)s[at]) || (unsigned char)s[at] >= 0x80))
+            ++at;
+        return at;
+    }
+    if (at < text->length)
+        ++at;
+    while (text_continuation(text, at))
+        ++at;
+    return at;
+}
+
+static void text_remove(DeskText *text, size_t start, size_t end)
+{
+    memmove(text->text + start, text->text + end, text->length - end + 1);
+    text->length -= end - start;
+    text->cursor = text->anchor = start;
+}
+
+bool desk_text_insert(DeskText *text, const char *insert, size_t length)
+{
+    if (!text->text && !desk_text_set(text, ""))
+        return false;
+    size_t start, end;
+    if (desk_text_selection(text, &start, &end))
+        text_remove(text, start, end);
+    if (text->length + length + 1 > text->capacity) {
+        size_t capacity = (text->length + length + 1) * 2;
+        char *grown = realloc(text->text, capacity);
+        if (!grown)
+            return false;
+        text->text = grown;
+        text->capacity = capacity;
+    }
+    char *at = text->text + text->cursor;
+    memmove(at + length, at, text->length - text->cursor + 1);
+    memcpy(at, insert, length);
+    text->length += length;
+    text->cursor = text->anchor = text->cursor + length;
+    return true;
+}
+
+bool desk_text_delete(DeskText *text, int direction, bool word)
+{
+    if (!text->text)
+        return false;
+    size_t start, end;
+    if (!desk_text_selection(text, &start, &end)) {
+        size_t other = text_step(text, text->cursor, direction, word);
+        start = other < text->cursor ? other : text->cursor;
+        end = other < text->cursor ? text->cursor : other;
+    }
+    if (start == end)
+        return false;
+    text_remove(text, start, end);
+    return true;
+}
+
+void desk_text_move(DeskText *text, int direction, bool word, bool extend)
+{
+    size_t start, end;
+    if (!extend && desk_text_selection(text, &start, &end)) {
+        text->cursor = text->anchor = direction < 0 ? start : end;
+        return;
+    }
+    text->cursor = text_step(text, text->cursor, direction, word);
+    if (!extend)
+        text->anchor = text->cursor;
+}
+
+void desk_text_move_to(DeskText *text, size_t offset, bool extend)
+{
+    if (offset > text->length)
+        offset = text->length;
+    while (text_continuation(text, offset))
+        --offset;
+    text->cursor = offset;
+    if (!extend)
+        text->anchor = offset;
+}
+
 /* Canvas */
 
 DeskCanvas desk_canvas(uint32_t *pixels, int width, int height)
@@ -724,6 +864,45 @@ void desk_keyboard_close(DeskKeyboard *keyboard)
     xkb_keymap_unref(keyboard->keymap);
     xkb_context_unref(keyboard->context);
     *keyboard = (DeskKeyboard){0};
+}
+
+int desk_text_key(DeskText *text, uint32_t sym, unsigned mods, const char *utf8)
+{
+    bool word = mods & DESK_MOD_CTRL, extend = mods & DESK_MOD_SHIFT;
+    switch (sym) {
+    case XKB_KEY_Left:
+    case XKB_KEY_KP_Left:
+        desk_text_move(text, -1, word, extend);
+        return DESK_TEXT_MOVED;
+    case XKB_KEY_Right:
+    case XKB_KEY_KP_Right:
+        desk_text_move(text, 1, word, extend);
+        return DESK_TEXT_MOVED;
+    case XKB_KEY_Home:
+    case XKB_KEY_KP_Home:
+        desk_text_move_to(text, 0, extend);
+        return DESK_TEXT_MOVED;
+    case XKB_KEY_End:
+    case XKB_KEY_KP_End:
+        desk_text_move_to(text, text->length, extend);
+        return DESK_TEXT_MOVED;
+    case XKB_KEY_BackSpace:
+        return desk_text_delete(text, -1, word) ? DESK_TEXT_CHANGED : DESK_TEXT_MOVED;
+    case XKB_KEY_Delete:
+    case XKB_KEY_KP_Delete:
+        return desk_text_delete(text, 1, word) ? DESK_TEXT_CHANGED : DESK_TEXT_MOVED;
+    default:
+        break;
+    }
+    if ((mods & DESK_MOD_CTRL) && (sym == XKB_KEY_a || sym == XKB_KEY_A)) {
+        desk_text_select_all(text);
+        return DESK_TEXT_MOVED;
+    }
+    if (mods & (DESK_MOD_CTRL | DESK_MOD_ALT | DESK_MOD_LOGO))
+        return DESK_TEXT_IGNORED;
+    if (!utf8 || !utf8[0] || (unsigned char)utf8[0] < 0x20 || utf8[0] == 0x7f)
+        return DESK_TEXT_IGNORED;
+    return desk_text_insert(text, utf8, strlen(utf8)) ? DESK_TEXT_CHANGED : DESK_TEXT_IGNORED;
 }
 #endif
 

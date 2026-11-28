@@ -1117,6 +1117,10 @@ static void sizer_start(struct files *files)
 
 /* Navigation */
 
+static const char *field_text(const struct field *field);
+static void stop_path_edit(struct files *files);
+static int pointer_buffer_x(const struct files *files);
+
 static void update_title(struct files *files)
 {
     char title[PATH_MAX + 2];
@@ -1126,7 +1130,7 @@ static void update_title(struct files *files)
 
 static void filter(struct files *files)
 {
-    listing_filter(&files->listing, files->show_hidden, files->search);
+    listing_filter(&files->listing, files->show_hidden, field_text(&files->search));
 }
 
 /* Replace the listing with path's, keeping the cursor on keep (a name) when
@@ -1168,9 +1172,10 @@ static void enter(struct files *files, char *path, const char *select)
     files->top = 0;
     files->free_scroll = false;
     files->press.kind = TARGET_NONE; /* A click there and one here aren't a double-click. */
-    files->search[0] = 0;
-    files->search_cursor = 0;
+    desk_text_set(&files->search.text, "");
     files->search_focus = false;
+    if (files->path_editing)
+        stop_path_edit(files);
     files->typed[0] = 0;
     files->notice[0] = 0;
     struct memory *memory = find_memory(files, path);
@@ -1667,7 +1672,7 @@ static void tab_store(struct files *files)
     struct entry *entry = cursor_entry(files);
     tab->path = strdup(files->path);
     tab->selected = entry ? strdup(entry->name) : NULL;
-    tab->search = files->search[0] ? strdup(files->search) : NULL;
+    tab->search = field_text(&files->search)[0] ? strdup(field_text(&files->search)) : NULL;
     tab->top = files->top;
     tab->back = files->back;
     tab->forward = files->forward;
@@ -1690,8 +1695,7 @@ static void tab_load(struct files *files, size_t index)
         enter(files, path, tab->selected);
     files->top = tab->top;
     if (tab->search) {
-        snprintf(files->search, sizeof files->search, "%s", tab->search);
-        files->search_cursor = strlen(files->search);
+        desk_text_set(&files->search.text, tab->search);
         refilter(files);
         select_name(files, tab->selected);
     }
@@ -1778,6 +1782,11 @@ static void search_focus(struct files *files, bool focus)
     }
 }
 
+static const char *field_text(const struct field *field)
+{
+    return field->text.text ? field->text.text : "";
+}
+
 static void search_changed(struct files *files)
 {
     refilter(files);
@@ -1786,86 +1795,115 @@ static void search_changed(struct files *files)
 
 static void search_clear(struct files *files)
 {
-    if (files->search[0]) {
-        files->search[0] = 0;
-        files->search_cursor = 0;
+    if (field_text(&files->search)[0]) {
+        desk_text_set(&files->search.text, "");
         search_changed(files);
     }
 }
 
-/* The start of the character before at, or of the word before it. */
-static size_t back_char(const char *text, size_t at)
-{
-    while (at > 0 && ((unsigned char)text[--at] & 0xc0) == 0x80)
-        ;
-    return at;
-}
+static void copy_text(struct files *files, const char *text);
+static char *paste_text(struct files *files);
 
-static size_t forward_char(const char *text, size_t at)
+/* Keys a focused field handles itself: editing, and the clipboard. Return
+   -1 when the key isn't the field's, else whether it repeats; *changed
+   says whether the text changed. */
+static int field_key(struct files *files, struct field *field, uint32_t key, xkb_keysym_t sym, unsigned mods,
+                     bool *changed)
 {
-    size_t length = strlen(text);
-    if (at < length)
-        ++at;
-    while (at < length && ((unsigned char)text[at] & 0xc0) == 0x80)
-        ++at;
-    return at;
-}
-
-static size_t back_word(const char *text, size_t at)
-{
-    while (at > 0 && text[at - 1] == ' ')
-        --at;
-    while (at > 0 && text[at - 1] != ' ')
-        --at;
-    return at;
-}
-
-static size_t forward_word(const char *text, size_t at)
-{
-    size_t length = strlen(text);
-    while (at < length && text[at] == ' ')
-        ++at;
-    while (at < length && text[at] != ' ')
-        ++at;
-    return at;
-}
-
-static void search_delete(struct files *files, size_t from, size_t to)
-{
-    if (from >= to)
-        return;
-    memmove(files->search + from, files->search + to, strlen(files->search + to) + 1);
-    files->search_cursor = from;
-    search_changed(files);
-}
-
-static void search_insert(struct files *files, const char *text, size_t length)
-{
-    size_t used = strlen(files->search);
-    if (used + length >= sizeof files->search)
-        return;
-    char *at = files->search + files->search_cursor;
-    memmove(at + length, at, used - files->search_cursor + 1);
-    memcpy(at, text, length);
-    files->search_cursor += length;
-    search_changed(files);
-}
-
-static void search_move(struct files *files, size_t to)
-{
-    if (to != files->search_cursor) {
-        files->search_cursor = to;
-        desk_window_redraw(&files->window);
+    DeskText *text = &field->text;
+    *changed = false;
+    if (!text->text && !desk_text_set(text, ""))
+        return -1;
+    size_t start, end;
+    bool selected = desk_text_selection(text, &start, &end);
+    if ((mods & DESK_MOD_CTRL) && !(mods & DESK_MOD_ALT)) {
+        if ((sym == XKB_KEY_c || sym == XKB_KEY_x) && selected) {
+            char *copy = strndup(text->text + start, end - start);
+            if (copy)
+                copy_text(files, copy);
+            free(copy);
+            if (sym == XKB_KEY_x)
+                *changed = desk_text_delete(text, 1, false);
+            desk_window_redraw(&files->window);
+            return 0;
+        }
+        if (sym == XKB_KEY_v) {
+            char *pasted = paste_text(files);
+            if (pasted) {
+                /* One line: line breaks become spaces, a trailing one goes. */
+                size_t length = strlen(pasted);
+                while (length && (pasted[length - 1] == '\n' || pasted[length - 1] == '\r'))
+                    pasted[--length] = 0;
+                for (char *at = pasted; *at; ++at) {
+                    if (*at == '\n' || *at == '\r' || *at == '\t')
+                        *at = ' ';
+                }
+                *changed = desk_text_insert(text, pasted, length);
+                free(pasted);
+            }
+            desk_window_redraw(&files->window);
+            return 0;
+        }
     }
+    char typed[16] = "";
+    if (files->keyboard.state) {
+        int length = xkb_state_key_get_utf8(files->keyboard.state, key + 8, typed, sizeof typed);
+        if (length <= 0)
+            typed[0] = 0;
+    }
+    int result = desk_text_key(text, sym, mods, typed);
+    if (result == DESK_TEXT_IGNORED)
+        return -1;
+    *changed = result == DESK_TEXT_CHANGED;
+    desk_window_redraw(&files->window);
+    return sym != XKB_KEY_Home && sym != XKB_KEY_End;
+}
+
+/* The byte offset in the field nearest buffer x. */
+static size_t field_offset_at(struct files *files, const struct field *field, int x)
+{
+    const char *text = field_text(field);
+    size_t length = strlen(text), at = 0;
+    x -= field->text_x;
+    while (at < length) {
+        size_t next = at + 1;
+        while (next < length && ((unsigned char)text[next] & 0xc0) == 0x80)
+            ++next;
+        int left = desk_text_width(files->font, text, at), right = desk_text_width(files->font, text, next);
+        if (x < (left + right) / 2)
+            break;
+        at = next;
+    }
+    return at;
+}
+
+/* A press in the field: the cursor goes there (extending the selection with
+   Shift), a drag selects, a double-click selects it all. */
+static void field_press(struct files *files, struct field *field, bool twice)
+{
+    if (!field->text.text && !desk_text_set(&field->text, ""))
+        return;
+    if (twice) {
+        desk_text_select_all(&field->text);
+    } else {
+        bool extend = desk_keyboard_mods(&files->keyboard) & DESK_MOD_SHIFT;
+        desk_text_move_to(&field->text, field_offset_at(files, field, pointer_buffer_x(files)), extend);
+        files->selecting = field;
+    }
+    desk_window_redraw(&files->window);
+}
+
+static void field_drag(struct files *files)
+{
+    struct field *field = files->selecting;
+    desk_text_move_to(&field->text, field_offset_at(files, field, pointer_buffer_x(files)), true);
+    desk_window_redraw(&files->window);
 }
 
 /* A key while the search field has the focus. Returns whether it repeats,
    or -1 when it isn't the field's, so the window handles it. */
 static int search_key(struct files *files, uint32_t key, xkb_keysym_t sym, unsigned mods)
 {
-    const char *text = files->search;
-    size_t at = files->search_cursor;
-    bool word = mods & DESK_MOD_CTRL;
     switch (sym) {
     case XKB_KEY_Escape:
         search_clear(files);
@@ -1877,36 +1915,286 @@ static int search_key(struct files *files, uint32_t key, xkb_keysym_t sym, unsig
     case XKB_KEY_Down:
         search_focus(files, false);
         return 0;
-    case XKB_KEY_BackSpace:
-        search_delete(files, word ? back_word(text, at) : back_char(text, at), at);
-        return 1;
-    case XKB_KEY_Delete:
-        search_delete(files, at, word ? forward_word(text, at) : forward_char(text, at));
-        return 1;
-    case XKB_KEY_Left:
-        search_move(files, word ? back_word(text, at) : back_char(text, at));
-        return 1;
-    case XKB_KEY_Right:
-        search_move(files, word ? forward_word(text, at) : forward_char(text, at));
-        return 1;
-    case XKB_KEY_Home:
-        search_move(files, 0);
-        return 0;
-    case XKB_KEY_End:
-        search_move(files, strlen(text));
-        return 0;
     default:
         break;
     }
-    if (mods & (DESK_MOD_CTRL | DESK_MOD_ALT | DESK_MOD_LOGO))
-        return -1;
-    char typed[16];
-    int length = files->keyboard.state ? xkb_state_key_get_utf8(files->keyboard.state, key + 8, typed, sizeof typed)
-                                       : 0;
-    if (length <= 0 || (unsigned char)typed[0] < 0x20 || typed[0] == 0x7f)
-        return -1;
-    search_insert(files, typed, (size_t)length);
-    return 1;
+    bool changed;
+    int repeats = field_key(files, &files->search, key, sym, mods, &changed);
+    if (changed)
+        search_changed(files);
+    return repeats;
+}
+
+/* Typing a path */
+
+static void free_suggestions(struct files *files)
+{
+    for (size_t i = 0; i < files->suggestion_count; ++i)
+        free(files->suggestions[i]);
+    free(files->suggestions);
+    files->suggestions = NULL;
+    files->suggestion_count = 0;
+    files->suggestion = -1;
+}
+
+/* What's typed as an absolute path: ~ expanded, a relative path taken from
+   the current directory. */
+static char *typed_path(const struct files *files, const char *typed)
+{
+    char *path = NULL;
+    if (typed[0] == '~' && (typed[1] == '/' || !typed[1]) && files->home) {
+        if (asprintf(&path, "%s%s", files->home, typed + 1) < 0)
+            return NULL;
+    } else if (typed[0] == '/') {
+        path = strdup(typed);
+    } else if (asprintf(&path, "%s/%s", strcmp(files->path, "/") == 0 ? "" : files->path, typed) < 0) {
+        return NULL;
+    }
+    return path;
+}
+
+/* Clean up a path by its text alone: no //, ., .. or trailing /. Links
+   stay as named, as everywhere else in files. */
+static char *normalize_path(const char *path)
+{
+    size_t length = strlen(path);
+    char *out = malloc(length + 2);
+    if (!out)
+        return NULL;
+    size_t used = 0;
+    for (const char *at = path; *at;) {
+        while (*at == '/')
+            ++at;
+        size_t part = strcspn(at, "/");
+        if (!part)
+            break;
+        if (part == 1 && at[0] == '.') {
+            /* Nothing. */
+        } else if (part == 2 && at[0] == '.' && at[1] == '.') {
+            while (used > 0 && out[used - 1] != '/')
+                --used;
+            if (used > 0)
+                --used;
+        } else {
+            out[used++] = '/';
+            memcpy(out + used, at, part);
+            used += part;
+        }
+        at += part;
+    }
+    if (!used)
+        out[used++] = '/';
+    out[used] = 0;
+    return out;
+}
+
+static int compare_names(const void *a, const void *b)
+{
+    return natural_compare(*(char *const *)a, *(char *const *)b);
+}
+
+/* The directories in what's typed so far whose names start with its last
+   part, ignoring case; dot directories only when that starts with a dot. */
+static void update_suggestions(struct files *files)
+{
+    free_suggestions(files);
+    const char *typed = field_text(&files->path_field);
+    const char *slash = strrchr(typed, '/');
+    char *directory_text = slash ? strndup(typed, (size_t)(slash - typed) + 1) : strdup("");
+    const char *prefix = slash ? slash + 1 : typed;
+    if (!directory_text)
+        return;
+    if (!slash && typed[0] == '~') {
+        free(directory_text);
+        return; /* "~" alone: completes once it's "~/". */
+    }
+    char *directory = typed_path(files, directory_text[0] ? directory_text : ".");
+    free(directory_text);
+    DIR *dir = directory ? opendir(directory) : NULL;
+    size_t capacity = 0, prefix_length = strlen(prefix);
+    struct dirent *item;
+    while (dir && (item = readdir(dir))) {
+        const char *name = item->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || (name[0] == '.' && prefix[0] != '.') ||
+            strncasecmp(name, prefix, prefix_length) != 0)
+            continue;
+        bool is_dir = item->d_type == DT_DIR;
+        if (item->d_type == DT_LNK || item->d_type == DT_UNKNOWN) {
+            struct stat info;
+            is_dir = fstatat(dirfd(dir), name, &info, 0) == 0 && S_ISDIR(info.st_mode);
+        }
+        if (!is_dir)
+            continue;
+        if (files->suggestion_count == capacity) {
+            size_t grown = capacity ? capacity * 2 : 16;
+            char **list = realloc(files->suggestions, grown * sizeof *list);
+            if (!list)
+                break;
+            files->suggestions = list;
+            capacity = grown;
+        }
+        if (!(files->suggestions[files->suggestion_count] = strdup(name)))
+            break;
+        ++files->suggestion_count;
+    }
+    if (dir)
+        closedir(dir);
+    free(directory);
+    if (files->suggestion_count)
+        qsort(files->suggestions, files->suggestion_count, sizeof *files->suggestions, compare_names);
+    /* Exactly what's typed already: nothing to suggest. */
+    if (files->suggestion_count == 1 && strcmp(files->suggestions[0], prefix) == 0)
+        free_suggestions(files);
+}
+
+static void start_path_edit(struct files *files)
+{
+    search_focus(files, false);
+    if (!desk_text_set(&files->path_field.text, files->path))
+        return;
+    desk_text_select_all(&files->path_field.text);
+    files->path_field.scroll = 0;
+    files->path_editing = true;
+    update_suggestions(files);
+    free_suggestions(files); /* Not until something's typed. */
+    desk_window_redraw(&files->window);
+}
+
+static void stop_path_edit(struct files *files)
+{
+    if (!files->path_editing)
+        return;
+    files->path_editing = false;
+    if (files->selecting == &files->path_field)
+        files->selecting = NULL;
+    free_suggestions(files);
+    desk_window_redraw(&files->window);
+}
+
+/* Replace the last part of what's typed with a suggestion and a /. */
+static void use_suggestion(struct files *files, const char *name)
+{
+    const char *typed = field_text(&files->path_field);
+    const char *slash = strrchr(typed, '/');
+    char *completed = NULL;
+    if (asprintf(&completed, "%.*s%s/", slash ? (int)(slash - typed) + 1 : 0, typed, name) < 0)
+        return;
+    desk_text_set(&files->path_field.text, completed);
+    free(completed);
+    update_suggestions(files);
+    desk_window_redraw(&files->window);
+}
+
+/* Tab: the chosen or only suggestion, else as much as they all share. */
+static void complete_path(struct files *files)
+{
+    if (files->suggestion >= 0) {
+        use_suggestion(files, files->suggestions[files->suggestion]);
+        return;
+    }
+    if (!files->suggestion_count) {
+        /* A whole directory name: on into it. */
+        const char *typed = field_text(&files->path_field);
+        size_t length = strlen(typed);
+        char *path = length && typed[length - 1] != '/' ? typed_path(files, typed) : NULL;
+        struct stat info;
+        if (path && stat(path, &info) == 0 && S_ISDIR(info.st_mode)) {
+            desk_text_move_to(&files->path_field.text, length, false);
+            desk_text_insert(&files->path_field.text, "/", 1);
+            update_suggestions(files);
+            desk_window_redraw(&files->window);
+        }
+        free(path);
+        return;
+    }
+    if (files->suggestion_count == 1) {
+        use_suggestion(files, files->suggestions[0]);
+        return;
+    }
+    const char *first = files->suggestions[0];
+    size_t shared = strlen(first);
+    for (size_t i = 1; i < files->suggestion_count; ++i) {
+        size_t same = 0;
+        while (same < shared && files->suggestions[i][same] == first[same])
+            ++same;
+        shared = same;
+    }
+    const char *typed = field_text(&files->path_field);
+    const char *slash = strrchr(typed, '/');
+    const char *prefix = slash ? slash + 1 : typed;
+    if (shared <= strlen(prefix))
+        return;
+    char *completed = NULL;
+    if (asprintf(&completed, "%.*s%.*s", slash ? (int)(slash - typed) + 1 : 0, typed, (int)shared, first) < 0)
+        return;
+    desk_text_set(&files->path_field.text, completed);
+    free(completed);
+    update_suggestions(files);
+    desk_window_redraw(&files->window);
+}
+
+/* Enter: go to what's typed. A file opens its directory with it selected;
+   somewhere that doesn't exist says so and keeps the field. */
+static void go_to_typed(struct files *files)
+{
+    char *full = typed_path(files, field_text(&files->path_field));
+    char *path = full ? normalize_path(full) : NULL;
+    free(full);
+    if (!path)
+        return;
+    struct stat info;
+    if (stat(path, &info) != 0) {
+        notify(files, "%s: %s", path, strerror(errno));
+        free(path);
+        return;
+    }
+    stop_path_edit(files);
+    if (S_ISDIR(info.st_mode)) {
+        go_to(files, path, NULL);
+        return;
+    }
+    char *parent = parent_path(path);
+    if (parent)
+        go_to(files, parent, base_name(path));
+    free(path);
+}
+
+static int path_key(struct files *files, uint32_t key, xkb_keysym_t sym, unsigned mods)
+{
+    switch (sym) {
+    case XKB_KEY_Escape:
+        stop_path_edit(files);
+        return 0;
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+        if (files->suggestion >= 0)
+            use_suggestion(files, files->suggestions[files->suggestion]);
+        go_to_typed(files);
+        return 0;
+    case XKB_KEY_Tab:
+        complete_path(files);
+        return 0;
+    case XKB_KEY_Down:
+    case XKB_KEY_Up:
+        if (files->suggestion_count) {
+            int count = (int)(files->suggestion_count < SUGGESTIONS_SHOWN ? files->suggestion_count
+                                                                          : SUGGESTIONS_SHOWN);
+            int step = sym == XKB_KEY_Down ? 1 : -1;
+            files->suggestion = files->suggestion < 0 ? (step > 0 ? 0 : count - 1)
+                                                      : (files->suggestion + step + count) % count;
+            desk_window_redraw(&files->window);
+        }
+        return 1;
+    default:
+        break;
+    }
+    bool changed;
+    int repeats = field_key(files, &files->path_field, key, sym, mods, &changed);
+    if (changed) {
+        update_suggestions(files);
+        desk_window_redraw(&files->window);
+    }
+    return repeats;
 }
 
 /* Keys */
@@ -1930,7 +2218,8 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         case XKB_KEY_Page_Down: next_tab(files, 1); return false;
         case XKB_KEY_ISO_Left_Tab:
         case XKB_KEY_Page_Up: next_tab(files, -1); return false;
-        case XKB_KEY_f: search_focus(files, true); return false;
+        case XKB_KEY_f: stop_path_edit(files); search_focus(files, true); return false;
+        case XKB_KEY_l: start_path_edit(files); return false;
         case XKB_KEY_1: set_view(files, VIEW_LIST); return false;
         case XKB_KEY_2: set_view(files, VIEW_ICONS); return false;
         case XKB_KEY_plus:
@@ -2073,7 +2362,11 @@ static bool handle_key(struct files *files, uint32_t key)
         context_key(files);
         return false;
     }
-    if (files->search_focus) {
+    if (files->path_editing) {
+        int repeats = path_key(files, key, sym, mods);
+        if (repeats >= 0)
+            return repeats;
+    } else if (files->search_focus) {
         int repeats = search_key(files, key, sym, mods);
         if (repeats >= 0)
             return repeats;
@@ -2533,7 +2826,7 @@ static const char *empty_message(const struct files *files, uint32_t *color)
         return strerror(listing->error);
     if (listing->shown_count)
         return NULL;
-    if (files->search[0])
+    if (field_text(&files->search)[0])
         return "No matches";
     return listing->count ? "Only hidden files (. shows them)" : "Empty";
 }
@@ -2765,6 +3058,51 @@ static void draw_magnifier(DeskCanvas *canvas, int x, int y, int size, uint32_t 
     }
 }
 
+/* A field's text between left and right: the selection behind it and the
+   cursor when focused, scrolled to keep the cursor in view; placeholder in
+   muted text when it's empty and not focused. */
+static void draw_field(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct field *field,
+                       int left, int right, int top, bool focused, const char *placeholder)
+{
+    const struct colors *colors = &files->colors;
+    int height = layout->row_height, baseline = top + layout->baseline, space = layout->padding / 2;
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    const char *text = field_text(field);
+    field->left = left;
+    field->right = right;
+    DeskCanvas clipped = *canvas;
+    desk_canvas_clip(&clipped, left, top, right, top + height);
+    if (!text[0] && !focused) {
+        field->scroll = 0;
+        field->text_x = left;
+        if (placeholder)
+            desk_text_draw(layout->font, &clipped, left, baseline, placeholder, strlen(placeholder), colors->muted);
+        return;
+    }
+    int room = right - left - line;
+    int cursor_x = desk_text_width(layout->font, text, field->text.cursor);
+    if (cursor_x - field->scroll > room)
+        field->scroll = cursor_x - room;
+    if (cursor_x < field->scroll)
+        field->scroll = cursor_x;
+    int total = desk_text_width(layout->font, text, strlen(text));
+    if (field->scroll > total - room)
+        field->scroll = total - room; /* No empty space after the end while it fits. */
+    if (field->scroll < 0)
+        field->scroll = 0;
+    field->text_x = left - field->scroll;
+    size_t start, end;
+    if (focused && desk_text_selection(&field->text, &start, &end)) {
+        int from = desk_text_width(layout->font, text, start), to = desk_text_width(layout->font, text, end);
+        desk_canvas_fill(&clipped, field->text_x + from, top + space / 2, to - from, height - space,
+                         colors->selection_background);
+    }
+    desk_text_draw(layout->font, &clipped, field->text_x, baseline, text, strlen(text), colors->foreground);
+    if (focused)
+        desk_canvas_fill(&clipped, field->text_x + cursor_x, top + space / 2, line, height - space,
+                         colors->foreground);
+}
+
 /* The search field: magnifier, text or "Search", the cursor when focused,
    and a × that clears it. */
 static void paint_search(struct files *files, DeskCanvas *canvas, const struct layout *layout, int top)
@@ -2781,7 +3119,7 @@ static void paint_search(struct files *files, DeskCanvas *canvas, const struct l
 
     int text_left = left + height, text_right = right - space;
     bar->search_clear_left = -1;
-    if (files->search[0]) {
+    if (field_text(&files->search)[0]) {
         bar->search_clear_left = right - height;
         text_right = bar->search_clear_left;
         if (hovering(files, TARGET_SEARCH_CLEAR, 0))
@@ -2789,29 +3127,7 @@ static void paint_search(struct files *files, DeskCanvas *canvas, const struct l
                              height - space, mix(colors->background, colors->muted, 80));
         draw_icon(layout->font, canvas, bar->search_clear_left, right, baseline, ICON_CLOSE, colors->muted);
     }
-    DeskCanvas clipped = *canvas;
-    desk_canvas_clip(&clipped, text_left, top, text_right, top + height);
-    if (!files->search[0] && !files->search_focus) {
-        bar->search_scroll = 0;
-        bar->search_text_x = text_left;
-        desk_text_draw(layout->font, &clipped, text_left, baseline, "Search", 6, colors->muted);
-        return;
-    }
-    /* Scroll so the cursor stays in view. */
-    int room = text_right - text_left - line;
-    int cursor_x = desk_text_width(layout->font, files->search, files->search_cursor);
-    if (cursor_x - bar->search_scroll > room)
-        bar->search_scroll = cursor_x - room;
-    if (cursor_x < bar->search_scroll)
-        bar->search_scroll = cursor_x;
-    if (bar->search_scroll < 0)
-        bar->search_scroll = 0;
-    bar->search_text_x = text_left - bar->search_scroll;
-    desk_text_draw(layout->font, &clipped, bar->search_text_x, baseline, files->search, strlen(files->search),
-                   colors->foreground);
-    if (files->search_focus)
-        desk_canvas_fill(&clipped, bar->search_text_x + cursor_x, top + space / 2, line, height - space,
-                         colors->foreground);
+    draw_field(files, canvas, layout, &files->search, text_left, text_right, top, files->search_focus, "Search");
 }
 
 /* Sidebar, back, forward and up buttons; the path as crumbs to click, with a
@@ -2865,6 +3181,15 @@ static void paint_toolbar(struct files *files, DeskCanvas *canvas, const struct 
     desk_canvas_fill(canvas, bar->path_left, top, bar->path_right - bar->path_left, height,
                      mix(colors->background, colors->muted, 35));
 
+    if (files->path_editing) {
+        outline(canvas, bar->path_left, top, bar->path_right - bar->path_left, height,
+                desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1,
+                colors->directory);
+        bar->crumb_count = 0;
+        draw_field(files, canvas, layout, &files->path_field, bar->path_left + space, bar->path_right - space, top,
+                   true, NULL);
+        return;
+    }
     right = bar->path_right - space;
     const char *mark = files->root ? "\xef\x80\xa3 root" : !files->writable ? "\xef\x80\xa3 read-only" : NULL;
     if (mark) {
@@ -3064,6 +3389,47 @@ static void paint(struct files *files, DeskCanvas *canvas)
     paint_notice(files, &area, &ui, bottom);
 }
 
+/* While a path is typed: the directories it could go on to, in a box
+   under the path over the list, the chosen one lit. */
+static void paint_suggestions(struct files *files, DeskCanvas *canvas)
+{
+    struct toolbar *bar = &files->toolbar;
+    bar->suggest_row = 0;
+    if (!files->path_editing || !files->suggestion_count)
+        return;
+    const struct colors *colors = &files->colors;
+    struct layout ui = make_layout(files->font, files->italic, files->mono, desk_window_scale(&files->window));
+    size_t shown = files->suggestion_count < SUGGESTIONS_SHOWN ? files->suggestion_count : SUGGESTIONS_SHOWN;
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    int left = bar->path_left, right = bar->path_right, top = bar->bottom + line, row = ui.row_height;
+    int height = (int)shown * row + (files->suggestion_count > shown ? row : 0);
+    bar->suggest_left = left;
+    bar->suggest_right = right;
+    bar->suggest_top = top;
+    bar->suggest_row = row;
+    uint32_t background = mix(colors->background, colors->muted, 25);
+    desk_canvas_fill(canvas, left, top, right - left, height, background);
+    outline(canvas, left, top, right - left, height, line, mix(colors->background, colors->muted, 110));
+    for (size_t i = 0; i < shown; ++i) {
+        int y = top + (int)i * row;
+        bool chosen = (int)i == files->suggestion, lit = chosen || hovering(files, TARGET_SUGGESTION, i);
+        if (lit)
+            desk_canvas_fill(canvas, left + line, y, right - left - 2 * line, row,
+                             chosen ? colors->selection_background : mix(background, colors->muted, 60));
+        uint32_t color = chosen ? colors->selection_foreground : colors->foreground;
+        draw_icon(ui.font, canvas, left + ui.padding / 2, left + ui.padding / 2 + ui.icon_width, y + ui.baseline,
+                  ICON_FOLDER, chosen ? color : colors->directory);
+        draw_clipped(ui.font, canvas, left + ui.padding / 2 + ui.icon_width, right - ui.padding, y + ui.baseline,
+                     files->suggestions[i], color);
+    }
+    if (files->suggestion_count > shown) {
+        char more[48];
+        snprintf(more, sizeof more, "%zu more", files->suggestion_count - shown);
+        draw_clipped(ui.italic, canvas, left + ui.padding / 2 + ui.icon_width, right - ui.padding,
+                     top + (int)shown * row + ui.baseline, more, colors->muted);
+    }
+}
+
 static void draw(void *data, DeskWindow *window)
 {
     struct files *files = data;
@@ -3072,6 +3438,7 @@ static void draw(void *data, DeskWindow *window)
         return; /* Both busy: retried after a release. */
     DeskCanvas canvas = desk_canvas(buffer->pixels, buffer->width, buffer->height);
     paint(files, &canvas);
+    paint_suggestions(files, &canvas);
     desk_window_commit(window, buffer);
 }
 
@@ -3170,7 +3537,8 @@ static uint32_t cursor_shape(const struct files *files)
     if (files->drag || files->resizing || files->hover.kind == TARGET_DIVIDER ||
         files->hover.kind == TARGET_COLUMN_EDGE)
         return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE;
-    if (files->hover.kind == TARGET_SEARCH)
+    if (files->hover.kind == TARGET_SEARCH || files->selecting ||
+        (files->hover.kind == TARGET_PATH && files->path_editing))
         return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
     return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
 }
@@ -3214,6 +3582,12 @@ static struct target target_at(const struct files *files)
     const struct toolbar *bar = &files->toolbar;
     const struct panes *panes = &files->panes;
     int x = pointer_buffer_x(files), y = pointer_buffer_y(files);
+    if (files->path_editing && files->suggestion_count && bar->suggest_row > 0 && x >= bar->suggest_left &&
+        x < bar->suggest_right && y >= bar->suggest_top) {
+        size_t row = (size_t)((y - bar->suggest_top) / bar->suggest_row);
+        if (row < files->suggestion_count && row < SUGGESTIONS_SHOWN)
+            return (struct target){TARGET_SUGGESTION, row};
+    }
     if (y >= bar->tabs_top && y < bar->tabs_bottom) {
         for (size_t i = 0; i < files->tab_count; ++i) {
             const struct tab *tab = &files->tabs[i];
@@ -3236,6 +3610,8 @@ static struct target target_at(const struct files *files)
             if (crumb->left >= 0 && x >= crumb->left && x < crumb->right)
                 return (struct target){TARGET_CRUMB, i};
         }
+        if (x >= bar->path_left && x < bar->path_right)
+            return (struct target){TARGET_PATH, 0}; /* Not on a crumb, or typing a path. */
         if (bar->search_clear_left >= 0 && x >= bar->search_clear_left && x < bar->search_right)
             return (struct target){TARGET_SEARCH_CLEAR, 0};
         if (x >= bar->search_left && x < bar->search_right)
@@ -3363,19 +3739,105 @@ static void copy_text(struct files *files, const char *text)
     files->clip_text = copy;
 }
 
-/* Other clients' clipboard and drags: nothing is read from them yet, but
-   their offers are released. */
-static void device_data_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
+/* Other clients' clipboard: each new offer lists its types before it's
+   known whether it's the clipboard or a drag; the best text type is kept. */
+static int text_type_rank(const char *mime)
+{
+    static const char *const types[] = {"text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"};
+    for (size_t i = 0; i < sizeof types / sizeof *types; ++i) {
+        if (strcmp(mime, types[i]) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+static void offer_offer(void *data, struct wl_data_offer *offer, const char *mime)
+{
+    struct files *files = data;
+    if (offer != files->pending_offer)
+        return;
+    int rank = text_type_rank(mime);
+    if (rank < 0 || (files->pending_type && text_type_rank(files->pending_type) <= rank))
+        return;
+    free(files->pending_type);
+    files->pending_type = strdup(mime);
+}
+
+static void offer_source_actions(void *data, struct wl_data_offer *offer, uint32_t actions)
 {
     (void)data;
-    (void)device;
     (void)offer;
+    (void)actions;
+}
+
+static void offer_action(void *data, struct wl_data_offer *offer, uint32_t action)
+{
+    (void)data;
+    (void)offer;
+    (void)action;
+}
+
+static const struct wl_data_offer_listener offer_listener = {
+    .offer = offer_offer,
+    .source_actions = offer_source_actions,
+    .action = offer_action,
+};
+
+static void device_data_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
+{
+    (void)device;
+    struct files *files = data;
+    free(files->pending_type);
+    files->pending_type = NULL;
+    files->pending_offer = offer;
+    wl_data_offer_add_listener(offer, &offer_listener, files);
+}
+
+/* The clipboard's text, or NULL when it has none. Waits for the other
+   client, at most a second. */
+static char *paste_text(struct files *files)
+{
+    if (files->clip_source && files->clip_text)
+        return strdup(files->clip_text); /* Ours. */
+    if (!files->selection_offer || !files->offer_type)
+        return NULL;
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0)
+        return NULL;
+    wl_data_offer_receive(files->selection_offer, files->offer_type, fds[1]);
+    close(fds[1]);
+    wl_display_flush(files->display);
+    char *text = NULL;
+    size_t length = 0, capacity = 0;
+    for (;;) {
+        struct pollfd wait = {fds[0], POLLIN, 0};
+        if (poll(&wait, 1, 1000) <= 0)
+            break;
+        if (length + 4096 + 1 > capacity) {
+            size_t grown = capacity ? capacity * 2 : 8192;
+            char *bigger = grown <= (1u << 20) ? realloc(text, grown) : NULL;
+            if (!bigger)
+                break;
+            text = bigger;
+            capacity = grown;
+        }
+        ssize_t got = read(fds[0], text + length, 4096);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0)
+            break;
+        length += (size_t)got;
+    }
+    close(fds[0]);
+    if (text)
+        text[length] = 0;
+    return text;
 }
 
 static void device_enter(void *data, struct wl_data_device *device, uint32_t serial, struct wl_surface *surface,
                          wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *offer)
 {
-    (void)data;
+    struct files *files = data;
     (void)device;
     (void)serial;
     (void)surface;
@@ -3383,6 +3845,8 @@ static void device_enter(void *data, struct wl_data_device *device, uint32_t ser
     (void)y;
     if (offer)
         wl_data_offer_destroy(offer); /* Drops onto files come in 0.4. */
+    if (offer == files->pending_offer)
+        files->pending_offer = NULL;
 }
 
 static void device_leave(void *data, struct wl_data_device *device)
@@ -3413,6 +3877,13 @@ static void device_selection(void *data, struct wl_data_device *device, struct w
     if (files->selection_offer)
         wl_data_offer_destroy(files->selection_offer);
     files->selection_offer = offer;
+    free(files->offer_type);
+    files->offer_type = NULL;
+    if (offer && offer == files->pending_offer) {
+        files->offer_type = files->pending_type;
+        files->pending_type = NULL;
+    }
+    files->pending_offer = NULL;
 }
 
 static const struct wl_data_device_listener device_listener = {
@@ -4000,7 +4471,7 @@ static void context_key(struct files *files)
 /* Everything clickable lights up under the pointer except entries. */
 static bool shows_hover(enum target_kind kind)
 {
-    return kind != TARGET_NONE && kind != TARGET_ROW && kind != TARGET_SEARCH;
+    return kind != TARGET_NONE && kind != TARGET_ROW && kind != TARGET_SEARCH && kind != TARGET_PATH;
 }
 
 static void update_hover(struct files *files, bool force)
@@ -4043,24 +4514,6 @@ static void go_to_place(struct files *files, size_t index)
         go_to(files, path, NULL);
 }
 
-/* Put the search cursor where the pointer is in the text. */
-static void search_click(struct files *files)
-{
-    int x = pointer_buffer_x(files) - files->toolbar.search_text_x;
-    const char *text = files->search;
-    size_t at = 0, length = strlen(text);
-    while (at < length) {
-        size_t next = forward_char(text, at);
-        int left = desk_text_width(files->font, text, at), right = desk_text_width(files->font, text, next);
-        if (x < (left + right) / 2)
-            break;
-        at = next;
-    }
-    files->search_cursor = at;
-    files->search_focus = true;
-    desk_window_redraw(&files->window);
-}
-
 static void click(struct files *files, uint32_t time)
 {
     struct target target = target_at(files);
@@ -4071,6 +4524,9 @@ static void click(struct files *files, uint32_t time)
     clear_notice(files);
     if (target.kind != TARGET_SEARCH && target.kind != TARGET_SEARCH_CLEAR)
         search_focus(files, false);
+    /* Clicking anywhere but the path field or a suggestion puts the crumbs back. */
+    if (files->path_editing && target.kind != TARGET_PATH && target.kind != TARGET_SUGGESTION)
+        stop_path_edit(files);
     switch (target.kind) {
     case TARGET_BUTTON:
         switch (target.index) {
@@ -4115,7 +4571,20 @@ static void click(struct files *files, uint32_t time)
         new_tab(files, strdup(files->path), true);
         break;
     case TARGET_SEARCH:
-        search_click(files);
+        files->search_focus = true;
+        field_press(files, &files->search, twice);
+        break;
+    case TARGET_PATH:
+        if (!files->path_editing)
+            start_path_edit(files); /* All selected, ready to type over. */
+        else
+            field_press(files, &files->path_field, twice);
+        break;
+    case TARGET_SUGGESTION:
+        if (target.index < files->suggestion_count) {
+            use_suggestion(files, files->suggestions[target.index]);
+            go_to_typed(files);
+        }
         break;
     case TARGET_SEARCH_CLEAR:
         search_clear(files);
@@ -4218,6 +4687,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
         set_sidebar_width(files, files->pointer_x - PADDING * 1.5);
     else if (files->resizing)
         resize_column(files, files->resizing);
+    else if (files->selecting)
+        field_drag(files);
     else
         update_hover(files, false);
 }
@@ -4259,6 +4730,9 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
         /* Other buttons do nothing. */
     } else if (pressed) {
         click(files, time);
+    } else if (files->selecting) {
+        files->selecting = NULL;
+        update_hover(files, true);
     } else if (files->drag || files->resizing) {
         files->drag = false;
         files->resizing = 0;
@@ -4486,6 +4960,11 @@ static void close_window(struct files *files)
     free(files->clip_text);
     if (files->selection_offer)
         wl_data_offer_destroy(files->selection_offer);
+    free(files->offer_type);
+    free(files->pending_type);
+    free_suggestions(files);
+    desk_text_free(&files->search.text);
+    desk_text_free(&files->path_field.text);
     if (files->data_device)
         wl_data_device_release(files->data_device);
     if (files->data_manager)

@@ -174,6 +174,7 @@ shot and view have grown desk further ahead of this phase. What's already there 
 | Fonts with fallback, glyph cache, canvas (`-DDESK_FONT`) | files 0.1 | files | 5 (bar, run, wall and deal's rasterizer still have their own) |
 | Desktop entries, `mimeapps.list`, MIME types and detached launching (`-DDESK_APPS`) | files 0.3 | files | none yet (run still parses desktop entries itself) |
 | Popups (`desk_popup_open`, an `xdg_popup` with a grab) | files 0.3 | files | 4, for popups (bar's menus could move onto it) |
+| A one-line text field (`DeskText`, `desk_text_key`: cursor, selection, word moves) | files 0.3 | files | none yet (run's prompt could move onto it) |
 | xkb keymap and modifiers (`-DDESK_KEYBOARD`) | files 0.1 | files, view | 6 (run and deal still have their own; compose to come) |
 | xdg-shell window with scale tracking (`-DDESK_WINDOW`) | files 0.1 | files, view | 4, for toplevels |
 
@@ -240,7 +241,7 @@ A graphical file manager that works like a normal explorer, mouse first with the
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | In progress: all but the Open with dialog and typing a path |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | In progress: all but the Open with dialog |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |

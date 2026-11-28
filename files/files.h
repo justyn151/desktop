@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.3.1"
+#define FILES_VERSION "0.3.2"
 
 /* Exit statuses. */
 enum {
@@ -106,9 +106,9 @@ struct toolbar {
     int button_left[BUTTON_COUNT], button_right[BUTTON_COUNT];
     int path_left, path_right;
     int search_left, search_right;
-    int search_text_x;      /* Where the search text starts, scrolled. */
     int search_clear_left;  /* The × that clears it, or -1. */
-    int search_scroll;      /* Pixels of text scrolled off the left. */
+    /* The suggestions under the path while it's typed, as drawn. */
+    int suggest_left, suggest_right, suggest_top, suggest_row;
     struct crumb *crumbs;
     size_t crumb_count, crumb_capacity;
 };
@@ -127,6 +127,8 @@ enum target_kind {
     TARGET_SEARCH,
     TARGET_SEARCH_CLEAR,
     TARGET_HEADING,         /* index: COLUMN_, sorts by it */
+    TARGET_PATH,            /* The path box: its empty part, or the field while typing a path */
+    TARGET_SUGGESTION,      /* index into suggestions */
     TARGET_COLUMN_EDGE,     /* index: the COLUMN_ to its right, resized by dragging */
 };
 
@@ -155,7 +157,15 @@ struct tab {
     int close_left, close_right;
 };
 
-#define SEARCH_MAX 256
+/* A text field as drawn: its text, and how far it's scrolled sideways. */
+struct field {
+    DeskText text;
+    int scroll;             /* Buffer pixels of text scrolled off the left. */
+    int text_x;             /* Where the text starts, scrolled, as drawn. */
+    int left, right;        /* The text area, as drawn. */
+};
+
+#define SUGGESTIONS_SHOWN 10
 
 /* A line in a right-click menu. */
 struct menu_item {
@@ -241,9 +251,17 @@ struct files {
     char *clip_text;          /* ...and its text. */
     struct wl_data_offer *selection_offer; /* Others' clipboard, unused but released. */
     char *bookmarks_path;     /* GTK's bookmarks file. */
-    char search[SEARCH_MAX];  /* Filters the list as it's typed. */
-    size_t search_cursor;     /* Byte offset in search. */
+    struct field search;      /* Filters the list as it's typed. */
     bool search_focus;        /* Keys go to the search field. */
+    bool path_editing;        /* The path box is a field: Ctrl+L. */
+    struct field path_field;
+    char **suggestions;       /* Directories matching what's typed, in order. */
+    size_t suggestion_count;
+    int suggestion;           /* The one chosen with Up and Down, or -1. */
+    struct field *selecting;  /* The field a mouse drag is selecting in, or NULL. */
+    char *offer_type;         /* The text type the clipboard's offer has, or NULL. */
+    struct wl_data_offer *pending_offer; /* The latest offer, before it's known what for. */
+    char *pending_type;
 
     struct place *places;     /* The sidebar: home, its folders, /, mounted drives. */
     size_t place_count;
