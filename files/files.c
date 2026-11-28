@@ -3302,6 +3302,8 @@ static char *trash_origin(const struct files *files, const char *name)
     return origin;
 }
 
+static void trash_paths(struct files *files, char **paths, size_t count);
+
 /* Delete, outside the trash: move the selection there. */
 static void trash_selection(struct files *files)
 {
@@ -3316,13 +3318,25 @@ static void trash_selection(struct files *files)
         free_paths(paths, count);
         return;
     }
+    trash_paths(files, paths, count);
+}
+
+/* Move paths to the trash (taking them over), with undo. */
+static void trash_paths(struct files *files, char **paths, size_t count)
+{
     char **trashed = calloc(count, sizeof *trashed);
     char **from = calloc(count, sizeof *from);
     size_t moved = 0;
     int first_error = 0;
     const char *failed = NULL;
     for (size_t i = 0; trashed && from && i < count; ++i) {
-        char *to;
+        char *to, *parent = parent_path(paths[i]);
+        bool allowed = parent && may_modify(files, parent);
+        free(parent);
+        if (!allowed) {
+            protected_notice(files, paths[i]);
+            continue;
+        }
         int error = trash_one(files, paths[i], &to);
         if (error) {
             if (!first_error) {
@@ -5170,6 +5184,7 @@ static void outline(DeskCanvas *canvas, int x, int y, int width, int height, int
    cursor's outline shows (when it isn't simply the one selected). */
 struct marks {
     bool selected, hovered, focused;
+    bool drop;              /* Something dragged over would go into it. */
     bool renaming;          /* Its name is being edited. */
 };
 
@@ -5181,6 +5196,7 @@ static struct marks entry_marks(struct files *files, size_t index, size_t select
         .hovered = hovering(files, TARGET_ROW, index) && !files->banding,
         .focused = index == files->cursor && (!entry->selected || selected > 1),
         .renaming = files->renaming && files->rename_name && strcmp(entry->name, files->rename_name) == 0,
+        .drop = files->drop_into && files->drop_target.kind == TARGET_ROW && files->drop_target.index == index,
     };
 }
 
@@ -5195,9 +5211,13 @@ static void draw_marks(struct files *files, DeskCanvas *canvas, struct marks mar
                                        : colors->selection_background);
     else if (marks.hovered)
         desk_canvas_fill(canvas, x, y, w, h, mix(colors->background, colors->muted, 45));
-    if (marks.focused)
-        outline(canvas, x, y, w, h, desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1,
-                mix(colors->background, colors->directory, 150));
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    if (marks.drop) {
+        desk_canvas_fill(canvas, x, y, w, h, mix(colors->background, colors->directory, 60));
+        outline(canvas, x, y, w, h, 2 * line, colors->directory);
+    } else if (marks.focused) {
+        outline(canvas, x, y, w, h, line, mix(colors->background, colors->directory, 150));
+    }
 }
 
 static void draw_field(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct field *field,
@@ -5740,7 +5760,12 @@ static void paint_sidebar(struct files *files, DeskCanvas *canvas, const struct 
                            colors->muted);
             continue;
         }
-        if (strcmp(place->path, files->path) == 0)
+        if (files->drop_into && files->drop_target.kind == TARGET_PLACE && files->drop_target.index == i) {
+            desk_canvas_fill(canvas, x0, y, x1 - x0, layout->row_height, mix(colors->background, colors->directory, 60));
+            outline(canvas, x0, y, x1 - x0, layout->row_height,
+                    2 * (desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1),
+                    colors->directory);
+        } else if (strcmp(place->path, files->path) == 0)
             desk_canvas_fill(canvas, x0, y, x1 - x0, layout->row_height,
                              mix(colors->background, colors->selection_background, 150));
         else if (hovering(files, TARGET_PLACE, i))
@@ -5850,6 +5875,16 @@ static void paint_progress(struct files *files, DeskCanvas *canvas, const struct
     desk_canvas_fill(canvas, left, bar_top, (int)(width * fraction), bar_height, colors->directory);
 }
 
+/* Dropping into the folder shown: a frame around the list. */
+static void paint_drop_frame(struct files *files, DeskCanvas *canvas, int top, int bottom)
+{
+    if (!files->drop_into || files->drop_target.kind != TARGET_NONE)
+        return;
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    outline(canvas, files->panes.list_left, top, files->panes.list_right - files->panes.list_left, bottom - top, 2 * line,
+            files->colors.directory);
+}
+
 static void paint(struct files *files, DeskCanvas *canvas)
 {
     files->rename_top = files->rename_bottom = -1;
@@ -5934,6 +5969,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
     const char *message = empty_message(files, &message_color);
     if (message) {
         draw_message(&area, &list, panes->list_left, top, message, message_color);
+        paint_drop_frame(files, &area, top, bottom);
         paint_notice(files, &area, &ui, bottom);
         return;
     }
@@ -5958,6 +5994,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
         desk_canvas_clip(&band, panes->list_left, panes->entries_top, panes->list_right, bottom);
         outline(&band, x0, y0, x1 - x0 + 1, y1 - y0 + 1, line, files->colors.directory);
     }
+    paint_drop_frame(files, &area, top, bottom);
     paint_notice(files, &area, &ui, bottom);
 }
 
@@ -6320,30 +6357,35 @@ static void clip_target(void *data, struct wl_data_source *source, const char *m
 
 /* Copied files as other file managers read them: GNOME's list ("copy" or
    "cut", then a URI a line) or a plain URI list. */
-static char *clip_uri_text(const struct files *files, bool uri_list)
+static char *uri_text(char *const *paths, size_t count, bool cut, bool uri_list)
 {
     size_t length = 8;
-    char **uris = calloc(files->clip_count, sizeof *uris);
-    for (size_t i = 0; uris && i < files->clip_count; ++i) {
-        uris[i] = path_uri(files->clip_paths[i]);
+    char **uris = calloc(count ? count : 1, sizeof *uris);
+    for (size_t i = 0; uris && i < count; ++i) {
+        uris[i] = path_uri(paths[i]);
         length += (uris[i] ? strlen(uris[i]) : 0) + 2;
     }
     char *text = uris ? malloc(length) : NULL;
     if (text) {
         size_t used = 0;
         if (!uri_list)
-            used = (size_t)sprintf(text, "%s", files->clip_cut ? "cut" : "copy");
-        for (size_t i = 0; i < files->clip_count; ++i) {
+            used = (size_t)sprintf(text, "%s", cut ? "cut" : "copy");
+        for (size_t i = 0; i < count; ++i) {
             if (!uris[i])
                 continue;
             used += (size_t)sprintf(text + used, uri_list ? "%s\r\n" : "\n%s", uris[i]);
         }
         text[used] = 0;
     }
-    for (size_t i = 0; uris && i < files->clip_count; ++i)
+    for (size_t i = 0; uris && i < count; ++i)
         free(uris[i]);
     free(uris);
     return text;
+}
+
+static char *clip_uri_text(const struct files *files, bool uri_list)
+{
+    return uri_text(files->clip_paths, files->clip_count, files->clip_cut, uri_list);
 }
 
 static void clip_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd)
@@ -6544,9 +6586,9 @@ static void offer_source_actions(void *data, struct wl_data_offer *offer, uint32
 
 static void offer_action(void *data, struct wl_data_offer *offer, uint32_t action)
 {
-    (void)data;
-    (void)offer;
-    (void)action;
+    struct files *files = data;
+    if (offer == files->drop_offer)
+        files->drop_action = action;
 }
 
 static const struct wl_data_offer_listener offer_listener = {
@@ -6569,7 +6611,8 @@ static void device_data_offer(void *data, struct wl_data_device *device, struct 
 
 /* The clipboard's text, or NULL when it has none. Waits for the other
    client, at most a second. */
-static char *receive_offer(struct files *files, const char *mime);
+static char *receive_offer(struct files *files, struct wl_data_offer *offer, const char *mime);
+static char **uri_list_paths(char *text, bool gnome, bool *cut, size_t *count);
 
 static char *paste_text(struct files *files)
 {
@@ -6577,7 +6620,7 @@ static char *paste_text(struct files *files)
         return strdup(files->clip_text); /* Ours. */
     if (!files->selection_offer || !files->offer_type)
         return NULL;
-    return receive_offer(files, files->offer_type);
+    return receive_offer(files, files->selection_offer, files->offer_type);
 }
 
 /* Whether the clipboard has files to paste. */
@@ -6606,34 +6649,8 @@ static void paste_files(struct files *files, const char *destination)
         cut = files->clip_cut;
     } else if (files->selection_offer && files->offer_files_type) {
         bool gnome = strcmp(files->offer_files_type, "x-special/gnome-copied-files") == 0;
-        char *text = receive_offer(files, files->offer_files_type);
-        size_t capacity = 0;
-        char *save = NULL;
-        bool first = true;
-        for (char *line = text ? strtok_r(text, "\r\n", &save) : NULL; line; line = strtok_r(NULL, "\r\n", &save)) {
-            if (gnome && first) {
-                first = false;
-                cut = strcmp(line, "cut") == 0;
-                if (cut || strcmp(line, "copy") == 0)
-                    continue;
-            }
-            first = false;
-            if (line[0] == '#')
-                continue;
-            char *path = uri_path(line, strlen(line));
-            if (!path)
-                continue;
-            if (count == capacity) {
-                capacity = capacity ? capacity * 2 : 16;
-                char **grown = realloc(paths, capacity * sizeof *grown);
-                if (!grown) {
-                    free(path);
-                    break;
-                }
-                paths = grown;
-            }
-            paths[count++] = path;
-        }
+        char *text = receive_offer(files, files->selection_offer, files->offer_files_type);
+        paths = uri_list_paths(text, gnome, &cut, &count);
         free(text);
     }
     if (!count) {
@@ -6653,14 +6670,51 @@ static void paste_files(struct files *files, const char *destination)
     }
 }
 
-/* The clipboard's offer as mime, read through a pipe; waits for the other
+/* The local paths in a URI list (GNOME's starts with "copy" or "cut",
+   which sets *cut). Takes text apart. */
+static char **uri_list_paths(char *text, bool gnome, bool *cut, size_t *count)
+{
+    char **paths = NULL;
+    size_t capacity = 0;
+    char *save = NULL;
+    bool first = true;
+    *count = 0;
+    *cut = false;
+    for (char *line = text ? strtok_r(text, "\r\n", &save) : NULL; line; line = strtok_r(NULL, "\r\n", &save)) {
+        if (gnome && first) {
+            first = false;
+            *cut = strcmp(line, "cut") == 0;
+            if (*cut || strcmp(line, "copy") == 0)
+                continue;
+        }
+        first = false;
+        if (line[0] == '#')
+            continue;
+        char *path = uri_path(line, strlen(line));
+        if (!path)
+            continue;
+        if (*count == capacity) {
+            capacity = capacity ? capacity * 2 : 16;
+            char **grown = realloc(paths, capacity * sizeof *grown);
+            if (!grown) {
+                free(path);
+                break;
+            }
+            paths = grown;
+        }
+        paths[(*count)++] = path;
+    }
+    return paths;
+}
+
+/* An offer's data as mime, read through a pipe; waits for the other
    client, at most a second. */
-static char *receive_offer(struct files *files, const char *mime)
+static char *receive_offer(struct files *files, struct wl_data_offer *offer, const char *mime)
 {
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0)
         return NULL;
-    wl_data_offer_receive(files->selection_offer, mime, fds[1]);
+    wl_data_offer_receive(offer, mime, fds[1]);
     close(fds[1]);
     wl_display_flush(files->display);
     char *text = NULL;
@@ -6690,40 +6744,305 @@ static char *receive_offer(struct files *files, const char *mime)
     return text;
 }
 
+/* Drag and drop
+
+   Dragging a selected name carries the selection out as files (the same
+   types as Copy), to another folder or place here, or to another
+   application. Files dropped on the window go into the folder under the
+   pointer, the place in the sidebar, or the folder shown: moved when the
+   compositor settles on moving (on the same drive by default, or with
+   Shift), copied otherwise (another drive, or Ctrl), through the same jobs
+   as paste. Dropped on the Trash they're trashed. Nothing goes where
+   files may not change things. */
+
+static void drag_source_target(void *data, struct wl_data_source *source, const char *mime)
+{
+    (void)data;
+    (void)source;
+    (void)mime;
+}
+
+static void drag_source_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd)
+{
+    (void)source;
+    struct files *files = data;
+    char *text = NULL;
+    if (strcmp(mime, "x-special/gnome-copied-files") == 0 || strcmp(mime, "text/uri-list") == 0) {
+        text = uri_text(files->drag_paths, files->drag_count, false, strcmp(mime, "text/uri-list") == 0);
+    } else {
+        size_t length = 1;
+        for (size_t i = 0; i < files->drag_count; ++i)
+            length += strlen(files->drag_paths[i]) + 1;
+        if ((text = malloc(length))) {
+            text[0] = 0;
+            for (size_t i = 0; i < files->drag_count; ++i) {
+                strcat(text, files->drag_paths[i]);
+                if (i + 1 < files->drag_count)
+                    strcat(text, "\n");
+            }
+        }
+    }
+    for (size_t left = text ? strlen(text) : 0, done = 0; left;) {
+        ssize_t written = write(fd, text + done, left);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            break;
+        done += (size_t)written;
+        left -= (size_t)written;
+    }
+    close(fd);
+    free(text);
+}
+
+static void drag_end(struct files *files, struct wl_data_source *source)
+{
+    if (files->drag_source != source)
+        return;
+    wl_data_source_destroy(source);
+    files->drag_source = NULL;
+    free_paths(files->drag_paths, files->drag_count);
+    files->drag_paths = NULL;
+    files->drag_count = 0;
+    desk_window_redraw(&files->window);
+}
+
+static void drag_source_cancelled(void *data, struct wl_data_source *source)
+{
+    drag_end(data, source);
+}
+
+static void drag_source_dropped(void *data, struct wl_data_source *source)
+{
+    (void)data;
+    (void)source;
+}
+
+/* The other side has what it needs; a move is its to do, as with other
+   file managers. */
+static void drag_source_finished(void *data, struct wl_data_source *source)
+{
+    drag_end(data, source);
+}
+
+static void drag_source_action(void *data, struct wl_data_source *source, uint32_t action)
+{
+    (void)data;
+    (void)source;
+    (void)action;
+}
+
+static const struct wl_data_source_listener drag_source_listener = {
+    .target = drag_source_target,
+    .send = drag_source_send,
+    .cancelled = drag_source_cancelled,
+    .dnd_drop_performed = drag_source_dropped,
+    .dnd_finished = drag_source_finished,
+    .action = drag_source_action,
+};
+
+/* A press on a selected name moved: drag the selection. */
+static void start_drag(struct files *files)
+{
+    files->band_pending = files->banding = false;
+    if (!files->data_device || files->drag_source)
+        return;
+    size_t count;
+    char **paths = selected_paths(files, &count);
+    if (!count) {
+        free(paths);
+        return;
+    }
+    struct wl_data_source *source = wl_data_device_manager_create_data_source(files->data_manager);
+    wl_data_source_add_listener(source, &drag_source_listener, files);
+    static const char *const types[] = {"text/uri-list", "x-special/gnome-copied-files", "text/plain;charset=utf-8",
+                                        "text/plain"};
+    for (size_t i = 0; i < sizeof types / sizeof *types; ++i)
+        wl_data_source_offer(source, types[i]);
+    if (wl_data_source_get_version(source) >= WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION) {
+        uint32_t actions = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+        if (files->writable && !in_trash(files))
+            actions |= WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+        wl_data_source_set_actions(source, actions);
+    }
+    files->drag_source = source;
+    files->drag_paths = paths;
+    files->drag_count = count;
+    wl_data_device_start_drag(files->data_device, source, files->window.surface, NULL, files->input_serial);
+    desk_window_redraw(&files->window);
+}
+
+static void drop_clear(struct files *files)
+{
+    if (files->drop_offer)
+        wl_data_offer_destroy(files->drop_offer);
+    files->drop_offer = NULL;
+    free(files->drop_type);
+    files->drop_type = NULL;
+    free(files->drop_into);
+    files->drop_into = NULL;
+    files->drop_target = (struct target){TARGET_NONE, 0};
+    files->drop_action = 0;
+}
+
+/* Our own drag: whether all of it is in directory already. */
+static bool dragged_from(const struct files *files, const char *directory)
+{
+    for (size_t i = 0; i < files->drag_count; ++i) {
+        char *parent = parent_path(files->drag_paths[i]);
+        bool same = parent && strcmp(parent, directory) == 0;
+        free(parent);
+        if (!same)
+            return false;
+    }
+    return files->drag_count > 0;
+}
+
+/* Where the pointer is while something is dragged over: what it would go
+   into, lit, and told to the compositor with the actions on offer. */
+static void drop_update(struct files *files)
+{
+    struct target before = files->drop_target;
+    bool had = files->drop_into != NULL;
+    free(files->drop_into);
+    files->drop_into = NULL;
+    files->drop_target = (struct target){TARGET_NONE, 0};
+    if (!files->drop_offer)
+        return;
+    bool own = files->drag_source != NULL;
+    struct target target = target_at(files);
+    const char *into = NULL;
+    char *owned = NULL;
+    if (files->drop_type && !files->dialog.open) {
+        if (target.kind == TARGET_PLACE) {
+            into = files->places[target.index].path;
+            files->drop_target = target;
+        } else if (target.kind == TARGET_ROW && target.index < files->listing.shown_count) {
+            struct entry *entry = shown_entry(files, target.index);
+            if (entry->directory && !(own && entry->selected)) {
+                into = owned = join_path(files->path, entry->name);
+                files->drop_target = target;
+            } else if (!entry->directory) {
+                into = files->path;
+            }
+        } else if (target.kind == TARGET_NONE && pointer_buffer_x(files) >= files->panes.list_left &&
+                   pointer_buffer_y(files) >= files->panes.entries_top) {
+            into = files->path;
+        }
+    }
+    bool trash = into && files->trash_files && strcmp(into, files->trash_files) == 0;
+    if (into && (trash ? !in_trash(files) || !own : may_modify(files, into)) && !(own && dragged_from(files, into)))
+        files->drop_into = strdup(into);
+    free(owned);
+    if (!files->drop_into)
+        files->drop_target = (struct target){TARGET_NONE, 0};
+
+    uint32_t copy = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY, move = WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    uint32_t preferred = copy;
+    if (files->drop_into) {
+        /* Moved within a drive, copied to another, as other file managers do;
+           Ctrl copies, Shift moves. Into the trash is always a move. */
+        unsigned mods = desk_keyboard_mods(&files->keyboard);
+        struct stat from, to;
+        if (trash || (mods & DESK_MOD_SHIFT))
+            preferred = move;
+        else if (!(mods & DESK_MOD_CTRL) && own && lstat(files->drag_paths[0], &from) == 0 &&
+                 stat(files->drop_into, &to) == 0 && from.st_dev == to.st_dev)
+            preferred = move;
+    }
+    wl_data_offer_accept(files->drop_offer, files->drop_serial, files->drop_into ? files->drop_type : NULL);
+    if (wl_data_offer_get_version(files->drop_offer) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
+        wl_data_offer_set_actions(files->drop_offer, files->drop_into ? (trash ? move : copy | move) : 0,
+                                  files->drop_into ? preferred : 0);
+    if (had != (files->drop_into != NULL) || before.kind != files->drop_target.kind ||
+        before.index != files->drop_target.index)
+        desk_window_redraw(&files->window);
+}
+
 static void device_enter(void *data, struct wl_data_device *device, uint32_t serial, struct wl_surface *surface,
                          wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *offer)
 {
-    struct files *files = data;
     (void)device;
-    (void)serial;
-    (void)surface;
-    (void)x;
-    (void)y;
-    if (offer)
-        wl_data_offer_destroy(offer); /* Drops onto files come in 0.4. */
-    if (offer == files->pending_offer)
+    struct files *files = data;
+    drop_clear(files);
+    if (!offer)
+        return;
+    files->drop_offer = offer;
+    files->drop_serial = serial;
+    if (offer == files->pending_offer) {
+        files->drop_type = files->pending_files_type;
+        files->pending_files_type = NULL;
         files->pending_offer = NULL;
+    }
+    if (surface != files->window.surface) {
+        wl_data_offer_accept(offer, serial, NULL); /* A menu. */
+        return;
+    }
+    files->pointer_surface = surface;
+    files->pointer_x = wl_fixed_to_double(x);
+    files->pointer_y = wl_fixed_to_double(y);
+    drop_update(files);
 }
 
 static void device_leave(void *data, struct wl_data_device *device)
 {
-    (void)data;
     (void)device;
+    struct files *files = data;
+    bool lit = files->drop_into != NULL;
+    drop_clear(files);
+    if (lit)
+        desk_window_redraw(&files->window);
 }
 
 static void device_motion(void *data, struct wl_data_device *device, uint32_t time, wl_fixed_t x, wl_fixed_t y)
 {
-    (void)data;
     (void)device;
     (void)time;
-    (void)x;
-    (void)y;
+    struct files *files = data;
+    files->pointer_x = wl_fixed_to_double(x);
+    files->pointer_y = wl_fixed_to_double(y);
+    drop_update(files);
 }
 
+/* Dropped: the files go where it was lit. */
 static void device_drop(void *data, struct wl_data_device *device)
 {
-    (void)data;
     (void)device;
+    struct files *files = data;
+    if (!files->drop_offer || !files->drop_into) {
+        drop_clear(files);
+        return;
+    }
+    char **paths = NULL;
+    size_t count = 0;
+    bool cut;
+    if (files->drag_source) {
+        /* Ours: no need to ask the compositor for what we have. */
+        paths = calloc(files->drag_count, sizeof *paths);
+        for (size_t i = 0; paths && i < files->drag_count; ++i) {
+            if ((paths[count] = strdup(files->drag_paths[i])))
+                ++count;
+        }
+    } else {
+        char *text = receive_offer(files, files->drop_offer, files->drop_type);
+        paths = uri_list_paths(text, strcmp(files->drop_type, "x-special/gnome-copied-files") == 0, &cut, &count);
+        free(text);
+    }
+    bool move = files->drop_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    char *into = strdup(files->drop_into);
+    if (wl_data_offer_get_version(files->drop_offer) >= WL_DATA_OFFER_FINISH_SINCE_VERSION && files->drop_action)
+        wl_data_offer_finish(files->drop_offer);
+    drop_clear(files);
+    if (!count || !into) {
+        free(paths);
+        notify(files, "Nothing in it is a file here");
+    } else if (files->trash_files && strcmp(into, files->trash_files) == 0) {
+        trash_paths(files, paths, count);
+    } else {
+        start_job(files, move ? JOB_MOVE : JOB_COPY, paths, count, into);
+    }
+    free(into);
+    desk_window_redraw(&files->window);
 }
 
 static void device_selection(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
@@ -7564,11 +7883,15 @@ static void band_select(struct files *files)
 static void band_drag(struct files *files)
 {
     int x = pointer_buffer_x(files), y = content_y(files);
-    if (files->press_on_name)
-        return; /* Dragging files comes next. */
+    int reach = (int)lround(4 * desk_window_scale(&files->window));
+    bool moved = abs(x - files->band_x0) >= reach || abs(y - files->band_y0) >= reach;
+    if (files->press_on_name) {
+        if (moved)
+            start_drag(files); /* The selection, carried by the compositor from here. */
+        return;
+    }
     if (!files->banding) {
-        int reach = (int)lround(4 * desk_window_scale(&files->window));
-        if (abs(x - files->band_x0) < reach && abs(y - files->band_y0) < reach)
+        if (!moved)
             return;
         files->banding = true;
     }
@@ -8088,6 +8411,10 @@ static void close_window(struct files *files)
     free(files->offer_files_type);
     free(files->pending_files_type);
     clip_forget_files(files);
+    drop_clear(files);
+    if (files->drag_source)
+        wl_data_source_destroy(files->drag_source);
+    free_paths(files->drag_paths, files->drag_count);
     free_suggestions(files);
     desk_text_free(&files->search.text);
     desk_text_free(&files->path_field.text);

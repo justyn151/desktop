@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.4.3"
+#define FILES_VERSION "0.4.4"
 
 /* Exit statuses. */
 enum {
@@ -304,6 +304,16 @@ struct files {
     size_t clip_count;
     bool clip_cut;            /* ...and whether it's to be moved. */
     char *offer_files_type;   /* The files type the clipboard's offer has, or NULL. */
+    /* Dragging files out: what's dragged, while the compositor carries it. */
+    struct wl_data_source *drag_source;
+    char **drag_paths;
+    size_t drag_count;
+    /* Something dragged over the window: where it would go. */
+    struct wl_data_offer *drop_offer;
+    char *drop_type;          /* The files type it has, or NULL: not files. */
+    uint32_t drop_serial, drop_action;
+    struct target drop_target; /* The folder row or place lit, or TARGET_NONE for the folder shown. */
+    char *drop_into;          /* NULL when it can't be dropped here. */
     char *pending_files_type;
     char *sized_path;         /* The directory whose sizes it's summing. */
     char typed[64];           /* Type to select: what's been typed lately... */

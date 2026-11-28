@@ -17,7 +17,7 @@ Ground rules that apply to every phase:
 
 **Next, in order:**
 
-1. `files`: 0.1 to 0.3 are done (0.3's "Other application…" dialog is put off). 0.4 from [docs/files-roadmap.md](docs/files-roadmap.md) is under way: selecting, thumbnails, rename, new folder, the trash, delete and undo, then copy, cut and paste with progress and the clipboard are in; next are drag and drop and properties. files is a mouse-first explorer, not a keyboard-first one.
+1. `files`: 0.1 to 0.3 are done (0.3's "Other application…" dialog is put off). 0.4 from [docs/files-roadmap.md](docs/files-roadmap.md) is under way: selecting, thumbnails, rename, new folder, the trash, delete and undo, then copy, cut and paste with progress and the clipboard, and drag and drop are in; next is properties. files is a mouse-first explorer, not a keyboard-first one.
 2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
 3. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
@@ -243,7 +243,7 @@ A graphical file manager that works like a normal explorer, mouse first with the
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
 | 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Done, but for the "Other application…" dialog (put off) |
-| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | In progress: selecting, rename, new folder, trash, delete, undo, copy, move and paste done |
+| 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | In progress: selecting, rename, new folder, trash, delete, undo, copy, move, paste, drag and drop done |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Not started |
