@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MARK_VERSION "0.4.0"
+#define MARK_VERSION "0.5.0"
 
 /* Exit statuses. */
 enum {
@@ -149,10 +149,25 @@ enum {
 
 #define COLOR_NONE (-1)
 
+/* Colors 256 and up are roles, resolved when written: the wallpaper's
+   palette in RGB, or the ANSI colors deal derives from it. */
+enum {
+    COLOR_ACCENT = 256,
+    COLOR_HIGHLIGHT,
+    COLOR_MUTED,
+    COLOR_SHADE,         /* Code backgrounds. */
+    COLOR_BORDER,        /* Table lines. */
+    COLOR_SELECTION,     /* Search matches and the focused link. */
+    COLOR_SELECTED_TEXT,
+    COLOR_BACKGROUND,
+    COLOR_ROLE_END,
+};
+#define ROLE_COUNT (COLOR_ROLE_END - COLOR_ACCENT)
+
 struct style {
     uint8_t attr;
     uint8_t underline;
-    int16_t fg, bg, underline_color; /* 0–255, or COLOR_NONE. */
+    int16_t fg, bg, underline_color; /* 0–255, a role, or COLOR_NONE. */
 };
 
 /* One character cell or a wide pair, with its combining marks. A glyph
@@ -196,17 +211,31 @@ struct page {
     size_t target_cap;
     struct heading *headings;
     size_t heading_count, heading_cap;
+    int *block_lines;    /* Each block's first source line, from 1, for the editor. */
+    size_t block_line_cap;
 };
 
 struct options {
     int width;           /* 0: pick from the terminal. */
     bool styled;         /* Escape sequences at all (off with --plain). */
     bool color;          /* Colors (off with NO_COLOR). */
+    bool palette;        /* Roles in the palette's RGB, not ANSI colors. */
+    uint32_t roles[ROLE_COUNT]; /* 0xRRGGBB, with palette. */
     const char *path;    /* NULL for standard input. */
     char *file_url;      /* file://host/dir/name.md, or NULL for stdin. */
     char *dir_url;       /* file://host/dir/ */
     bool pager;          /* Laid out for the pager: wide tables aren't cut. */
-    bool no_pager;       /* --no-pager */
+    bool no_pager;       /* --no-pager, or [pager] enable = false. */
+
+    /* mark.conf */
+    int width_limit;     /* [layout] width: the widest text gets; 0 for none. */
+    int margin;          /* [layout] margin: blank columns left of the text in the pager. */
+    bool want_palette;   /* [colors] source = palette. */
+    char *palette_path;
+    bool mouse;          /* [pager] mouse */
+    int wheel_lines;
+    char *opener;        /* [links] open */
+    char *warning;       /* The first problem in the config, for the status line. */
 #ifdef MARK_TEST
     bool html;
     bool commonmark; /* No extensions, for the CommonMark examples. */

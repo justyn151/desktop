@@ -33,6 +33,7 @@ build/
 !/deal/deal.conf
 !/shot/shot.conf
 !/view/view.conf
+!/mark/mark.conf
 *.local
 *.local.*
 

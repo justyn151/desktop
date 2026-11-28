@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=mark
+GenericName=Markdown Viewer
+Comment=Read markdown files in the terminal
+Exec=mark %f
+Terminal=true
+Categories=Utility;TextTools;Viewer;
+MimeType=text/markdown;text/x-markdown;

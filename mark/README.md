@@ -1,8 +1,8 @@
 # mark
 
-`mark` shows markdown in the terminal. It lays a file out for the terminal's width, with real bold and italic, underlined links you can Ctrl+click in deal, shaded code blocks and box-drawn tables, and shows it in its own pager, where you can follow links between files, search, and jump between headings. The config file and the wallpaper's colors come next; what's left is in [docs/mark-roadmap.md](../docs/mark-roadmap.md).
+`mark` shows markdown in the terminal. It lays a file out for the terminal's width, with real bold and italic, underlined links you can Ctrl+click in deal, shaded code blocks and box-drawn tables, and shows it in its own pager, where you can follow links between files, search, and jump between headings. It takes its colors from the wallpaper, reloads the file when it's saved, so it works as a live preview beside an editor, and `e` opens the file in your editor at the part you're reading. What's left before 1.0 is in [docs/mark-roadmap.md](../docs/mark-roadmap.md).
 
-The parser is hand-written and follows CommonMark 0.31.2, passing all 652 of the spec's examples, plus GitHub's tables, strikethrough, task lists and bare-URL autolinks, passing GitHub's 21 examples for them. It's one `mark.c` and one `mark.h` with nothing beyond the C library.
+The parser is hand-written and follows CommonMark 0.31.2, passing all 652 of the spec's examples, plus GitHub's tables, strikethrough, task lists and bare-URL autolinks, passing GitHub's 21 examples for them. It's one `mark.c` and one `mark.h`, plus desk's config parser, palette reader and file watch, with nothing beyond the C library.
 
 ## Build
 
@@ -11,8 +11,11 @@ On Arch Linux the build needs `gcc` and `make`. `make check` also uses `python3`
 ```sh
 make
 make check        # golden outputs, exit codes, the spec's examples, pathological inputs
-make install      # /usr/local/bin/mark; honors PREFIX, BINDIR and DESTDIR
+make install      # /usr/local/bin/mark and mark.desktop; honors PREFIX, BINDIR, DATADIR and DESTDIR
+make default      # make mark the default for text/markdown, with xdg-mime
 ```
+
+`make install PREFIX=~/.local` installs it next to deal. The desktop entry runs mark in a terminal (`Terminal=true`), so run starts it in deal and file managers open markdown files with it.
 
 ## Usage
 
@@ -29,7 +32,7 @@ mark [OPTIONS] [FILE]
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show the version |
 
-Without `--width`, text is as wide as the terminal up to 80 columns, so long lines stay readable in a wide window. When the output isn't a terminal, the width is 80.
+Without `--width`, text is as wide as the terminal up to `[layout] width` (80), so long lines stay readable in a wide window. When the output isn't a terminal, the width is `[layout] width`, or 80 when that's 0.
 
 When standard output is a terminal, mark shows the document in its pager (below). Otherwise it prints the document and exits. Printed output keeps its escape sequences (`mark README.md | less -R` works); `--plain` drops them. Setting `NO_COLOR` drops the colors but keeps bold, italic and underlines.
 
@@ -53,6 +56,7 @@ The document opens on the terminal's alternate screen, so quitting leaves the sh
 | `/`, `?` | Search forward, backward; `n` and `N` repeat it |
 | `]`, `[` | Next, previous heading |
 | `o` | Outline of the headings: move with `j`/`k`, Enter jumps |
+| `e` | Edit the file at the part on screen, then come back |
 | Mouse wheel | Three lines per notch; a horizontal wheel scrolls sideways |
 | Escape | Clear a focused link or search highlights; with neither, quit |
 | `q`, Ctrl+C | Quit |
@@ -89,7 +93,7 @@ Resizing the window reflows the text and keeps the paragraph you were reading at
 
 Text wraps at spaces; a word longer than the line breaks where it must. Widths come from `wcwidth`, the same as deal, so wide characters (CJK, emoji) and combining accents line up.
 
-Colors are the terminal's: blue (4) for the accent, yellow (3) for code, bright black (8) for muted text, and black (0) shading code. deal derives all sixteen from the wallpaper, where 8 is the palette's muted color and 0 the background lifted slightly, so mark already follows the wallpaper there. 0.5 switches to the palette's own colors.
+Colors are described under [Colors](#colors) below.
 
 Relative links point at the file next to the document (`file://host/path`), and `#anchor` links point into the document itself. Read from standard input, relative links aren't linked. deal opens only HTTP and HTTPS links on Ctrl+click.
 
@@ -109,13 +113,50 @@ Only the most common named entities are known (`&copy;`, `&mdash;`, `&nbsp;` and
 | 1 | The file couldn't be read, or was larger than 64 MiB |
 | 2 | Usage error, or standard input is a terminal |
 
+## Configuration
+
+mark reads `~/.config/mark/mark.conf` (or `$XDG_CONFIG_HOME/mark/mark.conf`), and writes the commented sample, [mark.conf](mark.conf), there the first time it runs. The command line wins over it. A mistake is reported with its line number, on standard error and on the pager's status line, and that setting keeps its default. Comments go on lines of their own.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `[layout] width` | `80` | The widest the text gets; `0` follows the terminal |
+| `[layout] margin` | `2` | Blank columns left of the text in the pager. It shrinks on narrow terminals |
+| `[colors] source` | `palette` | `palette` for wall's colors in RGB, `ansi` for the terminal's 16 colors |
+| `[pager] enable` | `true` | `false` prints, like `--no-pager` |
+| `[pager] mouse` | `true` | Wheel and click reports. With them on, hold Shift to select text in deal |
+| `[pager] wheel_lines` | `3` | Lines per wheel notch |
+| `[links] open` | `xdg-open` | The command for links that aren't markdown. It runs through `sh`, so it can have arguments; the URL comes last |
+
+## Colors
+
+With `source = palette`, colors come from the palette wall writes for the wallpaper (`~/.cache/wall/colors.conf`): `accent` for headings, bullets and link underlines, `highlight` for code, `muted` for quotes, rules and the dim parts of headings, `border_inactive` for tables, the selection colors for search matches and the focused link, and a shade a little toward the foreground from the background behind code. Text without a color of its own stays in the terminal's foreground. The pager watches the palette, so a new wallpaper recolors an open document.
+
+With `source = ansi`, or when there's no palette, the same roles use the terminal's colors: blue (4), yellow (3), bright black (8), and black (0) behind code. deal derives all sixteen from the wallpaper too, so they also follow it, more loosely. `NO_COLOR` turns colors off either way.
+
+## Live preview and editing
+
+The pager watches the open file. When it's saved, whether replaced or written in place, mark reads it again and keeps the line at the top of the screen where it was, even when text was added or removed above it. Open the file in lead in one tile and mark in the next to see it as you write.
+
+`e` opens the file in `$VISUAL`, `$EDITOR` or `editor` (lead), at the source line of the block at the top of the screen (`editor +N file`), and returns to the same place when the editor exits. Ctrl+C in the editor doesn't quit mark.
+
 ## Tests
 
 `make check` runs `tests/run.sh`:
 
 - Each `tests/NAME.md` must render to `NAME.txt` with `--plain`, and to `NAME.ansi` with escapes. A name ending in `-N` renders at width `N`.
 - Exit codes, standard input, line endings, invalid UTF-8 and `NO_COLOR`.
+- The config: written on first run and read back without complaints; `[layout] width` and `--width` over it; typos reported with their line. The palette's colors on headings, code and tables, and none with `source = ansi` or `NO_COLOR`. The tests use a config and cache directory of their own, so yours doesn't change the results.
 - `tests/commonmark.py` runs the CommonMark 0.31.2 examples (`tests/spec.json`) through a test build with extra `--html` and `--commonmark` options and compares the HTML, does the same for GitHub's examples of the extensions (`tests/gfm.json`, from cmark-gfm's `test/spec.txt`), then times inputs that make naive parsers quadratic (thousands of unclosed brackets, emphasis or comments, deep nesting, one very long line, huge tables). Each must finish within two seconds.
+
+## Manual checks (0.5)
+
+Checked offline in a pty: the margin; reloading on a replaced file and an in-place write, keeping the top line when a paragraph is added above; `e` with a stand-in editor (`+5 file`), coming back at the same place with its change shown, and Ctrl+C in the editor leaving mark running; a palette change recoloring the screen; a configured opener with arguments and a missing one; a config typo on the status line; `mouse = false`. Under ASan and UBSan too. lead opens at `+N`, past the end at the last line.
+
+- [ ] Changing the wallpaper recolors an open mark within a second.
+- [ ] Saving the file in lead in another tile updates mark without losing your place.
+- [ ] `e` opens lead at the right line and comes back to the same place.
+- [ ] After `make install PREFIX=~/.local`, run lists mark; `make default` makes markdown files open in it.
+- [ ] A typo in `mark.conf` shows its line on the status line and the rest still works.
 
 ## Manual checks (0.4)
 

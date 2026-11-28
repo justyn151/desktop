@@ -294,11 +294,23 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 
 ### Manual checks
 
-- Changing the wallpaper recolors an open mark within a second.
-- Saving the file in lead in another tile updates mark without losing the scroll position.
-- `e` opens lead at the right line and returns to the same place.
-- `run` lists mark and opens a file in a new deal window.
-- A config typo reports the line number and falls back to defaults.
+- [ ] Changing the wallpaper recolors an open mark within a second.
+- [ ] Saving the file in lead in another tile updates mark without losing the scroll position.
+- [ ] `e` opens lead at the right line and returns to the same place.
+- [ ] `run` lists mark and opens a file in a new deal window.
+- [ ] A config typo reports the line number and falls back to defaults.
+
+### As built
+
+- The sample config has its comments on lines of their own: desk's INI parser treats only whole lines as comments, so `width = 80 ; …` would be an invalid value. `make check` now checks the sample reads without complaints. Defaults come from parsing the embedded sample, as in view, so they live in one place. A problem goes to stderr with the full path and line, and the first one also to the pager's status line as `mark.conf:LINE: …`, since the pager's screen hides stderr.
+- `--no-pager` is kept apart from `[pager] enable`, so the config can't turn it back off. `--width` fixes the width; `[layout] width` is a limit the terminal can go under.
+- `margin` applies in the pager only, so printed output stays as it was, and it gives way to at most a quarter of the terminal's width.
+- Colors 256 and up are roles, resolved when written: RGB (`38;2;r;g;b`, and `58:2::r:g:b` for underlines) from the palette, or the ANSI colors as before. Tables use their own role, `border_inactive`. The code shade is the background moved 20/256 toward the foreground. Matches and the focused link take the selection colors with the palette and stay reversed with ANSI colors; the current match is the highlight color on either.
+- Reload doesn't use the block anchor alone: block numbers shift when a block is added above. It finds the first non-blank line on screen again, the nearest identical line to where it was, and falls back to the block anchor when that text is gone. Both a replaced file and an in-place write reload; a file that can't be read mid-save keeps the old one.
+- The pager now owns the first document, so it can reload it like the others.
+- `e`: `sh -c 'exec $EDITOR "$@"' sh +N FILE`, so `EDITOR` can carry arguments. The line is the parser's `start_line` of the block at the top. While the editor runs, SIGINT and SIGQUIT are ignored, and set to ignore once more afterwards: blocked as they are, a Ctrl+C sent to the editor would otherwise stay pending and quit mark after. lead got `+N` in its own commit; a line past the end lands on the last line.
+- `[links] open` runs through `sh` too, with the URL as its last argument, after a check that its program is on `PATH`, since a detached child can't report that it wasn't found.
+- Starting mark from run with no file prints the usage and exits, so the window closes at once; the entry is for opening files from a file manager or `xdg-open`.
 
 ---
 
@@ -330,5 +342,5 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 | 0.2 | GitHub tables, strikethrough, task lists, extended autolinks | Done (21/21 GitHub examples; live checks in deal pending) |
 | 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Done (live checks in deal pending) |
 | 0.4 | Following links, back stack, search, heading jumps, outline | Done (live checks in deal pending) |
-| 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Not started |
+| 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Done (live checks in deal pending) |
 | 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Final |
