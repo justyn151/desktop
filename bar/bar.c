@@ -78,7 +78,7 @@ struct hit_span {
 struct hit_map {
     int height;
     struct hit_span tags[BAR_MAX_WORKSPACES];
-    struct hit_span network;
+    struct hit_span network, volume;
 };
 
 struct command {
@@ -106,13 +106,33 @@ struct network {
     char ssid[NM_SSID_SIZE];
 };
 
+enum { VOLUME_LABEL_SIZE = BAR_VOLUME_TEXT_SIZE + 16 };
+
+/* The [volume] command's output: the last line it printed. */
+struct volume_feed {
+    pid_t pid;
+    int fd;
+    int64_t started, retry, delay;
+    char partial[256];
+    size_t used;
+    bool overflow, have, changed, muted;
+    int percent;
+    char raw[VOLUME_LABEL_SIZE];  /* A line that isn't wpctl's format, shown as it is. */
+};
+
 struct appearance {
     struct bar_config config;
     FT_Face font;
-    struct text_bounds labels[BAR_MAX_WORKSPACES], right_bounds, network_bounds;
-    size_t network_length;
+    struct text_bounds labels[BAR_MAX_WORKSPACES], right_bounds, network_bounds, volume_bounds;
+    /* The right text is volume, network and clock; these place the first two in it. */
+    size_t network_length, network_offset, volume_length;
+    int network_x, volume_advance;
+    bool volume_muted;
     struct command network_command;
-    char right_text[BAR_CLOCK_TEXT_SIZE + BAR_NETWORK_SEPARATOR_SIZE + NETWORK_LABEL_SIZE];
+    struct command volume_command, volume_click, volume_middle_click;
+    struct command volume_scroll_up, volume_scroll_down;
+    char right_text[BAR_CLOCK_TEXT_SIZE + 2 * BAR_NETWORK_SEPARATOR_SIZE + NETWORK_LABEL_SIZE +
+                    VOLUME_LABEL_SIZE];
     uint32_t background;
 };
 
@@ -269,13 +289,15 @@ struct bar {
     double pointer_x, pointer_y;
     double axis_delta, axis_remainder;
     int64_t axis_value120, wheel_remainder;
-    bool axis_stop, scroll_over_tags;
+    bool axis_stop;
+    int scroll_target;  /* SCROLL_NONE, SCROLL_TAGS or SCROLL_VOLUME */
     struct hit_map hits;
     struct wl_list buffers;
     FT_Library freetype;
     struct appearance appearance, pending;
     struct network network;
     pid_t network_child;
+    struct volume_feed volume;
     sigset_t child_mask;
     FcConfig *font_config;
     char *config_path;
@@ -387,8 +409,8 @@ static bool load_theme_palette(const char *path, uint32_t rgb[THEME_ROLE_COUNT])
     return ok;
 }
 
-enum section { BAR_SECTION, FONT_SECTION, WORKSPACE_SECTION, CLOCK_SECTION, NETWORK_SECTION, THEME_SECTION };
-static const char *const sections[] = {"bar", "font", "workspaces", "clock", "network", "theme"};
+enum section { BAR_SECTION, FONT_SECTION, WORKSPACE_SECTION, CLOCK_SECTION, NETWORK_SECTION, VOLUME_SECTION, THEME_SECTION };
+static const char *const sections[] = {"bar", "font", "workspaces", "clock", "network", "volume", "theme"};
 
 enum value_type { PIXELS, COLOR, OPACITY, SCALE, POSITION, BOOLEAN, STRING, LABELS, QUOTED_STRING, THEME_SOURCE, ACTIVE_STYLE };
 
@@ -428,6 +450,14 @@ static const struct config_key keys[] = {
     KEY(NETWORK_SECTION, "custom_text", QUOTED_STRING, network_custom_text, 0, BAR_NETWORK_TEXT_SIZE - 1),
     KEY(NETWORK_SECTION, "click_enabled", BOOLEAN, network_click_enabled, 0, 0),
     KEY(NETWORK_SECTION, "command", STRING, network_command, 1, BAR_NETWORK_COMMAND_SIZE - 1),
+    KEY(VOLUME_SECTION, "enabled", BOOLEAN, volume_enabled, 0, 0),
+    KEY(VOLUME_SECTION, "custom_text", QUOTED_STRING, volume_custom_text, 0, BAR_VOLUME_TEXT_SIZE - 1),
+    KEY(VOLUME_SECTION, "muted_color", COLOR, volume_muted_color, 0, 0),
+    KEY(VOLUME_SECTION, "command", STRING, volume_command, 0, BAR_NETWORK_COMMAND_SIZE - 1),
+    KEY(VOLUME_SECTION, "click", STRING, volume_click, 0, BAR_NETWORK_COMMAND_SIZE - 1),
+    KEY(VOLUME_SECTION, "middle_click", STRING, volume_middle_click, 0, BAR_NETWORK_COMMAND_SIZE - 1),
+    KEY(VOLUME_SECTION, "scroll_up", STRING, volume_scroll_up, 0, BAR_NETWORK_COMMAND_SIZE - 1),
+    KEY(VOLUME_SECTION, "scroll_down", STRING, volume_scroll_down, 0, BAR_NETWORK_COMMAND_SIZE - 1),
     KEY(THEME_SECTION, "source", THEME_SOURCE, wallpaper_theme, 0, 0),
 };
 #undef KEY
@@ -797,6 +827,21 @@ static struct text_bounds draw_text(FT_Face font, const char *text, uint32_t col
     return (struct text_bounds){min_x - start, max_x - min_x};
 }
 
+/* How far draw_text moves the pen over the first LENGTH bytes of TEXT. */
+static int text_advance(FT_Face font, const char *text, size_t length)
+{
+    int pen = 0;
+    const unsigned char *c = (const unsigned char *)text, *end = c + length;
+    while (c < end && *c) {
+        uint32_t code = utf8_next(&c);
+        if (code < 0x20 || code == 0x7f)
+            code = ' ';
+        if (!FT_Load_Char(font, code, FT_LOAD_NO_BITMAP))
+            pen += (int)(font->glyph->advance.x / 64);
+    }
+    return pen;
+}
+
 #define NM_SERVICE "org.freedesktop.NetworkManager"
 #define NM_ROOT "/org/freedesktop/NetworkManager"
 #define NM_ACTIVE NM_SERVICE ".Connection.Active"
@@ -1131,7 +1176,23 @@ static void service_network(struct network *network, bool enabled, struct pollfd
         *deadline = network->retry;
 }
 
-static bool update_right_text(struct appearance *appearance, const struct network *network)
+static void volume_label(const struct bar_config *config, const struct volume_feed *volume,
+                         char label[VOLUME_LABEL_SIZE])
+{
+    label[0] = '\0';
+    if (!config->volume_enabled || !volume->have)
+        return;
+    const char *prefix = config->volume_custom_text, *space = *prefix ? " " : "";
+    if (volume->raw[0])
+        snprintf(label, VOLUME_LABEL_SIZE, "%s", volume->raw);
+    else if (volume->muted)
+        snprintf(label, VOLUME_LABEL_SIZE, "%s%smuted", prefix, space);
+    else
+        snprintf(label, VOLUME_LABEL_SIZE, "%s%s%d%%", prefix, space, volume->percent);
+}
+
+static bool update_right_text(struct appearance *appearance, const struct network *network,
+                              const struct volume_feed *volume)
 {
     const struct bar_config *config = &appearance->config;
     char clock[BAR_CLOCK_TEXT_SIZE] = "";
@@ -1163,17 +1224,44 @@ static bool update_right_text(struct appearance *appearance, const struct networ
             break;
         }
     }
+    char sound[VOLUME_LABEL_SIZE];
+    volume_label(config, volume, sound);
+    bool muted = sound[0] && !volume->raw[0] && volume->muted;
 
+    /* Volume, network and clock, with the separator between those present. */
     char text[sizeof appearance->right_text];
-    snprintf(text, sizeof text, "%s%s%s", label,
-             *label && *clock ? config->network_separator : "", clock);
-    size_t network_length = strlen(label);
-    if (!strcmp(appearance->right_text, text) && appearance->network_length == network_length)
+    const char *parts[] = {sound, label, clock};
+    size_t starts[3] = {0}, length = 0;
+    text[0] = '\0';
+    for (size_t i = 0; i < 3; ++i) {
+        if (!*parts[i]) {
+            starts[i] = length;
+            continue;
+        }
+        if (length)
+            length += (size_t)snprintf(text + length, sizeof text - length, "%s",
+                                       config->network_separator);
+        if (length >= sizeof text)
+            length = sizeof text - 1;
+        starts[i] = length;
+        length += (size_t)snprintf(text + length, sizeof text - length, "%s", parts[i]);
+        if (length >= sizeof text)
+            length = sizeof text - 1;
+    }
+    size_t network_length = strlen(label), volume_length = strlen(sound);
+    if (!strcmp(appearance->right_text, text) && appearance->network_length == network_length &&
+        appearance->volume_length == volume_length && appearance->volume_muted == muted)
         return false;
     strcpy(appearance->right_text, text);
     appearance->right_bounds = draw_text(appearance->font, text, 0, NULL, 0, 0, 0, 0);
     appearance->network_bounds = draw_text(appearance->font, label, 0, NULL, 0, 0, 0, 0);
+    appearance->volume_bounds = draw_text(appearance->font, sound, 0, NULL, 0, 0, 0, 0);
     appearance->network_length = network_length;
+    appearance->network_offset = starts[1];
+    appearance->network_x = text_advance(appearance->font, text, starts[1]);
+    appearance->volume_length = volume_length;
+    appearance->volume_advance = text_advance(appearance->font, text, volume_length);
+    appearance->volume_muted = muted;
     return true;
 }
 
@@ -1231,6 +1319,16 @@ static bool parse_command(struct command *command, const char *input)
     return command->count && command->text[0] != '\0';
 }
 
+/* An empty command is allowed and does nothing. */
+static bool parse_optional_command(struct command *command, const char *input)
+{
+    if (!input[strspn(input, " \t")]) {
+        command->count = 0;
+        return true;
+    }
+    return parse_command(command, input);
+}
+
 static void read_bar_palette(struct bar *bar)
 {
     if (load_theme_palette(bar->theme_watch.path, bar->theme_palette))
@@ -1249,6 +1347,7 @@ static bool apply_bar_palette(struct appearance *appearance, const uint32_t pale
         {&config->background, THEME_BACKGROUND}, {&config->foreground, THEME_FOREGROUND},
         {&config->active_color, THEME_HIGHLIGHT}, {&config->occupied_color, THEME_ACCENT},
         {&config->inactive_color, THEME_MUTED}, {&config->urgent_color, THEME_URGENT},
+        {&config->volume_muted_color, THEME_MUTED},
     };
     bool changed = false;
     for (size_t i = 0; i < sizeof mapping / sizeof mapping[0]; ++i) {
@@ -1299,6 +1398,23 @@ static bool load_appearance(struct bar *bar, struct appearance *appearance)
                 bar->config_path ? bar->config_path : "defaults");
         return false;
     }
+    const struct {
+        struct command *command;
+        const char *text, *name;
+    } volume_commands[] = {
+        {&candidate.volume_command, config->volume_command, "command"},
+        {&candidate.volume_click, config->volume_click, "click"},
+        {&candidate.volume_middle_click, config->volume_middle_click, "middle_click"},
+        {&candidate.volume_scroll_up, config->volume_scroll_up, "scroll_up"},
+        {&candidate.volume_scroll_down, config->volume_scroll_down, "scroll_down"},
+    };
+    for (size_t i = 0; i < sizeof volume_commands / sizeof volume_commands[0]; ++i) {
+        if (!parse_optional_command(volume_commands[i].command, volume_commands[i].text)) {
+            fprintf(stderr, "bar: %s: invalid [volume] %s\n",
+                    bar->config_path ? bar->config_path : "defaults", volume_commands[i].name);
+            return false;
+        }
+    }
     if (!scale_dimensions(config, bar->config_path ? bar->config_path : "defaults"))
         return false;
     if (!valid_clock_format(config)) {
@@ -1324,7 +1440,7 @@ static bool load_appearance(struct bar *bar, struct appearance *appearance)
     }
     for (size_t i = 0; i < config->label_count; ++i)
         candidate.labels[i] = draw_text(candidate.font, config->labels[i], 0, NULL, 0, 0, 0, 0);
-    update_right_text(&candidate, &bar->network);
+    update_right_text(&candidate, &bar->network, &bar->volume);
     *appearance = candidate;
     return true;
 }
@@ -1550,10 +1666,30 @@ static void paint(const struct bar *bar, const struct appearance *appearance,
     }
 
     int pen = right_start(bar, appearance) - appearance->right_bounds.left;
-    draw_text(appearance->font, appearance->right_text, config->foreground, pixels, width, height,
-              pen, config->padding);
+    if (appearance->volume_length) {
+        char sound[VOLUME_LABEL_SIZE];
+        memcpy(sound, appearance->right_text, appearance->volume_length);
+        sound[appearance->volume_length] = '\0';
+        draw_text(appearance->font, sound,
+                  appearance->volume_muted ? config->volume_muted_color : config->foreground,
+                  pixels, width, height, pen, config->padding);
+        draw_text(appearance->font, appearance->right_text + appearance->volume_length,
+                  config->foreground, pixels, width, height, pen + appearance->volume_advance,
+                  config->padding);
+        int start = pen + appearance->volume_bounds.left;
+        int end = start + appearance->volume_bounds.width;
+        if (start < config->padding)
+            start = config->padding;
+        if (end > width)
+            end = width;
+        if (start < end)
+            hits->volume = (struct hit_span){start, end};
+    } else {
+        draw_text(appearance->font, appearance->right_text, config->foreground, pixels, width,
+                  height, pen, config->padding);
+    }
     if (config->network_click_enabled && appearance->network_bounds.width > 0) {
-        int start = pen + appearance->network_bounds.left;
+        int start = pen + appearance->network_x + appearance->network_bounds.left;
         int end = start + appearance->network_bounds.width;
         if (start < 0)
             start = 0;
@@ -1666,6 +1802,8 @@ static bool set_input_region(struct bar *bar, const struct hit_map *hits)
     }
     if (hits->network.end > hits->network.start)
         wl_region_add(region, hits->network.start, 0, hits->network.end - hits->network.start, hits->height);
+    if (hits->volume.end > hits->volume.start)
+        wl_region_add(region, hits->volume.start, 0, hits->volume.end - hits->volume.start, hits->height);
     wl_surface_set_input_region(bar->surface, region);
     wl_region_destroy(region);
     return true;
@@ -1717,7 +1855,7 @@ static void queue_reload(struct bar *bar)
 
 static void apply_reload(struct bar *bar)
 {
-    update_right_text(&bar->pending, &bar->network);
+    update_right_text(&bar->pending, &bar->network, &bar->volume);
     struct workspace_view view = layout_workspaces(bar, &bar->pending);
     const struct bar_config *old = &bar->appearance.config;
     const struct bar_config *next = &bar->pending.config;
@@ -1729,6 +1867,10 @@ static void apply_reload(struct bar *bar)
         if (!bar->redraw)
             wl_surface_commit(bar->surface);
     } else {
+        /* A different volume command starts over; the text waits for its first line. */
+        if (next->volume_enabled != old->volume_enabled ||
+            strcmp(next->volume_command, old->volume_command))
+            bar->volume.retry = -1;
         FT_Done_Face(bar->appearance.font);
         bar->appearance = bar->pending;
         bar->workspaces = view;
@@ -1911,24 +2053,29 @@ static const struct wl_surface_listener surface_listener = {
     .leave = surface_leave,
 };
 
-static void reap_network_child(struct bar *bar)
+static void reap_children(struct bar *bar)
 {
-    if (bar->network_child <= 0)
-        return;
-    pid_t result;
-    do {
-        result = waitpid(bar->network_child, NULL, WNOHANG);
-    } while (result < 0 && errno == EINTR);
-    if (result > 0 || (result < 0 && errno == ECHILD))
-        bar->network_child = 0;
+    for (;;) {
+        pid_t pid = waitpid(-1, NULL, WNOHANG);
+        if (pid < 0 && errno == EINTR)
+            continue;
+        if (pid < 0 && errno == ECHILD)
+            bar->network_child = bar->volume.pid = 0;
+        if (pid <= 0)
+            return;
+        if (pid == bar->network_child)
+            bar->network_child = 0;
+        if (pid == bar->volume.pid)
+            bar->volume.pid = 0;
+    }
 }
 
-static int spawn_network_child(struct bar *bar)
+/* OUTPUT >= 0 becomes the child's stdout, and the child gets its own process group. */
+static int spawn_command(struct bar *bar, const struct command *command, int output, pid_t *pid)
 {
-    struct command *command = &bar->appearance.network_command;
     char *argv[BAR_NETWORK_COMMAND_SIZE / 2 + 1];
     for (size_t i = 0; i < command->count; i++)
-        argv[i] = command->text + command->offsets[i];
+        argv[i] = (char *)command->text + command->offsets[i];
     argv[command->count] = NULL;
 
     posix_spawnattr_t attributes;
@@ -1937,19 +2084,20 @@ static int spawn_network_child(struct bar *bar)
         return error;
     error = posix_spawnattr_setsigmask(&attributes, &bar->child_mask);
     if (!error)
-        error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK);
+        error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK |
+                                         (output >= 0 ? POSIX_SPAWN_SETPGROUP : 0));
+    if (!error && output >= 0)
+        error = posix_spawnattr_setpgroup(&attributes, 0);
 
     posix_spawn_file_actions_t files;
     if (!error)
         error = posix_spawn_file_actions_init(&files);
     if (!error) {
         error = posix_spawn_file_actions_addopen(&files, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-        if (!error) {
-            pid_t pid;
-            error = posix_spawnp(&pid, argv[0], &files, &attributes, argv, environ);
-            if (!error)
-                bar->network_child = pid;
-        }
+        if (!error && output >= 0)
+            error = posix_spawn_file_actions_adddup2(&files, output, STDOUT_FILENO);
+        if (!error)
+            error = posix_spawnp(pid, argv[0], &files, &attributes, argv, environ);
         posix_spawn_file_actions_destroy(&files);
     }
     posix_spawnattr_destroy(&attributes);
@@ -1958,13 +2106,144 @@ static int spawn_network_child(struct bar *bar)
 
 static void launch_network(struct bar *bar)
 {
-    reap_network_child(bar);
+    reap_children(bar);
     if (bar->network_child)
         return;
 
-    int error = spawn_network_child(bar);
+    int error = spawn_command(bar, &bar->appearance.network_command, -1, &bar->network_child);
     if (error)
         fprintf(stderr, "bar: could not launch [network] command: %s\n", strerror(error));
+}
+
+/* One-shot commands for clicks and scrolling; SIGCHLD reaps them. */
+static void run_volume_command(struct bar *bar, const struct command *command, const char *name)
+{
+    if (!command->count)
+        return;
+    pid_t pid;
+    int error = spawn_command(bar, command, -1, &pid);
+    if (error)
+        fprintf(stderr, "bar: could not run [volume] %s: %s\n", name, strerror(error));
+}
+
+static void stop_volume(struct volume_feed *volume)
+{
+    if (volume->fd >= 0)
+        close(volume->fd);
+    volume->fd = -1;
+    if (volume->pid > 0)
+        kill(-volume->pid, SIGTERM);  /* The whole group, so a pipeline doesn't linger. */
+    volume->pid = 0;
+    volume->used = 0;
+    volume->overflow = false;
+    if (volume->have)
+        volume->changed = true;
+    volume->have = false;
+}
+
+static void start_volume(struct bar *bar, int64_t now)
+{
+    struct volume_feed *volume = &bar->volume;
+    int pipe_fds[2];
+    if (pipe2(pipe_fds, O_CLOEXEC) < 0) {
+        volume->retry = now + 30000;
+        return;
+    }
+    pid_t pid;
+    int error = spawn_command(bar, &bar->appearance.volume_command, pipe_fds[1], &pid);
+    close(pipe_fds[1]);
+    if (error) {
+        fprintf(stderr, "bar: could not start [volume] command: %s\n", strerror(error));
+        close(pipe_fds[0]);
+        volume->retry = now + 30000;
+        return;
+    }
+    fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK);
+    volume->fd = pipe_fds[0];
+    volume->pid = pid;
+    volume->started = now;
+}
+
+/* "Volume: 0.30" or "Volume: 0.30 [MUTED]" from wpctl or vol; anything else as it is. */
+static void volume_line(struct volume_feed *volume, const char *line)
+{
+    double level;
+    int used = 0;
+    const char *rest = NULL;
+    if (sscanf(line, "Volume: %lf%n", &level, &used) == 1 && used > 0 && isfinite(level) &&
+        level >= 0 && level <= 10)
+        rest = line + used;
+    if (rest && (!*rest || !strcmp(rest, " [MUTED]"))) {
+        volume->percent = (int)(level * 100 + 0.5);
+        volume->muted = *rest != '\0';
+        volume->raw[0] = '\0';
+    } else {
+        size_t length = 0;
+        for (const unsigned char *c = (const unsigned char *)line;
+             *c && length + 1 < sizeof volume->raw; ++c)
+            if (*c >= 0x20 && *c != 0x7f)
+                volume->raw[length++] = (char)*c;
+        volume->raw[length] = '\0';
+        if (!length)
+            return;
+    }
+    volume->have = volume->changed = true;
+}
+
+static void read_volume(struct volume_feed *volume, int64_t now)
+{
+    char bytes[1024];
+    for (int round = 0; round < 16; ++round) {
+        ssize_t count = read(volume->fd, bytes, sizeof bytes);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count < 0 && errno == EAGAIN)
+            return;
+        if (count <= 0) {
+            /* Restart after a second, backing off to 30 s while it keeps exiting early. */
+            stop_volume(volume);
+            if (now - volume->started > 10000 || !volume->delay)
+                volume->delay = 1000;
+            else if (volume->delay < 30000)
+                volume->delay *= 2;
+            volume->retry = now + volume->delay;
+            return;
+        }
+        for (ssize_t i = 0; i < count; ++i) {
+            if (bytes[i] == '\n') {
+                volume->partial[volume->used] = '\0';
+                if (!volume->overflow)
+                    volume_line(volume, volume->partial);
+                volume->used = 0;
+                volume->overflow = false;
+            } else if (volume->used + 1 < sizeof volume->partial) {
+                volume->partial[volume->used++] = bytes[i];
+            } else {
+                volume->overflow = true;
+            }
+        }
+    }
+}
+
+static void service_volume(struct bar *bar, struct pollfd *fd, int64_t now, int64_t *deadline)
+{
+    struct volume_feed *volume = &bar->volume;
+    *fd = (struct pollfd){.fd = -1};
+    if (volume->retry < 0) {
+        stop_volume(volume);
+        volume->retry = 0;
+        volume->delay = 0;
+    }
+    if (!bar->appearance.config.volume_enabled || !bar->appearance.volume_command.count) {
+        stop_volume(volume);
+        return;
+    }
+    if (volume->fd < 0 && now >= volume->retry)
+        start_volume(bar, now);
+    if (volume->fd >= 0)
+        *fd = (struct pollfd){.fd = volume->fd, .events = POLLIN};
+    else if (volume->retry < *deadline)
+        *deadline = volume->retry;
 }
 
 static bool pointer_hits(const struct bar *bar, struct hit_span span)
@@ -1982,7 +2261,17 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     (void)time;
     struct bar *bar = data;
     if (state != WL_POINTER_BUTTON_STATE_PRESSED ||
-        (button != BTN_LEFT && button != BTN_RIGHT))
+        (button != BTN_LEFT && button != BTN_RIGHT && button != BTN_MIDDLE))
+        return;
+
+    if (pointer_hits(bar, bar->hits.volume)) {
+        if (button == BTN_LEFT)
+            run_volume_command(bar, &bar->appearance.volume_click, "click");
+        else if (button == BTN_MIDDLE)
+            run_volume_command(bar, &bar->appearance.volume_middle_click, "middle_click");
+        return;
+    }
+    if (button == BTN_MIDDLE)
         return;
 
     if (button == BTN_LEFT && pointer_hits(bar, bar->hits.network)) {
@@ -2034,15 +2323,28 @@ static bool pointer_over_tags(const struct bar *bar)
     return false;
 }
 
+enum { SCROLL_NONE, SCROLL_TAGS, SCROLL_VOLUME };
+
+/* Positive steps scroll down. A fast wheel is capped so it can't start dozens of commands. */
+static void scroll_volume(struct bar *bar, int steps)
+{
+    const struct command *command = steps < 0 ? &bar->appearance.volume_scroll_up :
+                                                &bar->appearance.volume_scroll_down;
+    int count = steps < 0 ? -steps : steps;
+    for (int i = 0; i < count && i < 5; ++i)
+        run_volume_command(bar, command, steps < 0 ? "scroll_up" : "scroll_down");
+}
+
 static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
     (void)pointer;
     struct bar *bar = data;
-    bool target = pointer_over_tags(bar);
-    if (target != bar->scroll_over_tags) {
+    int target = pointer_over_tags(bar) ? SCROLL_TAGS :
+                 pointer_hits(bar, bar->hits.volume) ? SCROLL_VOLUME : SCROLL_NONE;
+    if (target != bar->scroll_target) {
         bar->axis_remainder = 0;
         bar->wheel_remainder = 0;
-        bar->scroll_over_tags = target;
+        bar->scroll_target = target;
     }
 
     int steps = 0;
@@ -2060,8 +2362,10 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
         bar->axis_remainder = total - steps * 10.0;
         bar->wheel_remainder = 0;
     }
-    if (steps)
+    if (steps && target == SCROLL_TAGS)
         scroll_tags(bar, steps);
+    else if (steps && target == SCROLL_VOLUME)
+        scroll_volume(bar, steps);
     if (bar->axis_stop) {
         bar->axis_remainder = 0;
         bar->wheel_remainder = 0;
@@ -2336,7 +2640,7 @@ static int status_input_flags(void)
     return flags;
 }
 
-enum { POLL_WAYLAND, POLL_SIGNALS, POLL_STATUS, POLL_NETWORK, POLL_THEME, POLL_COUNT };
+enum { POLL_WAYLAND, POLL_SIGNALS, POLL_STATUS, POLL_NETWORK, POLL_VOLUME, POLL_THEME, POLL_COUNT };
 
 static bool handle_signals(struct bar *bar, int fd)
 {
@@ -2344,7 +2648,7 @@ static bool handle_signals(struct bar *bar, int fd)
     bool reload = false;
     while (read(fd, &info, sizeof info) == sizeof info) {
         if (info.ssi_signo == SIGCHLD)
-            reap_network_child(bar);
+            reap_children(bar);
         else if (info.ssi_signo == SIGHUP)
             reload = true;
         else
@@ -2377,12 +2681,13 @@ static int run(struct bar *bar, int signals, int status_fd)
         bool enabled = bar->appearance.config.network_enabled;
         int64_t deadline = INT64_MAX;
         service_network(&bar->network, enabled, &fds[POLL_NETWORK], now, &deadline);
-        if (now >= bar->clock_next || bar->network.changed) {
-            if (update_right_text(&bar->appearance, &bar->network)) {
+        service_volume(bar, &fds[POLL_VOLUME], now, &deadline);
+        if (now >= bar->clock_next || bar->network.changed || bar->volume.changed) {
+            if (update_right_text(&bar->appearance, &bar->network, &bar->volume)) {
                 bar->redraw = true;
                 bar->layout_dirty = true;
             }
-            bar->network.changed = false;
+            bar->network.changed = bar->volume.changed = false;
             if (now >= bar->clock_next)
                 bar->clock_next = now + 1000;
         }
@@ -2433,6 +2738,8 @@ static int run(struct bar *bar, int signals, int status_fd)
         }
         if (fds[POLL_WAYLAND].revents & (POLLERR | POLLHUP | POLLNVAL))
             return -1;
+        if (fds[POLL_VOLUME].revents && bar->volume.fd == fds[POLL_VOLUME].fd)
+            read_volume(&bar->volume, monotonic_ms());
         if (theme_watch_changed(&bar->theme_watch, fds[POLL_THEME].revents))
             refresh_bar_palette(bar);
         if ((fds[POLL_SIGNALS].revents & POLLIN) && !handle_signals(bar, signals))
@@ -2448,7 +2755,8 @@ static int run(struct bar *bar, int signals, int status_fd)
 static void cleanup(struct bar *bar)
 {
     close_theme_watch(&bar->theme_watch);
-    reap_network_child(bar);
+    stop_volume(&bar->volume);
+    reap_children(bar);
     network_disconnect(&bar->network);
     release_seat(bar);
     if (bar->ipc_output)
@@ -2554,7 +2862,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    struct bar bar = {.theme_watch = {.fd = -1}};
+    struct bar bar = {.theme_watch = {.fd = -1}, .volume = {.fd = -1}};
     bar.child_mask = child_mask;
     wl_list_init(&bar.buffers);
     wl_list_init(&bar.outputs);

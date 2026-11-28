@@ -13,6 +13,7 @@ enum {
     BAR_NETWORK_SEPARATOR_SIZE = 64,
     BAR_NETWORK_TEXT_SIZE = 64,
     BAR_NETWORK_COMMAND_SIZE = 1024,
+    BAR_VOLUME_TEXT_SIZE = 64,
 };
 
 /* How the active workspace stands out besides its color. */
@@ -38,6 +39,15 @@ struct bar_config {
     char network_separator[BAR_NETWORK_SEPARATOR_SIZE];
     char network_custom_text[BAR_NETWORK_TEXT_SIZE];
     char network_command[BAR_NETWORK_COMMAND_SIZE];
+    bool volume_enabled;
+    uint32_t volume_muted_color;
+    char volume_custom_text[BAR_VOLUME_TEXT_SIZE];
+    /* follow prints a line per change; the others run once per pointer action. */
+    char volume_command[BAR_NETWORK_COMMAND_SIZE];
+    char volume_click[BAR_NETWORK_COMMAND_SIZE];
+    char volume_middle_click[BAR_NETWORK_COMMAND_SIZE];
+    char volume_scroll_up[BAR_NETWORK_COMMAND_SIZE];
+    char volume_scroll_down[BAR_NETWORK_COMMAND_SIZE];
 };
 
 static const struct bar_config bar_defaults = {
@@ -63,6 +73,15 @@ static const struct bar_config bar_defaults = {
     .network_separator = " | ",
     .network_custom_text = "WiFi",
     .network_command = "deal --app-id net --columns 84 --rows 26 -e net",
+    .volume_enabled = true,
+    .volume_muted_color = 0x887d69u,
+    .volume_custom_text = "Vol",
+    .volume_command = "sh -c 'v() { wpctl get-volume @DEFAULT_AUDIO_SINK@; }; v; "
+                      "pactl subscribe | grep --line-buffered -E \"on (sink|server)\" | "
+                      "while read -r _; do v; done'",
+    .volume_middle_click = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+    .volume_scroll_up = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
+    .volume_scroll_down = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-",
 };
 
 #endif

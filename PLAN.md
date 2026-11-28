@@ -18,7 +18,7 @@ Ground rules that apply to every phase:
 **Next, in order:**
 
 1. Bluetooth: `bluetooth.service` is already enabled and running and PipeWire's Bluetooth plugin is loaded, so what's left is installing `rtkit`, pairing headphones from `bluetoothctl` and checking they come back after a reboot (Stage 0.1 of [docs/sound-roadmap.md](docs/sound-roadmap.md))
-2. Volume: the built-in sink works but the keys do nothing (dwl only has `volume-up_EXAMPLE`). Bind the four audio keys to `wpctl` in dwl and add a `[volume]` module to bar that shows a command's output (Stages 0.2 and 0.3). `vol` and `blue` replace the stopgaps later, in the order the roadmap gives
+2. Volume: Stages 0.2 and 0.3 are in and installed: the four audio keys run `wpctl` from dwl, and bar has a `[volume]` module fed by a command (`Vol 30%`). Restart dwl to pick both up, then check the keys and scrolling the bar by hand. Next is `vol` 0.1, then `blue`, in the order the roadmap gives
 3. A browser: none is installed. Install one, make it the default for `http`, `https` and `text/html` in `mimeapps.list`, and check its upload and download dialogs come up as files through the portal (the reason for files 0.6)
 4. `files` toward 1.0: live checks, a week of daily use, fuzzing the listing and the portal input, final README, tag `files-1.0.0`. After 1.0: dialogs as windows of their own that can be dragged. files is a mouse-first explorer, not a keyboard-first one.
 5. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
@@ -296,7 +296,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 30 proje
 
 | Gap | Current state | Route |
 |---|---|---|
-| Volume keys | **Not working** (dwl config only has `volume-up_EXAMPLE`). Pulled forward: the `wpctl` stopgap is next | `vol` + XF86Audio bindings in dwl, plan in [docs/sound-roadmap.md](docs/sound-roadmap.md). Stopgap: bind `wpctl` in `config.h` |
+| Volume keys | `wpctl` stopgap bound in dwl, level shown in bar; `vol` next | `vol` + XF86Audio bindings in dwl, plan in [docs/sound-roadmap.md](docs/sound-roadmap.md). Stopgap: bind `wpctl` in `config.h` |
 | Bluetooth | `bluetooth.service` enabled and running, nothing paired. Pulled forward: next | `bluetoothctl` to start, then `blue` and a bar module ([docs/sound-roadmap.md](docs/sound-roadmap.md)) |
 | Browser | None installed. Pulled forward: next | Install one, default for web links, file dialogs through the portal |
 | Brightness keys + OSD | Missing | backlight via logind `SetBrightness`, layer-shell popup |

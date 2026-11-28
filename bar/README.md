@@ -55,16 +55,17 @@ fill in settings omitted from the file that was loaded.
 
 | Section | Options |
 | --- | --- |
-| `[bar]` | `height` (1–4096 logical pixels), `position` (`top` or `bottom`), `background`, `opacity` (0–1), `scale` (positive multiplier, default 1.0), `foreground` (network and clock color), `padding` (0–4096 pixels per side) |
+| `[bar]` | `height` (1–4096 logical pixels), `position` (`top` or `bottom`), `background`, `opacity` (0–1), `scale` (positive multiplier, default 1.0), `foreground` (volume, network and clock color), `padding` (0–4096 pixels per side) |
 | `[font]` | `family` (an installed Fontconfig family or a generic family such as `monospace`), `size` (1–256 pixels) |
 | `[workspaces]` | `labels` (1–32 comma-separated labels in tag order, up to 63 bytes each), `hide_empty` (`true` or `false`), `active_style` (`box` for an opaque box in the workspace color with the label in the background color, `underline`, or `none`), `active_color`, `occupied_color`, `inactive_color`, `urgent_color`, `spacing` (0–4096 pixels) |
 | `[clock]` | `format` (a `strftime` format, including glibc extensions such as `%l` and `%P`) |
 | `[network]` | `enabled`, `show_ssid`, `show_strength`, `click_enabled` (`true` or `false`), `custom_text` (Wi-Fi label), `separator` (up to 63 bytes each, quote to preserve spaces), `command` (up to 1023 bytes) |
+| `[volume]` | `enabled` (`true` or `false`), `custom_text` (label before the level, up to 63 bytes), `muted_color`, `command`, `click`, `middle_click`, `scroll_up`, `scroll_down` (up to 1023 bytes each; empty does nothing) |
 
 Colors use `#RRGGBB`. Full-line comments begin with `#` or `;`. Spaces
 inside values are preserved. The clock uses the process locale and local
-time. The network and clock share a right-aligned text group, and the
-workspace list stops before it.
+time. Volume, network and clock share a right-aligned text group, joined by
+the network `separator`, and the workspace list stops before it.
 
 `scale` multiplies the height, font size, padding, and workspace spacing.
 Each result rounds to the nearest pixel and must fit its listed range.
@@ -85,6 +86,26 @@ quotes. Shell expansion and pipelines are unavailable. Use a foreground
 command so bar can suppress repeat launches until it exits. deal and `net`
 must be on the session's `PATH` for the default command. See the
 [net installation and dwl rule notes](../net/README.md#bar-and-dwl-integration).
+
+The volume indicator doesn't talk to the sound server itself. bar starts
+`[volume] command` once, in its own process group with its output on a
+pipe, and shows the last line it printed. `Volume: 0.30` becomes `Vol 30%`
+and `Volume: 0.30 [MUTED]` becomes `Vol muted` in `muted_color` (the
+palette's muted role under `[theme] source = wallpaper`); any other line is
+shown as it is. The default command prints `wpctl get-volume` once and again
+on every sink or server event from `pactl subscribe`, which is the stopgap
+until `vol --follow` (see [docs/sound-roadmap.md](../docs/sound-roadmap.md)).
+It runs through `sh -c`, so pipelines work here, unlike in the click
+commands. If the command exits, the indicator disappears and the command is
+started again after a second, backing off to 30 seconds while it keeps
+exiting early. Reloading with a different command restarts it; bar stops the
+whole group when it exits.
+
+Scrolling over the indicator runs `scroll_up` or `scroll_down` once per
+wheel step (five at most per event), middle click runs `middle_click`
+(mute by default), and left click runs `click`, empty until `vol` has a
+mixer. These are fire-and-forget: they can overlap, unlike the network
+command.
 
 After editing the file, reload the running bar:
 

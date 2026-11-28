@@ -82,6 +82,7 @@ A `[volume]` module in bar that shows a command's output instead of talking to a
 | `command` | Started once at startup; every line it prints replaces the text. Restarted with backoff if it exits |
 | `click`, `middle_click`, `scroll_up`, `scroll_down` | Commands run on those pointer actions |
 | `muted_color` | Text color when the line ends in `[MUTED]` (wpctl's wording; `vol --follow` prints the same) |
+| `custom_text` | The label before the level, `Vol` by default |
 
 Stopgap `command`:
 
@@ -89,7 +90,7 @@ Stopgap `command`:
 sh -c 'v() { wpctl get-volume @DEFAULT_AUDIO_SINK@; }; v; pactl subscribe | grep --line-buffered -E "on (sink|server)" | while read -r _; do v; done'
 ```
 
-bar turns `Volume: 0.30` into an icon plus `30%`. Scrolling runs the same `wpctl` commands as the keys, middle click mutes, and a left click does nothing until `vol` 0.3 has a mixer.
+bar turns `Volume: 0.30` into `Vol 30%` and a muted line into `Vol muted` (bar's font has no Nerd Font fallback, so text like the network's `WiFi 82%`, not an icon). Scrolling runs the same `wpctl` commands as the keys, middle click mutes, and a left click does nothing until `vol` 0.3 has a mixer.
 
 Checks: the level updates immediately for keys, for scrolling the bar, and for changes made in another tool. Muting changes the color. Killing the command restarts it. Changing the default sink (headphones connecting) updates the text.
 
@@ -208,6 +209,11 @@ The checklists in a fresh session, a week of use, the agent's input fuzzed (D-Bu
 - **Bluetooth audio auto-switching:** WirePlumber can switch a headset to HFP when an app opens the mic and back afterwards (`bluetooth.autoswitch-to-headset-profile`). Decide after a week of calls whether to keep its default.
 - **Absolute volume over AVRCP** for headphones that support it, so `vol` changes the headphones' own volume. PipeWire does this already. Check it behaves and document it.
 - **notify:** "Headphones connected, 80% battery" and low-battery warnings, once `notify` exists.
+
+## As built
+
+- **Stage 0.2:** the four keys in `dwl/config.h` and `config.def.h` as argv arrays (`volupcmd` and the rest), documented in dwl's key table. The unused `volume-up_EXAMPLE` axis comment is gone.
+- **Stage 0.3:** bar's `[volume]` module. The command runs in its own process group (`POSIX_SPAWN_SETPGROUP`) so stopping it with `kill(-pid)` takes the `pactl | grep | while` pipeline with it. SIGCHLD now reaps every child with `waitpid(-1)`, since click and scroll commands aren't tracked. The right side is drawn in pieces (volume, then the rest) so the volume can have its own color; `text_advance` places the network's click area behind it. Checked with a second bar on screen: `Vol 30%`, `Vol muted` in the muted color, the network text aligned, and no `pactl` left after bar exits. Clicking and scrolling on it still need a check by hand.
 
 ## Bluetooth notes
 

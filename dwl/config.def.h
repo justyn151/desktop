@@ -132,6 +132,11 @@ static const char *termcmd[] = { "deal", NULL };
 static const char *menucmd[] = { "run", NULL };
 static const char *shotcmd[] = { "shot", "-r", NULL };
 static const char *filescmd[] = { "files", NULL };
+/* Audio keys: the stopgap until vol 0.1 (docs/sound-roadmap.md) */
+static const char *volupcmd[]   = { "wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "5%+", NULL };
+static const char *voldowncmd[] = { "wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-", NULL };
+static const char *volmutecmd[] = { "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle", NULL };
+static const char *micmutecmd[] = { "wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle", NULL };
 
 static const Key keys[] = {
 	/* modifier                  key                  function          argument */
@@ -139,6 +144,10 @@ static const Key keys[] = {
 	{ WLR_MODIFIER_LOGO,         XKB_KEY_w,           spawnwallbrowser, {0} },
 	{ WLR_MODIFIER_LOGO|WLR_MODIFIER_SHIFT, XKB_KEY_s,  spawn,            {.v = shotcmd} },
 	{ WLR_MODIFIER_LOGO,         XKB_KEY_e,           spawn,            {.v = filescmd} },
+	{ 0,                         XKB_KEY_XF86AudioRaiseVolume, spawn,   {.v = volupcmd} },
+	{ 0,                         XKB_KEY_XF86AudioLowerVolume, spawn,   {.v = voldowncmd} },
+	{ 0,                         XKB_KEY_XF86AudioMute,        spawn,   {.v = volmutecmd} },
+	{ 0,                         XKB_KEY_XF86AudioMicMute,     spawn,   {.v = micmutecmd} },
 	{ MODKEY,                    XKB_KEY_p,           spawn,            {.v = menucmd} },
 	{ WLR_MODIFIER_LOGO,         XKB_KEY_Return,      spawn,            {.v = termcmd} },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Return,      spawn,            {.v = termcmd} },
@@ -199,9 +208,6 @@ static const Button buttons[] = {
 };
 
 static const Axis axes[] = {
-	/* example of volume control:
-	{ MODKEY, AxisUp,   spawn, SHCMD("volume-up_EXAMPLE") },
-	{ MODKEY, AxisDown, spawn, SHCMD("volume-down_EXAMPLE") }, */
 	{ 0, 0, NULL, {0} },
 	/* does nothing, but the array cannot be empty */
 };
