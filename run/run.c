@@ -1513,6 +1513,28 @@ static int result_order(const void *a, const void *b)
     return (left->order > right->order) - (left->order < right->order);
 }
 
+/* Whether a desktop entry of the same name starts this command: then the
+   list shows only the entry. The command still runs when typed. */
+static bool launched_by_entry(const struct launcher *run, const struct command *cmd)
+{
+    struct stat command;
+    bool known = false;
+    for (size_t i = 0; i < run->application_count; ++i) {
+        const struct application *app = &run->applications[i];
+        if (name_order(app->name, cmd->name))
+            continue;
+        if (!strcmp(app->path, cmd->path))
+            return true;
+        if (!known && stat(cmd->path, &command) < 0)
+            return false;
+        known = true;
+        struct stat target;
+        if (stat(app->path, &target) == 0 && target.st_dev == command.st_dev && target.st_ino == command.st_ino)
+            return true;
+    }
+    return false;
+}
+
 static bool discover_results(struct launcher *run)
 {
     if (!discover_commands(run) ||
@@ -1526,25 +1548,30 @@ static bool discover_results(struct launcher *run)
     run->matches = reallocarray(NULL, count, sizeof *run->matches);
     if (!run->results || !run->matches)
         return false;
-    run->result_count = count;
+    size_t shown = 0;
     for (size_t i = 0; i < path_count; ++i) {
         const struct command *cmd = &run->commands[i];
+        if (launched_by_entry(run, cmd))
+            continue;
         wchar_t *fields = reallocarray(NULL, strlen(cmd->name) + 2, sizeof *fields);
         if (!fields)
             return false;
         *search_text(fields, cmd->name, run->config.case_sensitive) = L'\0';
-        run->results[i] = (struct result){
-            .name = cmd->name, .search = fields, .command = cmd, .order = i,
+        run->results[shown] = (struct result){
+            .name = cmd->name, .search = fields, .command = cmd, .order = shown,
         };
+        ++shown;
     }
     for (size_t i = 0; i < run->application_count; ++i) {
         const struct application *app = &run->applications[i];
-        run->results[path_count + i] = (struct result){
+        run->results[shown] = (struct result){
             .name = app->name, .search = app->search, .application = app,
-            .order = path_count + i,
+            .order = shown,
             .preference = run->config.prefer_desktop_entries ? (app->terminal ? 1 : 2) : 0,
         };
+        ++shown;
     }
+    count = run->result_count = shown;
     qsort(run->results, count, sizeof *run->results, result_order);
     for (size_t i = 0; i < count; ++i)
         run->results[i].order = i;
