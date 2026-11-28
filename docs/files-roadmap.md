@@ -122,7 +122,7 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 - **Tabs** along the top, each with its own directory, selection, history and search: Ctrl+T, Ctrl+W (the last tab closes the window), Ctrl+Tab, Alt+1–9, a × on each and a `+`, and middle-click on a directory, place or path piece to open it in a background tab.
 - **Search** in a field beside the path (Ctrl+F): it filters the current directory as you type, ignoring ASCII case. Going elsewhere ends it. Brought forward from 0.3.
 - **Views:** list, or a grid of large icons with names under them in up to two lines, from buttons at the toolbar's end or Ctrl+1 and Ctrl+2. Brought forward from 0.5; thumbnails in the icon view stay in 0.5.
-- **Zoom:** Ctrl+wheel, Ctrl+plus, minus and 0. The list's text goes from 0.75× to 2×, the icons from 32 to 192 pixels; each view keeps its own, saved with the view in the state file.
+- **Zoom:** Ctrl+wheel, Ctrl+plus, minus and 0. The list's text goes from 0.75× to 1.5×, the icons from 48 to 192 pixels, as one scale: zooming in past the biggest list switches to icons, and out past the smallest icons back to the list. Each view keeps its own zoom, saved with the view in the state file.
 - No preview. 0.2 first had Miller columns (parent, current, preview) with image and text previews made on worker threads; they were replaced by this layout in 0.2.2. That code is in git history (`14b4e7f`) if a preview pane comes back, and the image decoding and worker thread will return with 0.5's thumbnail grid.
 - The status line 0.2 first had is gone too. The details it showed are the list's size and date columns; permissions and owner come back in a properties view if they're missed.
 

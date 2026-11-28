@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.2.3"
+#define FILES_VERSION "0.2.4"
 
 /* Exit statuses. */
 enum {

@@ -57,7 +57,7 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Ctrl+F | Search |
 | Escape | Clear the search |
 | Ctrl+1, Ctrl+2 | List, icons |
-| Ctrl+plus, Ctrl+minus, Ctrl+0 | Zoom in, out, back to normal |
+| Ctrl+plus, Ctrl+minus, Ctrl+0 | Zoom in, out (switching view at either end), back to normal |
 | `q`, Ctrl+Q | Quit |
 
 While the search field has the focus, typing goes into it: Left, Right, Home and End move, Backspace and Delete delete (a word with Ctrl), Escape clears it, and Enter, Tab or Down give the focus back to the list with the search kept. Ctrl shortcuts still work.
@@ -79,7 +79,7 @@ Movement keys repeat while held, at the compositor's rate. Enter doesn't repeat,
 | An entry | Selects it; double-click goes into a directory (opening files comes in 0.3) |
 | Middle-click on a directory, place or path piece | Opens it in a new tab behind this one |
 | The wheel over the entries | Scrolls them, three rows a notch (a row of icons in the icon view), without moving the selection. Touchpads scroll by distance |
-| Ctrl+wheel | Zooms the current view |
+| Ctrl+wheel | Zooms; past the biggest list it turns into icons, and past the smallest icons back into the list |
 | Mouse side buttons | Back, forward |
 | The sidebar's edge | Drag to resize; double-click resets |
 
@@ -97,10 +97,10 @@ The search field filters the current directory as you type: names containing the
 
 ### Views and zoom
 
-- **List:** one row per entry, with size and date where there's room. Zoom changes its text size, from 0.75× to 2×.
-- **Icons:** a grid of large icons with the name under each in up to two lines, broken at a space, dot, dash or underscore where it can be, and cut in the middle when it's still too long. Zoom changes the icon size, from 32 to 192 pixels; the grid fits as many columns as it can.
+- **List:** one row per entry, with size and date where there's room. Zoom changes its text size, from 0.75× to 1.5×.
+- **Icons:** a grid of large icons with the name under each in up to two lines, broken at a space, dot, dash or underscore where it can be, and cut in the middle when it's still too long. Zoom changes the icon size, from 48 to 192 pixels; the grid fits as many columns as it can.
 
-Each view keeps its own zoom. The view and both zooms are kept in the state file.
+The two make one scale: zooming in past the biggest list switches to the smallest icons, and zooming out past the smallest icons switches back to the biggest list. Ctrl+0 resets the current view only. Each view keeps its own zoom. The view and both zooms are kept in the state file.
 
 ### The sidebar
 
@@ -161,4 +161,4 @@ files will only change things inside your home directory: that's the rule every 
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
 - [ ] Tabs open, close and switch by clicking, middle-click and keys, each keeping its place.
 - [ ] Typing in the search field filters as you type; its × clears it.
-- [ ] Ctrl+wheel zooms the list and the icons, and the zoom comes back after a restart.
+- [ ] Ctrl+wheel zooms the list and the icons, crossing from one to the other at the ends, and the zoom comes back after a restart.

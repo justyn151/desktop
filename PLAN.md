@@ -31,7 +31,7 @@ Ground rules that apply to every phase:
 
 | What | Result |
 |---|---|
-| files 0.2 | An explorer layout: a toolbar (sidebar toggle, back, forward, up, clickable path) and a sidebar of places (home folders, `/`, mounted drives) beside the list; date and time on every entry. The mouse works: click, double-click, wheel, side buttons, dragging the sidebar's edge, kept between runs. Tabs, a search field beside the path, list and icon views, and zoom (Ctrl+wheel) followed in 0.2.3. Outside home is read-only unless root (the rule 0.4's operations follow). It began as Miller columns with previews on worker threads (`14b4e7f`), replaced in 0.2.2. desk gained `desk_canvas_blit` |
+| files 0.2 | An explorer layout: a toolbar (sidebar toggle, back, forward, up, clickable path) and a sidebar of places (home folders, `/`, mounted drives) beside the list; date and time on every entry. The mouse works: click, double-click, wheel, side buttons, dragging the sidebar's edge, kept between runs. Tabs, a search field beside the path, list and icon views, and zoom (Ctrl+wheel) followed in 0.2.3; in 0.2.4 zooming crosses from the list into icons and back. Outside home is read-only unless root (the rule 0.4's operations follow). It began as Miller columns with previews on worker threads (`14b4e7f`), replaced in 0.2.2. desk gained `desk_canvas_blit` |
 | files 0.1 | One directory: keyboard navigation, selection remembered per directory, live refresh, Nerd Font icons, palette colors. desk gained fonts with fallback (`-DDESK_FONT`), the keyboard and an xdg-shell window; view moved onto the last two. Key checks pending |
 | shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
 | view 0.1 | One image fitted to the window, sharp at any scale |
@@ -267,12 +267,20 @@ Noted 2026-11-28 so it isn't forgotten. No roadmap yet, and no place in the orde
   - LaTeX-like for math and math diagrams, rendered by the app itself. A real TeX install is too big to depend on.
 - mark's CommonMark parser is the natural starting point for the text half.
 - Open questions for the roadmap: the language's syntax and how drawings are stored in the same file, GUI on desk vs a terminal front end, and how much of TeX's math layout is worth reimplementing.
+### todo and cal (ideas, not scheduled)
+
+Noted 2026-11-28. Two separate apps, connected later. No roadmaps yet, and no place in the order above.
+
+- **`todo`:** a to-do list. Tasks with a title, optional notes, a due date and time, done or not; lists or tags to group them.
+- **`cal`:** a calendar with month, week and day views and events on them, in the GUI style of `files` (desk window, mouse first).
+- **Connected later:** tasks with a due date show on the calendar, and finishing one there marks it done in `todo`. Both read the same store, or `cal` reads `todo`'s, so neither keeps a copy of the other's data. `notify` could remind of both.
+- Open questions for the roadmaps: the storage format (plain text in a folder like `note`, or one file each; iCalendar `.ics` would let them sync with phones and other calendars later), whether `todo` is a GUI or a terminal app, and recurring tasks and events.
 
 ---
 
 ## Phase 6: Gaps (last)
 
-These are the pieces a laptop daily driver needs that aren't one of the 27 projects. They come after the core apps exist.
+These are the pieces a laptop daily driver needs that aren't one of the 29 projects. They come after the core apps exist.
 
 | Gap | Current state | Route |
 |---|---|---|
@@ -287,7 +295,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 
 ---
 
-## The 27 projects
+## The 29 projects
 
 ### Existing (7)
 
@@ -301,7 +309,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 | 6 | `deal` | Terminal emulator, native Wayland, tabs, wallpaper colors | 0.13.3, Phase 1 |
 | 7 | `lead` | Modal terminal text editor (installed as `editor`) | Early (Phase 0.3) |
 
-### Planned (20)
+### Planned (22)
 
 | # | Project | What it does |
 |---|---|---|
@@ -325,3 +333,5 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 | 25 | toolkit | Shared GUI widgets, extracted from `desk` once `files` shows what is really common |
 | 26 | `mark` | Markdown viewer for the terminal: renders headings, emphasis, lists, tables, code blocks and links with deal's text attributes, in a pager |
 | 27 | `note` (working name) | Note-taking app in the spirit of Obsidian and Excalidraw, on its own markup language |
+| 28 | `todo` | To-do list; tasks with due dates, connected to `cal` later |
+| 29 | `cal` | Calendar with month, week and day views; shows `todo`'s due tasks once they're connected |

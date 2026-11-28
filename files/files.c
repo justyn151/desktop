@@ -39,12 +39,14 @@
 #define DOUBLE_CLICK_MS 400
 
 /* Zoom levels: the list's text size as a multiple of the window's, and the
-   icon view's icon size in logical pixels. */
-static const double list_zooms[] = {0.75, 0.875, 1.0, 1.125, 1.25, 1.5, 1.75, 2.0};
-static const double icon_zooms[] = {32, 40, 48, 64, 80, 96, 128, 160, 192};
+   icon view's icon size in logical pixels. Together they make one scale:
+   zooming in past the biggest list goes to the smallest icons, and out past
+   the smallest icons back to the list. */
+static const double list_zooms[] = {0.75, 0.875, 1.0, 1.125, 1.25, 1.5};
+static const double icon_zooms[] = {48, 64, 80, 96, 128, 160, 192};
 #define LIST_ZOOMS ((int)(sizeof list_zooms / sizeof *list_zooms))
 #define ICON_ZOOMS ((int)(sizeof icon_zooms / sizeof *icon_zooms))
-static const int default_zoom[VIEW_COUNT] = {2, 3};
+static const int default_zoom[VIEW_COUNT] = {2, 2};
 
 /* Nerd Font icons (Font Awesome and Octicons ranges of Symbols Nerd Font). */
 #define ICON_FOLDER 0xf07b
@@ -1012,18 +1014,28 @@ static void set_view(struct files *files, enum view view)
 }
 
 /* One step bigger (+1) or smaller (-1), or back to the default (0), in the
-   current view. */
+   current view; past the list's biggest or the icons' smallest it changes
+   view. */
 static void zoom(struct files *files, int direction)
 {
-    int count = files->view == VIEW_LIST ? LIST_ZOOMS : ICON_ZOOMS;
-    int level = direction ? files->zoom[files->view] + direction : default_zoom[files->view];
+    enum view view = files->view;
+    int level = direction ? files->zoom[view] + direction : default_zoom[view];
+    if (view == VIEW_LIST && level >= LIST_ZOOMS) {
+        view = VIEW_ICONS;
+        level = 0;
+    } else if (view == VIEW_ICONS && level < 0) {
+        view = VIEW_LIST;
+        level = LIST_ZOOMS - 1;
+    }
+    int count = view == VIEW_LIST ? LIST_ZOOMS : ICON_ZOOMS;
     if (level < 0)
         level = 0;
     if (level >= count)
         level = count - 1;
-    if (level == files->zoom[files->view])
+    if (view == files->view && level == files->zoom[view])
         return;
-    files->zoom[files->view] = level;
+    files->view = view;
+    files->zoom[view] = level;
     files->free_scroll = false;
     save_state(files);
     desk_window_redraw(&files->window);
@@ -1823,7 +1835,6 @@ static void paint_icons(struct files *files, DeskCanvas *canvas, const struct la
 #define ICON_UP 0xf062
 #define ICON_LIST 0xf03a
 #define ICON_GRID 0xf00a
-#define ICON_SEARCH 0xf422
 #define ICON_CLOSE 0xf00d
 #define ICON_PLUS 0xf067
 #define CRUMB_SEPARATOR "\xe2\x80\xba" /* › */
@@ -1945,6 +1956,36 @@ static void paint_tabs(struct files *files, DeskCanvas *canvas, const struct lay
     draw_icon(layout->font, canvas, bar->new_tab_left, bar->new_tab_right, baseline, ICON_PLUS, colors->foreground);
 }
 
+/* A magnifying glass in a size×size square at x, y: a ring and a handle,
+   drawn here rather than taken from a font, where fallback fonts disagree
+   on the glyph. Edges are smoothed by sampling each pixel 4×4. */
+static void draw_magnifier(DeskCanvas *canvas, int x, int y, int size, uint32_t color, uint32_t background)
+{
+    double glyph = size * 0.5, left = x + (size - glyph) / 2, top = y + (size - glyph) / 2;
+    double radius = glyph * 0.34, stroke = fmax(1.2, glyph * 0.13);
+    double cx = left + radius + stroke / 2, cy = top + radius + stroke / 2;
+    double hx = left + glyph - stroke / 2, hy = top + glyph - stroke / 2; /* The handle's end. */
+    double reach = radius * M_SQRT1_2;
+    double sx = cx + reach, sy = cy + reach; /* Where it leaves the ring. */
+    for (int py = (int)top - 1; py <= (int)(top + glyph) + 1; ++py) {
+        for (int px = (int)left - 1; px <= (int)(left + glyph) + 1; ++px) {
+            int hits = 0;
+            for (int i = 0; i < 16; ++i) {
+                double qx = px + (i % 4 + 0.5) / 4, qy = py + (i / 4 + 0.5) / 4;
+                double ring = fabs(hypot(qx - cx, qy - cy) - radius);
+                /* Distance to the handle's segment. */
+                double dx = hx - sx, dy = hy - sy;
+                double t = ((qx - sx) * dx + (qy - sy) * dy) / (dx * dx + dy * dy);
+                t = t < 0 ? 0 : t > 1 ? 1 : t;
+                double handle = hypot(qx - (sx + t * dx), qy - (sy + t * dy));
+                hits += ring <= stroke / 2 || handle <= stroke * 0.6;
+            }
+            if (hits)
+                desk_canvas_fill(canvas, px, py, 1, 1, mix(background, color, (unsigned)(hits * 255 / 16)));
+        }
+    }
+}
+
 /* The search field: magnifier, text or "Search", the cursor when focused,
    and a × that clears it. */
 static void paint_search(struct files *files, DeskCanvas *canvas, const struct layout *layout, int top)
@@ -1957,7 +1998,7 @@ static void paint_search(struct files *files, DeskCanvas *canvas, const struct l
     desk_canvas_fill(canvas, left, top, right - left, height, mix(colors->background, colors->muted, 35));
     if (files->search_focus)
         outline(canvas, left, top, right - left, height, line, colors->directory);
-    draw_icon(layout->font, canvas, left, left + height, baseline, ICON_SEARCH, colors->muted);
+    draw_magnifier(canvas, left, top, height, colors->muted, mix(colors->background, colors->muted, 35));
 
     int text_left = left + height, text_right = right - space;
     bar->search_clear_left = -1;
