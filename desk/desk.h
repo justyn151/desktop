@@ -407,6 +407,85 @@ void desk_window_close(DeskWindow *window);
 #endif
 #endif
 
+#ifdef DESK_APPS
+/* Applications and file types: desktop entries, mimeapps.list and the
+   shared-mime-info database, for opening files the way other desktops do. */
+
+typedef struct {
+    char *id;               /* The desktop file's name, as "view.desktop". */
+    char *path;             /* Where it was read from. */
+    char *name;
+    char *exec;             /* Exec, with the value escapes decoded. */
+    char **mime_types;      /* MimeType, split. */
+    size_t mime_count;
+    bool terminal;          /* Terminal=true: run inside the terminal. */
+    bool no_display;        /* NoDisplay=true: not offered in lists. */
+} DeskApp;
+
+/* One line of mimeapps.list: a type and an application for it. */
+typedef struct {
+    char *mime, *id;
+    int kind;               /* DESK_DEFAULT, DESK_ADDED or DESK_REMOVED. */
+} DeskAssociation;
+
+enum { DESK_DEFAULT, DESK_ADDED, DESK_REMOVED };
+
+/* A glob from shared-mime-info's globs2. */
+typedef struct {
+    char *pattern, *mime;
+    int weight;
+    bool case_sensitive;
+} DeskGlob;
+
+typedef struct {
+    DeskApp *apps;          /* User's first, each id once. */
+    size_t app_count;
+    DeskAssociation *associations; /* Most important file first. */
+    size_t association_count;
+    DeskGlob *globs;        /* Empty when shared-mime-info isn't installed. */
+    size_t glob_count;
+} DeskApps;
+
+/* Read the desktop entries in $XDG_DATA_HOME/applications and each of
+   $XDG_DATA_DIRS's, the mimeapps.list files and the globs. Missing files are
+   fine. Return 0 or ENOMEM. */
+int desk_apps_load(DeskApps *apps);
+void desk_apps_free(DeskApps *apps);
+
+/* The MIME type of the file at path, whose name is name: inode/directory,
+   then by name from the globs (or a built-in table of common types without
+   them), then by content: ELF executables, text, or
+   application/octet-stream. The string is static or the database's. */
+const char *desk_mime_type(const DeskApps *apps, const char *path, const char *name);
+
+/* The applications for a type, most preferred first: the default from
+   mimeapps.list, the added associations, then every application declaring
+   the type, without the removed ones. text/ types also get text/plain's.
+   Fill up to max and return how many there are in all. */
+size_t desk_apps_for(const DeskApps *apps, const char *mime, const DeskApp **out, size_t max);
+
+/* An application by id, or NULL. */
+const DeskApp *desk_app_find(const DeskApps *apps, const char *id);
+
+/* Start app on paths (count of them, maybe 0) in directory, detached in its
+   own session with stdin from /dev/null. Exec's field codes are expanded;
+   an app taking one file (%f, %u) starts once per path. Terminal=true apps
+   start inside terminal, a command line such as "deal -e". The caller
+   should ignore SIGCHLD so they don't linger as zombies. Return 0 or an
+   errno value (EINVAL for an Exec that can't be parsed). */
+int desk_app_launch(const DeskApp *app, char *const paths[], size_t count, const char *terminal,
+                    const char *directory);
+
+/* Run argv (argv[0] looked up in PATH) the same way: detached, in directory,
+   inside terminal when it isn't NULL. Return 0 or an errno value. */
+int desk_spawn(char *const argv[], const char *terminal, const char *directory);
+
+/* Make id the default for mime in $XDG_CONFIG_HOME/mimeapps.list (written
+   atomically, other lines kept), and add it to the added associations.
+   Return 0 or an errno value. */
+int desk_mimeapps_set_default(const char *mime, const char *id);
+#endif
+
 #ifdef DESK_IMAGE
 /* Image decoding: needs libpng and libjpeg. -DDESK_IMAGE_GIF adds GIF (first
    frame, built in, no library) and -DDESK_IMAGE_WEBP adds still WebP

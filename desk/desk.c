@@ -1454,6 +1454,878 @@ void desk_window_close(DeskWindow *window)
 #endif
 #endif
 
+#ifdef DESK_APPS
+/* Applications and file types */
+
+#include <dirent.h>
+#include <fnmatch.h>
+#include <spawn.h>
+
+extern char **environ;
+
+/* Make room for one more item in an array. */
+static bool apps_grow(void **items, size_t *capacity, size_t count, size_t size)
+{
+    if (count < *capacity)
+        return true;
+    size_t grown = *capacity ? *capacity * 2 : 16;
+    void *moved = realloc(*items, grown * size);
+    if (!moved)
+        return false;
+    *items = moved;
+    *capacity = grown;
+    return true;
+}
+
+/* A whole small file as a string, or NULL with errno set. */
+static char *apps_read(const char *path)
+{
+    FILE *file = fopen(path, "re");
+    if (!file)
+        return NULL;
+    char *text = NULL;
+    size_t length = 0, capacity = 0;
+    char chunk[4096];
+    size_t got;
+    while ((got = fread(chunk, 1, sizeof chunk, file)) > 0) {
+        if (length + got + 1 > capacity) {
+            size_t grown = (length + got + 1) * 2;
+            char *moved = grown <= (1u << 20) * 2 ? realloc(text, grown) : NULL;
+            if (!moved) {
+                free(text);
+                fclose(file);
+                errno = ENOMEM;
+                return NULL;
+            }
+            text = moved;
+            capacity = grown;
+        }
+        memcpy(text + length, chunk, got);
+        length += got;
+    }
+    fclose(file);
+    if (!text && !(text = calloc(1, 1)))
+        return NULL;
+    text[length] = 0;
+    return text;
+}
+
+/* $XDG_DATA_HOME, then each of $XDG_DATA_DIRS, as new strings in a
+   NULL-terminated array; config does the same for the config directories. */
+static char **apps_base_dirs(bool config)
+{
+    const char *home_variable = getenv(config ? "XDG_CONFIG_HOME" : "XDG_DATA_HOME");
+    const char *dirs = getenv(config ? "XDG_CONFIG_DIRS" : "XDG_DATA_DIRS");
+    const char *home = getenv("HOME");
+    if (!dirs || !*dirs)
+        dirs = config ? "/etc/xdg" : "/usr/local/share:/usr/share";
+    size_t count = 2;
+    for (const char *at = dirs; *at; ++at)
+        count += *at == ':';
+    char **list = calloc(count + 1, sizeof *list);
+    if (!list)
+        return NULL;
+    size_t used = 0;
+    if (home_variable && home_variable[0] == '/')
+        list[used++] = strdup(home_variable);
+    else if (home && *home && asprintf(&list[used], "%s/%s", home, config ? ".config" : ".local/share") >= 0)
+        ++used;
+    for (const char *at = dirs; *at;) {
+        size_t length = strcspn(at, ":");
+        if (length && at[0] == '/' && (list[used] = strndup(at, length)))
+            ++used;
+        at += length + (at[length] == ':');
+    }
+    return list;
+}
+
+static void apps_free_strings(char **list)
+{
+    for (size_t i = 0; list && list[i]; ++i)
+        free(list[i]);
+    free(list);
+}
+
+/* Decode the desktop file escapes \s \n \t \r \\ in place. */
+static void apps_unescape(char *value)
+{
+    char *out = value;
+    for (const char *in = value; *in; ++in) {
+        if (*in == '\\' && in[1]) {
+            char next = *++in;
+            switch (next) {
+            case 's': *out++ = ' '; break;
+            case 'n': *out++ = '\n'; break;
+            case 't': *out++ = '\t'; break;
+            case 'r': *out++ = '\r'; break;
+            case '\\': *out++ = '\\'; break;
+            default: /* Kept for the next level, as \" in Exec or \; in lists. */
+                *out++ = '\\';
+                *out++ = next;
+            }
+        } else {
+            *out++ = *in;
+        }
+    }
+    *out = 0;
+}
+
+static bool apps_in_path(const char *program)
+{
+    if (strchr(program, '/'))
+        return access(program, X_OK) == 0;
+    const char *path = getenv("PATH");
+    if (!path)
+        path = "/usr/local/bin:/usr/bin:/bin";
+    char candidate[4096];
+    for (const char *at = path; *at;) {
+        size_t length = strcspn(at, ":");
+        if (length && snprintf(candidate, sizeof candidate, "%.*s/%s", (int)length, at, program) <
+                          (int)sizeof candidate &&
+            access(candidate, X_OK) == 0)
+            return true;
+        at += length + (at[length] == ':');
+    }
+    return false;
+}
+
+static void app_free(DeskApp *app)
+{
+    free(app->id);
+    free(app->path);
+    free(app->name);
+    free(app->exec);
+    for (size_t i = 0; i < app->mime_count; ++i)
+        free(app->mime_types[i]);
+    free(app->mime_types);
+    *app = (DeskApp){0};
+}
+
+/* Read one desktop entry. Return 1 for an application, 0 for something to
+   skip (another type, Hidden, a missing TryExec), or -ENOMEM. */
+static int apps_parse_entry(const char *path, const char *id, DeskApp *app)
+{
+    char *text = apps_read(path);
+    if (!text)
+        return errno == ENOMEM ? -ENOMEM : 0;
+    *app = (DeskApp){0};
+    bool group = false, application = false, hidden = false, missing = false, failed = false;
+    for (char *line = text, *next; line && *line; line = next) {
+        next = strchr(line, '\n');
+        if (next)
+            *next++ = 0;
+        size_t length = strlen(line);
+        while (length && (line[length - 1] == '\r' || line[length - 1] == ' ' || line[length - 1] == '\t'))
+            line[--length] = 0;
+        while (*line == ' ' || *line == '\t')
+            ++line;
+        if (!*line || *line == '#')
+            continue;
+        if (*line == '[') {
+            group = strcmp(line, "[Desktop Entry]") == 0;
+            continue;
+        }
+        char *equals = strchr(line, '=');
+        if (!group || !equals)
+            continue;
+        char *key_end = equals;
+        while (key_end > line && (key_end[-1] == ' ' || key_end[-1] == '\t'))
+            --key_end;
+        *key_end = 0;
+        char *value = equals + 1;
+        while (*value == ' ' || *value == '\t')
+            ++value;
+        if (strchr(line, '['))
+            continue; /* A translation. */
+        if (strcmp(line, "Type") == 0) {
+            application = strcmp(value, "Application") == 0;
+        } else if (strcmp(line, "Hidden") == 0) {
+            desk_parse_bool(value, &hidden);
+        } else if (strcmp(line, "NoDisplay") == 0) {
+            desk_parse_bool(value, &app->no_display);
+        } else if (strcmp(line, "Terminal") == 0) {
+            desk_parse_bool(value, &app->terminal);
+        } else if (strcmp(line, "TryExec") == 0) {
+            apps_unescape(value);
+            missing = !apps_in_path(value);
+        } else if (strcmp(line, "Name") == 0 || strcmp(line, "Exec") == 0) {
+            apps_unescape(value);
+            char **field = line[0] == 'N' ? &app->name : &app->exec;
+            free(*field);
+            failed |= !(*field = strdup(value));
+        } else if (strcmp(line, "MimeType") == 0) {
+            size_t capacity = 0;
+            for (char *type = strtok(value, ";"); type; type = strtok(NULL, ";")) {
+                if (!*type)
+                    continue;
+                if (!apps_grow((void **)&app->mime_types, &capacity, app->mime_count, sizeof *app->mime_types) ||
+                    !(app->mime_types[app->mime_count] = strdup(type))) {
+                    failed = true;
+                    break;
+                }
+                ++app->mime_count;
+            }
+        }
+    }
+    free(text);
+    if (!failed && application && !hidden && !missing && app->exec && app->name) {
+        app->id = strdup(id);
+        app->path = strdup(path);
+        if (app->id && app->path)
+            return 1;
+        failed = true;
+    }
+    app_free(app);
+    return failed ? -ENOMEM : 0;
+}
+
+static int apps_compare_names(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Every .desktop in directory, in name order. The first entry seen with an
+   id wins, so the user's override the system's; ids already in seen are
+   skipped, and Hidden ones still claim their id. */
+static int apps_scan(DeskApps *apps, size_t *capacity, char ***seen, size_t *seen_count, size_t *seen_capacity,
+                     const char *directory)
+{
+    DIR *dir = opendir(directory);
+    if (!dir)
+        return 0;
+    char **names = NULL;
+    size_t count = 0, names_capacity = 0;
+    struct dirent *item;
+    int error = 0;
+    while ((item = readdir(dir))) {
+        size_t length = strlen(item->d_name);
+        if (length <= 8 || strcmp(item->d_name + length - 8, ".desktop") != 0)
+            continue;
+        if (!apps_grow((void **)&names, &names_capacity, count, sizeof *names) ||
+            !(names[count] = strdup(item->d_name))) {
+            error = ENOMEM;
+            break;
+        }
+        ++count;
+    }
+    closedir(dir);
+    if (count)
+        qsort(names, count, sizeof *names, apps_compare_names);
+    for (size_t i = 0; i < count && !error; ++i) {
+        bool taken = false;
+        for (size_t j = 0; j < *seen_count && !taken; ++j)
+            taken = strcmp((*seen)[j], names[i]) == 0;
+        if (taken)
+            continue;
+        if (!apps_grow((void **)seen, seen_capacity, *seen_count, sizeof **seen)) {
+            error = ENOMEM;
+            break;
+        }
+        (*seen)[(*seen_count)++] = names[i];
+        char *path;
+        if (asprintf(&path, "%s/%s", directory, names[i]) < 0) {
+            error = ENOMEM;
+            break;
+        }
+        if (!apps_grow((void **)&apps->apps, capacity, apps->app_count, sizeof *apps->apps)) {
+            free(path);
+            error = ENOMEM;
+            break;
+        }
+        int result = apps_parse_entry(path, names[i], &apps->apps[apps->app_count]);
+        free(path);
+        if (result < 0)
+            error = ENOMEM;
+        else if (result > 0)
+            ++apps->app_count;
+        names[i] = NULL; /* Owned by seen now. */
+    }
+    for (size_t i = 0; i < count; ++i)
+        free(names[i]);
+    free(names);
+    return error;
+}
+
+struct apps_list_state {
+    DeskApps *apps;
+    size_t capacity;
+    int error;
+};
+
+static void apps_list_entry(void *data, const char *section, const char *key, const char *value, int line)
+{
+    (void)line;
+    struct apps_list_state *state = data;
+    if (!key || state->error)
+        return;
+    int kind = strcmp(section, "Default Applications") == 0 ? DESK_DEFAULT
+             : strcmp(section, "Added Associations") == 0   ? DESK_ADDED
+             : strcmp(section, "Removed Associations") == 0 ? DESK_REMOVED
+                                                            : -1;
+    if (kind < 0)
+        return;
+    char *ids = strdup(value);
+    if (!ids) {
+        state->error = ENOMEM;
+        return;
+    }
+    DeskApps *apps = state->apps;
+    for (char *id = strtok(ids, ";"); id; id = strtok(NULL, ";")) {
+        while (*id == ' ')
+            ++id;
+        if (!*id)
+            continue;
+        if (!apps_grow((void **)&apps->associations, &state->capacity, apps->association_count,
+                       sizeof *apps->associations)) {
+            state->error = ENOMEM;
+            break;
+        }
+        DeskAssociation *association = &apps->associations[apps->association_count];
+        *association = (DeskAssociation){strdup(key), strdup(id), kind};
+        if (!association->mime || !association->id) {
+            free(association->mime);
+            free(association->id);
+            state->error = ENOMEM;
+            break;
+        }
+        ++apps->association_count;
+    }
+    free(ids);
+}
+
+static int apps_load_globs(DeskApps *apps, const char *path)
+{
+    char *text = apps_read(path);
+    if (!text)
+        return errno == ENOMEM ? ENOMEM : 0;
+    size_t capacity = 0;
+    int error = 0;
+    for (char *line = text, *next; line && *line && !error; line = next) {
+        next = strchr(line, '\n');
+        if (next)
+            *next++ = 0;
+        if (*line == '#')
+            continue;
+        char *weight = line, *mime = strchr(weight, ':');
+        char *pattern = mime ? strchr(++mime, ':') : NULL;
+        if (!pattern)
+            continue;
+        mime[-1] = 0;
+        *pattern++ = 0;
+        char *flags = strchr(pattern, ':');
+        if (flags)
+            *flags++ = 0;
+        if (!apps_grow((void **)&apps->globs, &capacity, apps->glob_count, sizeof *apps->globs)) {
+            error = ENOMEM;
+            break;
+        }
+        DeskGlob *glob = &apps->globs[apps->glob_count];
+        *glob = (DeskGlob){strdup(pattern), strdup(mime), atoi(weight), flags && strstr(flags, "cs")};
+        if (!glob->pattern || !glob->mime) {
+            free(glob->pattern);
+            free(glob->mime);
+            error = ENOMEM;
+            break;
+        }
+        ++apps->glob_count;
+    }
+    free(text);
+    return error;
+}
+
+int desk_apps_load(DeskApps *apps)
+{
+    *apps = (DeskApps){0};
+    char **data = apps_base_dirs(false), **config = apps_base_dirs(true);
+    int error = data && config ? 0 : ENOMEM;
+
+    char **seen = NULL;
+    size_t seen_count = 0, seen_capacity = 0, capacity = 0;
+    for (size_t i = 0; !error && data[i]; ++i) {
+        char *directory;
+        if (asprintf(&directory, "%s/applications", data[i]) < 0) {
+            error = ENOMEM;
+            break;
+        }
+        error = apps_scan(apps, &capacity, &seen, &seen_count, &seen_capacity, directory);
+        free(directory);
+    }
+    for (size_t i = 0; i < seen_count; ++i)
+        free(seen[i]);
+    free(seen);
+
+    /* mimeapps.list: the config directories', then the data directories'. */
+    struct apps_list_state state = {apps, 0, 0};
+    for (int pass = 0; !error && pass < 2; ++pass) {
+        char **dirs = pass ? data : config;
+        for (size_t i = 0; dirs[i]; ++i) {
+            char *path;
+            if (asprintf(&path, pass ? "%s/applications/mimeapps.list" : "%s/mimeapps.list", dirs[i]) < 0) {
+                error = ENOMEM;
+                break;
+            }
+            desk_ini_load(path, apps_list_entry, &state);
+            free(path);
+        }
+    }
+    if (!error)
+        error = state.error;
+
+    /* The globs: the first mime directory that has them. */
+    for (size_t i = 0; !error && data[i] && !apps->glob_count; ++i) {
+        char *path;
+        if (asprintf(&path, "%s/mime/globs2", data[i]) < 0) {
+            error = ENOMEM;
+            break;
+        }
+        error = apps_load_globs(apps, path);
+        free(path);
+    }
+    apps_free_strings(data);
+    apps_free_strings(config);
+    if (error)
+        desk_apps_free(apps);
+    return error;
+}
+
+void desk_apps_free(DeskApps *apps)
+{
+    for (size_t i = 0; i < apps->app_count; ++i)
+        app_free(&apps->apps[i]);
+    free(apps->apps);
+    for (size_t i = 0; i < apps->association_count; ++i) {
+        free(apps->associations[i].mime);
+        free(apps->associations[i].id);
+    }
+    free(apps->associations);
+    for (size_t i = 0; i < apps->glob_count; ++i) {
+        free(apps->globs[i].pattern);
+        free(apps->globs[i].mime);
+    }
+    free(apps->globs);
+    *apps = (DeskApps){0};
+}
+
+/* Common types by extension, for when shared-mime-info isn't installed. */
+static const char *const builtin_types[][2] = {
+    {"png", "image/png"}, {"jpg", "image/jpeg"}, {"jpeg", "image/jpeg"}, {"jpe", "image/jpeg"},
+    {"gif", "image/gif"}, {"webp", "image/webp"}, {"svg", "image/svg+xml"}, {"bmp", "image/bmp"},
+    {"avif", "image/avif"}, {"heic", "image/heic"}, {"tif", "image/tiff"}, {"tiff", "image/tiff"},
+    {"ico", "image/vnd.microsoft.icon"}, {"jxl", "image/jxl"},
+    {"mp4", "video/mp4"}, {"m4v", "video/mp4"}, {"mkv", "video/x-matroska"}, {"webm", "video/webm"},
+    {"mov", "video/quicktime"}, {"avi", "video/x-msvideo"},
+    {"mp3", "audio/mpeg"}, {"flac", "audio/flac"}, {"ogg", "audio/ogg"}, {"opus", "audio/ogg"},
+    {"wav", "audio/x-wav"}, {"m4a", "audio/mp4"}, {"aac", "audio/aac"},
+    {"pdf", "application/pdf"}, {"zip", "application/zip"}, {"tar", "application/x-tar"},
+    {"gz", "application/gzip"}, {"tgz", "application/x-compressed-tar"}, {"xz", "application/x-xz"},
+    {"zst", "application/zstd"}, {"bz2", "application/x-bzip2"}, {"7z", "application/x-7z-compressed"},
+    {"rar", "application/vnd.rar"}, {"deb", "application/vnd.debian.binary-package"},
+    {"md", "text/markdown"}, {"markdown", "text/markdown"}, {"txt", "text/plain"}, {"log", "text/x-log"},
+    {"c", "text/x-csrc"}, {"h", "text/x-chdr"}, {"cc", "text/x-c++src"}, {"cpp", "text/x-c++src"},
+    {"hpp", "text/x-c++hdr"}, {"py", "text/x-python3"}, {"sh", "application/x-shellscript"},
+    {"js", "text/javascript"}, {"ts", "text/x-typescript"}, {"rs", "text/rust"}, {"go", "text/x-go"},
+    {"lua", "text/x-lua"}, {"java", "text/x-java"}, {"rb", "application/x-ruby"}, {"zig", "text/x-zig"},
+    {"json", "application/json"}, {"xml", "application/xml"}, {"html", "text/html"}, {"htm", "text/html"},
+    {"css", "text/css"}, {"csv", "text/csv"}, {"toml", "application/toml"}, {"yaml", "application/yaml"},
+    {"yml", "application/yaml"}, {"ini", "text/plain"}, {"conf", "text/plain"}, {"cfg", "text/plain"},
+    {"desktop", "application/x-desktop"}, {"mk", "text/x-makefile"},
+};
+
+/* By content: an ELF executable, text (no NUL in the first 1 KiB), or
+   anything else. */
+static const char *apps_sniff(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0)
+        return "application/octet-stream";
+    unsigned char head[1024];
+    ssize_t length = read(fd, head, sizeof head);
+    close(fd);
+    if (length < 0)
+        return "application/octet-stream";
+    if (length >= 4 && memcmp(head, "\x7f" "ELF", 4) == 0)
+        return "application/x-executable";
+    if (memchr(head, 0, (size_t)length))
+        return "application/octet-stream";
+    return "text/plain";
+}
+
+const char *desk_mime_type(const DeskApps *apps, const char *path, const char *name)
+{
+    struct stat info;
+    if (path && stat(path, &info) == 0 && S_ISDIR(info.st_mode))
+        return "inode/directory";
+    const char *best = NULL;
+    int best_weight = -1;
+    size_t best_length = 0;
+    for (size_t i = 0; apps && i < apps->glob_count; ++i) {
+        const DeskGlob *glob = &apps->globs[i];
+        size_t length = strlen(glob->pattern);
+        if (glob->weight < best_weight || (glob->weight == best_weight && length <= best_length))
+            continue;
+        if (fnmatch(glob->pattern, name, glob->case_sensitive ? 0 : FNM_CASEFOLD) == 0) {
+            best = glob->mime;
+            best_weight = glob->weight;
+            best_length = length;
+        }
+    }
+    if (best)
+        return best;
+    if (!apps || !apps->glob_count) {
+        if (strcasecmp(name, "Makefile") == 0 || strcasecmp(name, "GNUmakefile") == 0)
+            return "text/x-makefile";
+        const char *dot = strrchr(name, '.');
+        for (size_t i = 0; dot && dot != name && i < sizeof builtin_types / sizeof *builtin_types; ++i) {
+            if (strcasecmp(dot + 1, builtin_types[i][0]) == 0)
+                return builtin_types[i][1];
+        }
+    }
+    return path ? apps_sniff(path) : "application/octet-stream";
+}
+
+const DeskApp *desk_app_find(const DeskApps *apps, const char *id)
+{
+    for (size_t i = 0; i < apps->app_count; ++i) {
+        if (strcmp(apps->apps[i].id, id) == 0)
+            return &apps->apps[i];
+    }
+    return NULL;
+}
+
+static bool apps_removed(const DeskApps *apps, const char *mime, const char *id)
+{
+    for (size_t i = 0; i < apps->association_count; ++i) {
+        const DeskAssociation *association = &apps->associations[i];
+        if (association->kind == DESK_REMOVED && strcmp(association->mime, mime) == 0 &&
+            strcmp(association->id, id) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool apps_declares(const DeskApp *app, const char *mime)
+{
+    for (size_t i = 0; i < app->mime_count; ++i) {
+        if (strcmp(app->mime_types[i], mime) == 0)
+            return true;
+    }
+    return false;
+}
+
+size_t desk_apps_for(const DeskApps *apps, const char *mime, const DeskApp **out, size_t max)
+{
+    const DeskApp **found = apps->app_count ? calloc(apps->app_count, sizeof *found) : NULL;
+    if (!found)
+        return 0;
+    size_t count = 0;
+    const char *types[2] = {mime, strncmp(mime, "text/", 5) == 0 && strcmp(mime, "text/plain") != 0 ? "text/plain"
+                                                                                                     : NULL};
+    for (int t = 0; t < 2 && types[t]; ++t) {
+        const char *type = types[t];
+        /* Defaults, then added associations, then whoever declares it. */
+        for (int kind = DESK_DEFAULT; kind <= DESK_ADDED + 1; ++kind) {
+            size_t total = kind <= DESK_ADDED ? apps->association_count : apps->app_count;
+            for (size_t i = 0; i < total; ++i) {
+                const DeskApp *app;
+                if (kind <= DESK_ADDED) {
+                    const DeskAssociation *association = &apps->associations[i];
+                    if (association->kind != kind || strcmp(association->mime, type) != 0)
+                        continue;
+                    app = desk_app_find(apps, association->id);
+                } else {
+                    app = &apps->apps[i];
+                    if (!apps_declares(app, type))
+                        continue;
+                }
+                if (!app || apps_removed(apps, type, app->id))
+                    continue;
+                bool already = false;
+                for (size_t j = 0; j < count && !already; ++j)
+                    already = found[j] == app;
+                if (!already)
+                    found[count++] = app;
+            }
+        }
+    }
+    for (size_t i = 0; i < count && i < max; ++i)
+        out[i] = found[i];
+    free(found);
+    return count;
+}
+
+struct apps_argv {
+    char **argv;
+    size_t count, capacity;
+};
+
+static bool apps_push(struct apps_argv *list, const char *text, size_t length)
+{
+    if (!apps_grow((void **)&list->argv, &list->capacity, list->count + 1, sizeof *list->argv))
+        return false;
+    if (!(list->argv[list->count] = strndup(text, length)))
+        return false;
+    list->argv[++list->count] = NULL;
+    return true;
+}
+
+static void apps_argv_free(struct apps_argv *list)
+{
+    for (size_t i = 0; i < list->count; ++i)
+        free(list->argv[i]);
+    free(list->argv);
+    *list = (struct apps_argv){0};
+}
+
+/* Split a command line into words: spaces separate, "double quotes" group
+   with \" \` \$ \\ escaped inside. Return false when a quote isn't closed. */
+static bool apps_split(const char *line, struct apps_argv *words)
+{
+    char *word = malloc(strlen(line) + 1);
+    if (!word)
+        return false;
+    const char *at = line;
+    bool ok = true;
+    while (ok) {
+        while (*at == ' ' || *at == '\t')
+            ++at;
+        if (!*at)
+            break;
+        size_t length = 0;
+        while (*at && *at != ' ' && *at != '\t') {
+            if (*at == '"') {
+                ++at;
+                while (*at && *at != '"') {
+                    if (*at == '\\' && at[1] && strchr("\"`$\\", at[1]))
+                        ++at;
+                    word[length++] = *at++;
+                }
+                if (*at != '"') {
+                    ok = false;
+                    break;
+                }
+                ++at;
+            } else {
+                word[length++] = *at++;
+            }
+        }
+        if (ok && !apps_push(words, word, length))
+            ok = false;
+    }
+    free(word);
+    return ok;
+}
+
+int desk_spawn(char *const argv[], const char *terminal, const char *directory)
+{
+    struct apps_argv full = {0};
+    if (terminal && !apps_split(terminal, &full)) {
+        apps_argv_free(&full);
+        return EINVAL;
+    }
+    for (size_t i = 0; argv[i]; ++i) {
+        if (!apps_push(&full, argv[i], strlen(argv[i]))) {
+            apps_argv_free(&full);
+            return ENOMEM;
+        }
+    }
+    if (!full.count) {
+        apps_argv_free(&full);
+        return EINVAL;
+    }
+    posix_spawnattr_t attributes;
+    posix_spawn_file_actions_t actions;
+    int error = posix_spawnattr_init(&attributes);
+    if (!error) {
+        error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSID);
+        if (!error && !(error = posix_spawn_file_actions_init(&actions))) {
+            error = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+            if (!error && directory)
+                error = posix_spawn_file_actions_addchdir_np(&actions, directory);
+            pid_t child;
+            if (!error)
+                error = posix_spawnp(&child, full.argv[0], &actions, &attributes, full.argv, environ);
+            posix_spawn_file_actions_destroy(&actions);
+        }
+        posix_spawnattr_destroy(&attributes);
+    }
+    apps_argv_free(&full);
+    return error;
+}
+
+/* Expand one word of Exec for the paths. Return false when out of memory. */
+static bool apps_expand(const DeskApp *app, const char *word, char *const paths[], size_t count,
+                        struct apps_argv *argv)
+{
+    if (strcmp(word, "%F") == 0 || strcmp(word, "%U") == 0) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!apps_push(argv, paths[i], strlen(paths[i])))
+                return false;
+        }
+        return true;
+    }
+    char *out = NULL;
+    size_t length = 0;
+    FILE *stream = open_memstream(&out, &length);
+    if (!stream)
+        return false;
+    bool only_codes = true;
+    for (const char *at = word; *at; ++at) {
+        if (*at != '%' || !at[1]) {
+            fputc(*at, stream);
+            only_codes = false;
+            continue;
+        }
+        char code = *++at;
+        if (code == '%') {
+            fputc('%', stream);
+            only_codes = false;
+        } else if ((code == 'f' || code == 'u') && count) {
+            fputs(paths[0], stream);
+        } else if (code == 'c') {
+            fputs(app->name, stream);
+        }
+        /* %i, %k and the deprecated codes expand to nothing. */
+    }
+    fclose(stream);
+    bool ok = !out || (only_codes && !length) || apps_push(argv, out, length);
+    free(out);
+    return out != NULL && ok;
+}
+
+int desk_app_launch(const DeskApp *app, char *const paths[], size_t count, const char *terminal,
+                    const char *directory)
+{
+    struct apps_argv words = {0};
+    if (!apps_split(app->exec, &words) || !words.count) {
+        apps_argv_free(&words);
+        return EINVAL;
+    }
+    bool many = false, one = false;
+    for (size_t i = 0; i < words.count; ++i) {
+        many |= strcmp(words.argv[i], "%F") == 0 || strcmp(words.argv[i], "%U") == 0;
+        one |= strstr(words.argv[i], "%f") || strstr(words.argv[i], "%u");
+    }
+    int error = 0;
+    /* An application that takes one file starts once for each. */
+    size_t runs = one && !many && count > 1 ? count : 1;
+    for (size_t run = 0; run < runs && !error; ++run) {
+        char *const *these = runs > 1 ? paths + run : paths;
+        size_t these_count = runs > 1 ? 1 : count;
+        struct apps_argv argv = {0};
+        for (size_t i = 0; i < words.count && !error; ++i) {
+            if (!apps_expand(app, words.argv[i], these, these_count, &argv))
+                error = ENOMEM;
+        }
+        if (!error)
+            error = argv.count ? desk_spawn(argv.argv, app->terminal ? terminal : NULL, directory) : EINVAL;
+        apps_argv_free(&argv);
+    }
+    apps_argv_free(&words);
+    return error;
+}
+
+int desk_mimeapps_set_default(const char *mime, const char *id)
+{
+    const char *config = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    char *path = NULL;
+    if (config && config[0] == '/') {
+        if (asprintf(&path, "%s/mimeapps.list", config) < 0)
+            return ENOMEM;
+    } else if (home && *home) {
+        if (asprintf(&path, "%s/.config/mimeapps.list", home) < 0)
+            return ENOMEM;
+    } else {
+        return ENOENT;
+    }
+    char *text = apps_read(path);
+    if (!text && errno != ENOENT) {
+        free(path);
+        return errno;
+    }
+    char *out = NULL;
+    size_t out_length = 0;
+    FILE *stream = open_memstream(&out, &out_length);
+    if (!stream) {
+        free(text);
+        free(path);
+        return ENOMEM;
+    }
+    /* Copy the lines, replacing mime's in the two sections, and add them at
+       each section's end (or a new section) when they weren't there. */
+    static const char *const sections[2] = {"[Default Applications]", "[Added Associations]"};
+    bool done[2] = {false, false}, seen[2] = {false, false};
+    int section = -1;
+    size_t mime_length = strlen(mime);
+    for (char *line = text, *next; line && *line; line = next) {
+        next = strchr(line, '\n');
+        if (next)
+            *next++ = 0;
+        if (line[0] == '[') {
+            if (section >= 0 && !done[section]) {
+                fprintf(stream, "%s=%s;\n", mime, id);
+                done[section] = true;
+            }
+            section = -1;
+            for (int i = 0; i < 2; ++i) {
+                if (strncmp(line, sections[i], strlen(sections[i])) == 0) {
+                    section = i;
+                    seen[i] = true;
+                }
+            }
+        } else if (section >= 0 && strncmp(line, mime, mime_length) == 0 &&
+                   (line[mime_length] == '=' || line[mime_length] == ' ')) {
+            if (section == 0) {
+                fprintf(stream, "%s=%s;\n", mime, id);
+            } else {
+                /* Added associations: id first, the others kept after it. */
+                const char *list = strchr(line, '=');
+                fprintf(stream, "%s=%s;", mime, id);
+                char *copy = strdup(list ? list + 1 : "");
+                for (char *other = copy ? strtok(copy, ";") : NULL; other; other = strtok(NULL, ";")) {
+                    while (*other == ' ')
+                        ++other;
+                    if (*other && strcmp(other, id) != 0)
+                        fprintf(stream, "%s;", other);
+                }
+                free(copy);
+                fputc('\n', stream);
+            }
+            done[section] = true;
+            continue;
+        }
+        fprintf(stream, "%s\n", line);
+    }
+    if (section >= 0 && !done[section]) {
+        fprintf(stream, "%s=%s;\n", mime, id);
+        done[section] = true;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (!seen[i])
+            fprintf(stream, "%s%s\n%s=%s;\n", out_length || ftell(stream) ? "\n" : "", sections[i], mime, id);
+    }
+    fclose(stream);
+    free(text);
+    int error = ENOMEM;
+    if (out) {
+        char *directory = strdup(path);
+        char *slash = directory ? strrchr(directory, '/') : NULL;
+        if (slash)
+            *slash = 0;
+        error = directory ? desk_mkdirs(directory, 0700) : ENOMEM;
+        free(directory);
+        DeskAtomic atomic;
+        if (!error && !(error = desk_atomic_open(&atomic, path, 0644))) {
+            fwrite(out, 1, out_length, atomic.file);
+            error = desk_atomic_commit(&atomic, true);
+            desk_atomic_abort(&atomic);
+        }
+    }
+    free(out);
+    free(path);
+    return error;
+}
+#endif
+
 #ifdef DESK_IMAGE
 /* Image decoding. Moved from wall, which printed these same messages. */
 

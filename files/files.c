@@ -2,6 +2,8 @@
 #include "files.h"
 
 #include <ctype.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/eventfd.h>
@@ -37,7 +39,7 @@
 #define SIDEBAR_CELLS 60      /* Narrower than this, the sidebar goes. */
 #define SIDEBAR_WIDTH 180     /* Logical pixels, to begin with. */
 #define SIDEBAR_MIN 100       /* No narrower than this, and no wider than half the window. */
-#define SIDEBAR_STEP 20       /* < and > change the width by this. */
+#define TYPE_RESET_MS 1000    /* Type to select starts over after this long without a key. */
 #define DIVIDER_GRAB 5        /* Logical pixels either side of a divider that grab it. */
 #define DOUBLE_CLICK_MS 400
 #define NAME_MIN 150          /* Logical pixels the name column keeps before the others narrow. */
@@ -558,6 +560,30 @@ static void save_state(struct files *files)
     desk_atomic_abort(&atomic); /* Frees what's left, after success or failure. */
 }
 
+/* Applications marked Terminal=true run in run's terminal (its
+   [applications] terminal setting), "deal -e" by default. */
+static void terminal_entry(void *data, const char *section, const char *key, const char *value, int line)
+{
+    (void)line;
+    char **terminal = data;
+    if (key && strcmp(section, "applications") == 0 && strcmp(key, "terminal") == 0 && *value) {
+        char *copy = strdup(value);
+        if (copy) {
+            free(*terminal);
+            *terminal = copy;
+        }
+    }
+}
+
+static char *terminal_command(void)
+{
+    char *terminal = NULL, *path = desk_config_path("run");
+    if (path)
+        desk_ini_load(path, terminal_entry, &terminal);
+    free(path);
+    return terminal ? terminal : strdup("deal -e");
+}
+
 /* Places */
 
 static bool is_directory(const char *path)
@@ -969,6 +995,8 @@ static void enter(struct files *files, char *path, const char *select)
     files->search[0] = 0;
     files->search_cursor = 0;
     files->search_focus = false;
+    files->typed[0] = 0;
+    files->notice[0] = 0;
     struct memory *memory = find_memory(files, path);
     load(files, select ? select : memory ? memory->name : NULL, 0);
     watch_directory(files);
@@ -1063,11 +1091,92 @@ static void go_up(struct files *files)
     free(came_from);
 }
 
+static void notify(struct files *files, const char *format, ...) __attribute__((format(printf, 2, 3)));
+
+/* A line over the foot of the list, until the next click or key. */
+static void notify(struct files *files, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(files->notice, sizeof files->notice, format, arguments);
+    va_end(arguments);
+    desk_window_redraw(&files->window);
+}
+
+static void clear_notice(struct files *files)
+{
+    if (files->notice[0]) {
+        files->notice[0] = 0;
+        desk_window_redraw(&files->window);
+    }
+}
+
+/* Types that are text even though they aren't text/: they open in the
+   editor when nothing else claims them. */
+static bool text_like(const char *mime)
+{
+    static const char *const types[] = {"application/json", "application/xml", "application/toml",
+                                        "application/yaml", "application/x-shellscript", "application/x-desktop",
+                                        "application/javascript", "application/x-ruby", "application/x-perl",
+                                        "application/sql", NULL};
+    if (strncmp(mime, "text/", 5) == 0)
+        return true;
+    size_t length = strlen(mime);
+    if (length > 4 && (strcmp(mime + length - 4, "+xml") == 0 || strcmp(mime + length - 5, "+json") == 0))
+        return true;
+    for (int i = 0; types[i]; ++i) {
+        if (strcmp(mime, types[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Open a file with its type's default application, as other desktops do:
+   mimeapps.list, then the applications that declare the type. Text nothing
+   claims goes to editor in the terminal. Programs aren't run. */
+static void open_file(struct files *files, const struct entry *entry)
+{
+    char *path = join_path(files->path, entry->name);
+    if (!path)
+        return;
+    DeskApps apps;
+    if (desk_apps_load(&apps) != 0) {
+        notify(files, "Out of memory");
+        free(path);
+        return;
+    }
+    const char *mime = desk_mime_type(&apps, path, entry->name);
+    const DeskApp *app = NULL;
+    desk_apps_for(&apps, mime, &app, 1);
+    int error = 0;
+    if (app) {
+        error = desk_app_launch(app, &path, 1, files->terminal, files->path);
+        if (error)
+            notify(files, "Couldn't start %s: %s", app->name, strerror(error));
+    } else if (text_like(mime)) {
+        char *argv[] = {"editor", path, NULL};
+        if ((error = desk_spawn(argv, files->terminal, files->path)))
+            notify(files, "Couldn't start editor: %s", strerror(error));
+    } else {
+        notify(files, "No application is set up to open %s (%s)", entry->name, mime);
+    }
+    desk_apps_free(&apps);
+    free(path);
+}
+
+/* Enter or double-click: into a directory, or open a file. */
 static void go_in(struct files *files)
 {
     struct entry *entry = cursor_entry(files);
-    if (!entry || !entry->directory)
-        return; /* Opening files comes in 0.3. */
+    if (!entry)
+        return;
+    if (!entry->directory) {
+        if (!entry->broken)
+            open_file(files, entry);
+        else
+            notify(files, "%s is a broken link", entry->name);
+        return;
+    }
     char *path = join_path(files->path, entry->name);
     if (path)
         go_to(files, path, NULL);
@@ -1187,21 +1296,6 @@ static void scroll_lines(struct files *files, long lines)
     }
 }
 
-/* Half a page, moving the view with the cursor like a pager. */
-static void scroll_half(struct files *files, int direction)
-{
-    long half = files->page_rows > 1 ? files->page_rows / 2 : 1;
-    long top = (long)files->top + direction * half;
-    long last_top = (long)line_count(files) - files->page_rows;
-    if (top > last_top)
-        top = last_top;
-    if (top < 0)
-        top = 0;
-    files->top = (size_t)top;
-    move_cursor(files, direction * half * (long)columns(files));
-    desk_window_redraw(&files->window);
-}
-
 /* Filter again after show_hidden or the search changed, keeping the cursor
    on the same entry or the next one still shown. */
 static void refilter(struct files *files)
@@ -1319,15 +1413,6 @@ static void set_sidebar_width(struct files *files, double width)
         files->sidebar_width = width;
         desk_window_redraw(&files->window);
     }
-}
-
-/* < and >: narrower or wider by a step. */
-static void resize_sidebar(struct files *files, int direction)
-{
-    if (!files->panes.sidebar)
-        return;
-    set_sidebar_width(files, files->sidebar_width + direction * SIDEBAR_STEP);
-    save_state(files);
 }
 
 static void reset_sidebar(struct files *files)
@@ -1654,8 +1739,8 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
     long line = (long)columns(files);
     if (mods & DESK_MOD_CTRL) {
         switch (sym) {
-        case XKB_KEY_d: scroll_half(files, 1); return true;
-        case XKB_KEY_u: scroll_half(files, -1); return true;
+        case XKB_KEY_h: toggle_hidden(files); return false;
+        case XKB_KEY_r: refresh(files); return false;
         case XKB_KEY_q: files->running = false; return false;
         case XKB_KEY_t: new_tab(files, strdup(files->path), true); return false;
         case XKB_KEY_w: close_tab(files, files->current_tab); return false;
@@ -1686,48 +1771,37 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         case XKB_KEY_Left: go_back(files); return false;
         case XKB_KEY_Right: go_forward(files); return false;
         case XKB_KEY_Up: go_up(files); return false;
+        case XKB_KEY_Home: go_home(files); return false;
         default: return false;
         }
     }
     if (mods & DESK_MOD_LOGO)
         return false;
     switch (sym) {
-    case XKB_KEY_j:
     case XKB_KEY_Down:
         move_cursor(files, line);
         return true;
-    case XKB_KEY_k:
     case XKB_KEY_Up:
         move_cursor(files, -line);
         return true;
     case XKB_KEY_Right:
         if (icons)
             move_cursor(files, 1);
-        else
-            go_in(files);
-        return true;
+        return icons;
     case XKB_KEY_Left:
         if (icons)
             move_cursor(files, -1);
-        else
-            go_up(files);
-        return true;
-    case XKB_KEY_l:
-        go_in(files);
-        return true;
+        return icons;
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
         go_in(files);
         return false;
-    case XKB_KEY_h:
     case XKB_KEY_BackSpace:
         go_up(files);
         return true;
-    case XKB_KEY_g:
     case XKB_KEY_Home:
         move_cursor(files, -(long)files->listing.shown_count);
         return false;
-    case XKB_KEY_G:
     case XKB_KEY_End:
         move_cursor(files, (long)files->listing.shown_count);
         return false;
@@ -1737,36 +1811,68 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
     case XKB_KEY_Page_Up:
         move_cursor(files, -page(files));
         return true;
-    case XKB_KEY_minus:
-        go_back(files);
+    case XKB_KEY_F5:
+        refresh(files);
         return false;
-    case XKB_KEY_less:
-        resize_sidebar(files, -1);
-        return true;
-    case XKB_KEY_greater:
-        resize_sidebar(files, 1);
-        return true;
-    case XKB_KEY_equal:
-        reset_sidebar(files);
-        return false;
-    case XKB_KEY_b:
     case XKB_KEY_F9:
         toggle_sidebar(files);
-        return false;
-    case XKB_KEY_period:
-        toggle_hidden(files);
-        return false;
-    case XKB_KEY_asciitilde:
-        go_home(files);
         return false;
     case XKB_KEY_Escape:
         search_clear(files);
         return false;
-    case XKB_KEY_q:
-        files->running = false;
-        return false;
     default:
         return false;
+    }
+}
+
+static uint64_t now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+/* Whether name starts with prefix, ignoring ASCII case. */
+static bool starts_with(const char *name, const char *prefix)
+{
+    return strncasecmp(name, prefix, strlen(prefix)) == 0;
+}
+
+/* Type to select: jump to the first name starting with what's been typed
+   in the last second. The same letter again goes to the next name starting
+   with it. */
+static void type_to_select(struct files *files, const char *text, size_t length)
+{
+    struct listing *listing = &files->listing;
+    uint64_t now = now_ms();
+    if (now - files->typed_at > TYPE_RESET_MS)
+        files->typed[0] = 0;
+    files->typed_at = now;
+    size_t used = strlen(files->typed); /* Bytes; letters are compared as bytes too. */
+    if (used + length >= sizeof files->typed)
+        return;
+    memcpy(files->typed + used, text, length);
+    files->typed[used + length] = 0;
+    /* One letter over and over cycles through the names starting with it. */
+    bool cycling = true;
+    for (size_t i = 0; files->typed[i]; ++i)
+        cycling &= strncasecmp(files->typed + i, files->typed, length) == 0 && (i % length) == 0;
+    const char *prefix = files->typed;
+    size_t start = files->cursor;
+    if (cycling) {
+        /* A first letter, or the same one again: the next name after this. */
+        files->typed[length] = 0;
+        start = files->cursor + 1;
+    }
+    size_t count = listing->shown_count;
+    for (size_t step = 0; step < count; ++step) {
+        size_t index = (start + step) % count;
+        if (starts_with(listing->entries[listing->shown[index]].name, prefix)) {
+            files->cursor = index;
+            files->free_scroll = false;
+            desk_window_redraw(&files->window);
+            return;
+        }
     }
 }
 
@@ -1776,10 +1882,19 @@ static bool handle_key(struct files *files, uint32_t key)
 {
     xkb_keysym_t sym = desk_keyboard_sym(&files->keyboard, key);
     unsigned mods = desk_keyboard_mods(&files->keyboard);
+    clear_notice(files);
     if (files->search_focus) {
         int repeats = search_key(files, key, sym, mods);
         if (repeats >= 0)
             return repeats;
+    }
+    if (!(mods & (DESK_MOD_CTRL | DESK_MOD_ALT | DESK_MOD_LOGO)) && files->keyboard.state) {
+        char typed[16];
+        int length = xkb_state_key_get_utf8(files->keyboard.state, key + 8, typed, sizeof typed);
+        if (length > 0 && (unsigned char)typed[0] > 0x20 && typed[0] != 0x7f) {
+            type_to_select(files, typed, (size_t)length);
+            return false;
+        }
     }
     return key_action(files, sym, mods);
 }
@@ -2654,6 +2769,20 @@ static void paint_sidebar(struct files *files, DeskCanvas *canvas, const struct 
     }
 }
 
+/* The notice, if any, in a bar across the foot of the list. */
+static void paint_notice(struct files *files, DeskCanvas *canvas, const struct layout *ui, int bottom)
+{
+    if (!files->notice[0])
+        return;
+    const struct colors *colors = &files->colors;
+    const struct panes *panes = &files->panes;
+    int height = ui->row_height, top = bottom - height;
+    desk_canvas_fill(canvas, panes->list_left, top, panes->list_right - panes->list_left, height,
+                     mix(colors->background, colors->muted, 60));
+    draw_clipped(ui->font, canvas, panes->list_left + ui->padding, panes->list_right - ui->padding,
+                 top + ui->baseline, files->notice, colors->foreground);
+}
+
 static void paint(struct files *files, DeskCanvas *canvas)
 {
     const struct colors *colors = &files->colors;
@@ -2730,6 +2859,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
     const char *message = empty_message(files, &message_color);
     if (message) {
         draw_message(&area, &list, panes->list_left, top, message, message_color);
+        paint_notice(files, &area, &ui, bottom);
         return;
     }
     size_t lines = line_count(files), per_line = columns(files);
@@ -2741,6 +2871,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
         paint_icons(files, &area, &ui, panes->list_left, top, panes->rows + 1);
     else
         paint_list(files, &area, &list, panes->list_left, panes->list_right, top, panes->rows + 1);
+    paint_notice(files, &area, &ui, bottom);
 }
 
 static void draw(void *data, DeskWindow *window)
@@ -3023,6 +3154,7 @@ static void click(struct files *files, uint32_t time)
                  target.index == files->press.index && time - files->press_time < DOUBLE_CLICK_MS;
     files->press = target;
     files->press_time = time;
+    clear_notice(files);
     if (target.kind != TARGET_SEARCH && target.kind != TARGET_SEARCH_CLEAR)
         search_focus(files, false);
     switch (target.kind) {
@@ -3497,9 +3629,10 @@ static void usage(FILE *stream)
           "  -v, --version  Show the version\n"
           "\n"
           "Keys: arrows move, Enter opens, Backspace goes up, Alt+Left/Right back and\n"
-          "forward, Ctrl+T/W new and close tab, Ctrl+Tab next tab, Ctrl+F search,\n"
-          "Ctrl+1/2 list or icons, Ctrl+plus/minus/0 zoom, F9 sidebar, . hidden files,\n"
-          "Ctrl+Q quits. Ctrl+wheel zooms; middle-click opens a folder in a new tab.\n",
+          "forward, Alt+Home home, typing a name selects it, Ctrl+T/W new and close\n"
+          "tab, Ctrl+Tab next tab, Ctrl+F search, Ctrl+H hidden files, F5 refresh,\n"
+          "F9 sidebar, Ctrl+1/2 list or icons, Ctrl+plus/minus/0 zoom, Ctrl+Q quits.\n"
+          "Double-click opens; middle-click opens a folder in a new tab.\n",
           stream);
 }
 
@@ -3589,6 +3722,8 @@ int main(int argc, char **argv)
 
     files.mounts = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
     files.sizer = sizer_create(); /* Without it, directories just show no size. */
+    files.terminal = terminal_command();
+    signal(SIGCHLD, SIG_IGN); /* Applications started are left to themselves. */
     files.tabs = calloc(1, sizeof *files.tabs);
     if (!files.tabs) {
         fprintf(stderr, "files: out of memory\n");
@@ -3615,6 +3750,7 @@ int main(int argc, char **argv)
         close(files.refresh);
     sizer_destroy(files.sizer);
     free(files.sized_path);
+    free(files.terminal);
     listing_free(&files.listing);
     places_free(files.places, files.place_count);
     free(files.toolbar.crumbs);

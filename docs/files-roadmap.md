@@ -42,8 +42,8 @@ dwl already supports everything files needs: xdg-shell, viewporter, fractional s
 | Font loading (fontconfig match with fallback faces), glyph cache, measuring, drawing into ARGB buffers with clipping | 2, new (`-DDESK_FONT`: freetype2, fontconfig) | 0.1 | Step 5. files is the fourth copy otherwise |
 | xkb keymap and modifier state from `wl_keyboard` | 1 | 0.1 | Step 6. view moves onto it in the same change |
 | A plain xdg-shell window with scale tracking (`DeskWindow`: surface, toplevel, viewport, fractional scale, configure and close) | 1 | 0.1 | Step 4, for toplevels. view moves onto it |
-| Desktop entries and `mimeapps.list` lookup (`desk_app_for_type`, `desk_app_exec` with field codes and a detached spawn) | 0 | 0.3 | None yet. run moves onto the parser later |
-| MIME type of a file (`desk_mime_type`: globs2, built-in table, sniffing) | 0 | 0.3 | None |
+| Desktop entries, `mimeapps.list` and launching (`-DDESK_APPS`: `desk_apps_load`, `desk_apps_for`, `desk_app_launch` with field codes and a detached spawn, `desk_mimeapps_set_default`) | 0 | 0.3 (done) | None yet. run moves onto the parser later |
+| MIME type of a file (`desk_mime_type`: globs2, built-in table, sniffing) | 0 | 0.3 (done) | None |
 | Popup menus (`xdg_popup` with a grab, positioned against the window, closing on a click outside) | 1 | 0.3 | Step 4, for popups. bar's menus could move onto it |
 | A one-line text field (cursor, selection, word movement, clipboard paste), for the path, search, rename and the picker's name | 2 | 0.3 | None. run's prompt could move onto it |
 
@@ -153,7 +153,9 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 
 ---
 
-## 0.3: Opening, menus, finding and sorting
+## 0.3: Opening, menus and finding
+
+Progress: opening files, the standard keys and type to select are in (0.3.0), with desk's new `DESK_APPS` piece (desktop entries, `mimeapps.list`, MIME types, launching). The menu, Open with, typing a path and bookmarks are next. Sorting moved into 0.2.
 
 ### Opening files
 
@@ -438,7 +440,7 @@ How applications pick up the portal (to confirm against the installed versions):
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Not started |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | In progress: opening, keys and type to select done |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |

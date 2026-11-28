@@ -38,18 +38,18 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 
 | Key | Action |
 |---|---|
-| `j` / Down, `k` / Up | Next, previous entry (a row of icons in the icon view) |
-| `l` / Right / Enter | Into the directory. On a file nothing happens yet (opening comes in 0.3). In the icon view Right moves to the next icon |
-| `h` / Left / Backspace, Alt+Up | Up to the parent, with the directory you came from selected. In the icon view Left moves to the previous icon |
-| Alt+Left or `-`, Alt+Right | Back, forward through the directories visited |
-| `g` / Home, `G` / End | First, last entry |
-| Ctrl+D, Ctrl+U | Half a page down, up, moving the view with the cursor |
-| Page Down, Page Up | A page down, up |
-| `b`, F9 | Show or hide the sidebar |
-| `<`, `>` | Make the sidebar narrower, wider |
-| `=` | Reset the sidebar's width |
-| `.` | Show or hide hidden files |
-| `~` | Home |
+| Up, Down | Previous, next entry (a row of icons in the icon view) |
+| Left, Right | Previous, next icon in the icon view |
+| Enter | Open: into a directory, or a file with its application (see Opening files) |
+| Backspace, Alt+Up | Up to the parent, with the directory you came from selected |
+| Alt+Left, Alt+Right | Back, forward through the directories visited |
+| Alt+Home | Home |
+| Home, End | First, last entry |
+| Page Up, Page Down | A page up, down |
+| Letters and digits | Type to select: the next name starting with what you type |
+| Ctrl+H | Show or hide hidden files |
+| F5, Ctrl+R | Refresh |
+| F9 | Show or hide the sidebar |
 | Ctrl+T | New tab, in the same directory |
 | Ctrl+W | Close the tab; the last one closes the window |
 | Ctrl+Tab, Ctrl+Shift+Tab (or Ctrl+Page Down, Page Up) | Next, previous tab |
@@ -58,11 +58,24 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Escape | Clear the search |
 | Ctrl+1, Ctrl+2 | List, icons |
 | Ctrl+plus, Ctrl+minus, Ctrl+0 | Zoom in, out (switching view at either end), back to normal |
-| `q`, Ctrl+Q | Quit |
+| Ctrl+Q | Quit |
 
 While the search field has the focus, typing goes into it: Left, Right, Home and End move, Backspace and Delete delete (a word with Ctrl), Escape clears it, and Enter, Tab or Down give the focus back to the list with the search kept. Ctrl shortcuts still work.
 
-Movement keys repeat while held, at the compositor's rate. Enter doesn't repeat, so holding it can't dive down the tree.
+Type to select works like other explorers: typing letters within a second of each other jumps to the first name starting with them, ignoring case; typing the same letter again moves on to the next name starting with it. After a second without typing it starts over.
+
+0.1's letter keys (`h`, `j`, `k`, `l`, `g`, `q` and the rest) are gone, so letters can select. Movement keys repeat while held, at the compositor's rate. Enter doesn't repeat, so holding it can't dive down the tree.
+
+## Opening files
+
+Double-click or Enter opens a file the way other Linux desktops do:
+
+1. Its type comes from shared-mime-info's database (`/usr/share/mime/globs2`) by name. Without shared-mime-info, files knows the common extensions itself. Failing both, it looks at the content: text, an ELF program, or unknown.
+2. The application is the default for that type in `mimeapps.list` (`~/.config/mimeapps.list` first, then the system's), then other associations listed there, then any application whose desktop entry (in `~/.local/share/applications` and `/usr/share/applications`) declares the type. Text types also get text/plain's applications.
+3. It starts in the file's directory, in its own session, so closing files doesn't close it. An application with `Terminal=true` (like mark) runs inside the terminal set in run's config (`[applications] terminal`), `deal -e` by default.
+4. Text that nothing claims opens in `editor` in that terminal. Anything else shows a line at the foot of the list saying nothing is set up to open it, until the next click or key.
+
+Programs aren't run by double-clicking: an executable opens like any other file of its type. Running one comes with the right-click menu.
 
 ## Mouse
 
@@ -76,7 +89,7 @@ Movement keys repeat while held, at the compositor's rate. Enter doesn't repeat,
 | A place in the sidebar | Goes there |
 | The search field | Focuses it, with the cursor where you clicked; its × clears it |
 | The list and icon buttons (right end) | Switch the view |
-| An entry | Selects it; double-click goes into a directory (opening files comes in 0.3) |
+| An entry | Selects it; double-click opens it (goes into a directory, or opens a file) |
 | Middle-click on a directory, place or path piece | Opens it in a new tab behind this one |
 | The wheel over the entries | Scrolls them, three rows a notch (a row of icons in the icon view), without moving the selection. Touchpads scroll by distance |
 | Ctrl+wheel | Zooms; past the biggest list it turns into icons, and past the smallest icons back into the list |
@@ -168,6 +181,13 @@ files will only change things inside your home directory: that's the rule every 
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
 - [x] The list has a Name, Type, Size, Modified header lined up with its columns.
 - [x] Folders show their summed size, and sorting by Size orders them by it.
+
+## Manual checks (0.3)
+
+- [x] Opening a file starts the application mimeapps.list or a desktop entry gives it, expanding `%f`, `%F` and `%c` (checked with test entries).
+- [x] Text nothing claims opens in `editor`; a file nothing opens says so.
+- [x] Typing letters selects by name; the same letter again cycles.
+- [ ] Double-clicking a PNG opens view and a `.md` opens mark in deal, once both are installed (`make install` and their desktop entries).
 - [ ] Clicking headings sorts and reverses; dragging an edge resizes, double-clicking resets, and both come back after a restart.
 - [ ] Narrowing the window narrows the columns instead of hiding them.
 - [ ] Tabs open, close and switch by clicking, middle-click and keys, each keeping its place.

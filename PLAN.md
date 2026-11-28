@@ -172,6 +172,7 @@ shot and view have grown desk further ahead of this phase. What's already there 
 | Atomic files, `desk_shm_open` | shot 0.1 | shot | none |
 | Image decoding (`-DDESK_IMAGE`, PNG, JPEG, optional GIF and WebP, EXIF orientation) | wall, moved for view 0.1 | wall, view | none |
 | Fonts with fallback, glyph cache, canvas (`-DDESK_FONT`) | files 0.1 | files | 5 (bar, run, wall and deal's rasterizer still have their own) |
+| Desktop entries, `mimeapps.list`, MIME types and detached launching (`-DDESK_APPS`) | files 0.3 | files | none yet (run still parses desktop entries itself) |
 | xkb keymap and modifiers (`-DDESK_KEYBOARD`) | files 0.1 | files, view | 6 (run and deal still have their own; compose to come) |
 | xdg-shell window with scale tracking (`-DDESK_WINDOW`) | files 0.1 | files, view | 4, for toplevels |
 
@@ -238,7 +239,7 @@ A graphical file manager that works like a normal explorer, mouse first with the
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Not started |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | In progress: opening, keys and type to select done |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |

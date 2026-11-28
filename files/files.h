@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.2.6"
+#define FILES_VERSION "0.3.0"
 
 /* Exit statuses. */
 enum {
@@ -187,6 +187,10 @@ struct files {
     int resizing;             /* The COLUMN_ whose left edge is being dragged, or 0. */
     struct sizer *sizer;      /* Sums directories' sizes on a thread. */
     char *sized_path;         /* The directory whose sizes it's summing. */
+    char typed[64];           /* Type to select: what's been typed lately... */
+    uint64_t typed_at;        /* ...and when, monotonic ms. */
+    char notice[256];         /* Shown over the list's foot until the next click or key, or "". */
+    char *terminal;           /* Runs Terminal=true applications: run's setting, or "deal -e". */
     char search[SEARCH_MAX];  /* Filters the list as it's typed. */
     size_t search_cursor;     /* Byte offset in search. */
     bool search_focus;        /* Keys go to the search field. */
