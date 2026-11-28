@@ -4233,6 +4233,13 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
             menu_choose(files, menu, menu_item_at(menu, files->pointer_y), false);
         return;
     }
+    /* The compositor closes menus for clicks on other clients; a click on
+       this window closes them here, and does nothing else. */
+    if (files->menus[0].open) {
+        if (pressed)
+            close_menus(files);
+        return;
+    }
     if (button == BTN_SIDE || button == BTN_BACK) {
         if (pressed)
             go_back(files);
