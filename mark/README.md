@@ -1,6 +1,6 @@
 # mark
 
-`mark` shows markdown in the terminal. It lays a file out for the terminal's width, with real bold and italic, underlined links you can Ctrl+click in deal, shaded code blocks and box-drawn tables, and shows it in its own pager (0.3). Link following, search and the config file come next; what's left is in [docs/mark-roadmap.md](../docs/mark-roadmap.md).
+`mark` shows markdown in the terminal. It lays a file out for the terminal's width, with real bold and italic, underlined links you can Ctrl+click in deal, shaded code blocks and box-drawn tables, and shows it in its own pager, where you can follow links between files, search, and jump between headings. The config file and the wallpaper's colors come next; what's left is in [docs/mark-roadmap.md](../docs/mark-roadmap.md).
 
 The parser is hand-written and follows CommonMark 0.31.2, passing all 652 of the spec's examples, plus GitHub's tables, strikethrough, task lists and bare-URL autolinks, passing GitHub's 21 examples for them. It's one `mark.c` and one `mark.h` with nothing beyond the C library.
 
@@ -46,10 +46,22 @@ The document opens on the terminal's alternate screen, so quitting leaves the sh
 | `d`, Ctrl+D / `u`, Ctrl+U | Down / up half a screen |
 | `g`, Home, `<` / `G`, End, `>` | Top / bottom |
 | `l`, Right / `h`, Left | Scroll tables wider than the screen sideways |
+| Tab / Shift+Tab | Focus the next / previous link; the status line shows where it goes |
+| Enter | Follow the focused link (with none focused, down a line) |
+| Click | Follow the link under the pointer |
+| Backspace | Back to where you were before the last link or jump |
+| `/`, `?` | Search forward, backward; `n` and `N` repeat it |
+| `]`, `[` | Next, previous heading |
+| `o` | Outline of the headings: move with `j`/`k`, Enter jumps |
 | Mouse wheel | Three lines per notch; a horizontal wheel scrolls sideways |
-| `q`, Escape, Ctrl+C | Quit |
+| Escape | Clear a focused link or search highlights; with neither, quit |
+| `q`, Ctrl+C | Quit |
 | `r`, Ctrl+L | Redraw |
 | Ctrl+Z | Suspend to the shell (`fg` to come back) |
+
+Following a link to another markdown file (`.md`, `.markdown`) opens it in the pager, at the heading its `#anchor` names; an `#anchor` alone jumps within the document, using GitHub's heading anchors. Other links go to `xdg-open` (from `xdg-utils`), which runs detached; without it, the status line says so and shows the link. Backspace returns through up to 32 places.
+
+Search is plain text over what's on screen, case-insensitive unless the pattern has a capital. Matches are highlighted, the current one in yellow; a phrase broken across two lines isn't found.
 
 Resizing the window reflows the text and keeps the paragraph you were reading at the top. Code blocks wrap; only tables too wide even after their columns shrink run past the right edge, and only they move with `←` and `→`. The pager reports mouse clicks so the wheel works, so in deal select text with Shift held.
 
@@ -104,6 +116,15 @@ Only the most common named entities are known (`&copy;`, `&mdash;`, `&nbsp;` and
 - Each `tests/NAME.md` must render to `NAME.txt` with `--plain`, and to `NAME.ansi` with escapes. A name ending in `-N` renders at width `N`.
 - Exit codes, standard input, line endings, invalid UTF-8 and `NO_COLOR`.
 - `tests/commonmark.py` runs the CommonMark 0.31.2 examples (`tests/spec.json`) through a test build with extra `--html` and `--commonmark` options and compares the HTML, does the same for GitHub's examples of the extensions (`tests/gfm.json`, from cmark-gfm's `test/spec.txt`), then times inputs that make naive parsers quadratic (thousands of unclosed brackets, emphasis or comments, deep nesting, one very long line, huge tables). Each must finish within two seconds.
+
+## Manual checks (0.4)
+
+Checked offline in a pty: following links across files and anchors and coming back, missing files and a missing opener, search and its highlights, heading jumps, the outline and clicks, and the back stack's limit, plus random input under ASan and UBSan.
+
+- [ ] `mark PLAN.md`: Tab to `docs/view-roadmap.md` and Enter opens it; Backspace returns to the same spot. A link to an `#anchor` jumps.
+- [ ] `/foot` finds every match, `n` wraps with a message, Escape clears the highlights.
+- [ ] `]` steps through headings; `o` lists them, and Enter and clicks jump.
+- [ ] With `xdg-utils` installed, an `https://` link opens in the browser and mark keeps running.
 
 ## Manual checks (0.3)
 

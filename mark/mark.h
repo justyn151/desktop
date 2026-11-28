@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MARK_VERSION "0.3.0"
+#define MARK_VERSION "0.4.0"
 
 /* Exit statuses. */
 enum {
@@ -175,6 +175,12 @@ struct line {
     int32_t heading;     /* Into page.headings: the section it's in, or -1. */
 };
 
+struct heading {
+    char *text;   /* As rendered, without the #### marks. */
+    int level;
+    size_t line;  /* Its first line. */
+};
+
 /* The document laid out for one width. */
 struct page {
     struct buf text;
@@ -184,9 +190,11 @@ struct page {
     size_t line_count, line_cap;
     struct style *styles;
     size_t style_count, style_cap;
-    char **links;
+    char **links;        /* Resolved for OSC 8; NULL when there's nothing to resolve against. */
     size_t link_count, link_cap;
-    char **headings;     /* Each heading's text, for the pager's status line. */
+    char **targets;      /* The pager's copy of each link as written. */
+    size_t target_cap;
+    struct heading *headings;
     size_t heading_count, heading_cap;
 };
 

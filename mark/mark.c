@@ -7,6 +7,8 @@
 #include <getopt.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <limits.h>
@@ -2487,13 +2489,6 @@ static uint16_t intern_style(struct page *pg, struct style s)
     return (uint16_t)pg->style_count++;
 }
 
-static int32_t add_link(struct page *pg, char *url)
-{
-    if (!url) return -1;
-    grow(&pg->links, &pg->link_cap, pg->link_count + 1, sizeof *pg->links);
-    pg->links[pg->link_count] = url;
-    return (int32_t)pg->link_count++;
-}
 
 static void push_glyph(struct glyphs *g, struct glyph glyph)
 {
@@ -2758,6 +2753,23 @@ static struct style with_color(struct style s, int fg)
 
 /* Turn inlines into glyphs, without recursion: emphasis can nest as deep
    as the text is long. */
+/* A link's index for its glyphs. Printed, a link that can't be resolved
+   (a relative one read from standard input) isn't one; the pager keeps
+   every link as written, so it can follow #anchors and relative paths. */
+static int32_t add_link(struct layout *L, const char *raw)
+{
+    struct page *pg = L->page;
+    char *url = resolve_url(L->opt, raw);
+    if (!url && !L->opt->pager) return -1;
+    grow(&pg->links, &pg->link_cap, pg->link_count + 1, sizeof *pg->links);
+    pg->links[pg->link_count] = url;
+    if (L->opt->pager) {
+        grow(&pg->targets, &pg->target_cap, pg->link_count + 1, sizeof *pg->targets);
+        pg->targets[pg->link_count] = xstrdup(raw);
+    }
+    return (int32_t)pg->link_count++;
+}
+
 static void flatten(struct layout *L, const struct inline_node *first, struct style base, struct glyphs *out)
 {
     struct frame {
@@ -2813,11 +2825,11 @@ static void flatten(struct layout *L, const struct inline_node *first, struct st
             } else if (node->type == I_LINK) {
                 style.underline = UNDERLINE_SINGLE;
                 style.underline_color = COLOR_ACCENT;
-                link = add_link(pg, resolve_url(L->opt, node->url));
+                link = add_link(L, node->url);
             } else {
                 style.attr |= ATTR_ITALIC;
                 style.fg = COLOR_MUTED;
-                link = add_link(pg, resolve_url(L->opt, node->url));
+                link = add_link(L, node->url);
                 push_text(pg, out, "[image: ", 8, intern_style(pg, style), link, NULL);
             }
             node = node->first;
@@ -2871,7 +2883,7 @@ static void layout_heading(struct layout *L, const struct block *b)
     }
     struct page *pg = L->page;
     grow(&pg->headings, &pg->heading_cap, pg->heading_count + 1, sizeof *pg->headings);
-    pg->headings[pg->heading_count] = text.data ? text.data : xstrdup("");
+    pg->headings[pg->heading_count] = (struct heading){text.data ? text.data : xstrdup(""), b->level, pg->line_count};
     L->heading = (int32_t)pg->heading_count++;
     wrap(L, L->tmp.items, L->tmp.count);
 }
@@ -3241,7 +3253,11 @@ static void free_page(struct page *pg)
     free(pg->styles);
     for (size_t i = 0; i < pg->link_count; ++i) free(pg->links[i]);
     free(pg->links);
-    for (size_t i = 0; i < pg->heading_count; ++i) free(pg->headings[i]);
+    for (size_t i = 0; i < pg->heading_count; ++i) free(pg->headings[i].text);
+    if (pg->targets) {
+        for (size_t i = 0; i < pg->link_count; ++i) free(pg->targets[i]);
+        free(pg->targets);
+    }
     free(pg->headings);
     *pg = (struct page){0};
 }
@@ -3289,12 +3305,41 @@ static void put_link(struct buf *out, const char *url)
     buf_puts(out, "\x1b\\");
 }
 
-/* The line's cells from column from, at most cols of them (INT_MAX for
-   all). A wide character cut by the left edge shows as spaces in its style. */
-static void render_cells(struct buf *out, const struct page *pg, const struct line *line, const struct options *opt,
-                         int from, int cols)
+/* Overlays the pager draws on top of a glyph's own style. */
+enum { MARK_NONE, MARK_MATCH, MARK_CURRENT, MARK_FOCUS };
+
+static void put_marked_style(struct buf *out, const struct style *base, bool color, uint8_t mark)
 {
-    int style = 0;
+    struct style s = *base;
+    bool reverse = false;
+    switch (mark) {
+    case MARK_MATCH: reverse = true; break;
+    case MARK_CURRENT:
+        if (color) {
+            s.fg = COLOR_SHADE;
+            s.bg = COLOR_HIGHLIGHT;
+        } else {
+            reverse = true;
+        }
+        s.attr |= ATTR_BOLD;
+        break;
+    case MARK_FOCUS:
+        reverse = true;
+        s.underline = UNDERLINE_DASHED;
+        break;
+    default: break;
+    }
+    put_style(out, &s, color);
+    if (reverse) buf_puts(out, "\x1b[7m");
+}
+
+/* The line's cells from column from, at most cols of them (INT_MAX for
+   all). A wide character cut by the left edge shows as spaces in its style.
+   marks, when given, has an overlay for each of the line's glyphs. */
+static void render_cells(struct buf *out, const struct page *pg, const struct line *line, const struct options *opt,
+                         int from, int cols, const uint8_t *marks)
+{
+    long state = 0; /* Style index times 4 plus the overlay. */
     int32_t link = -1;
     int end = cols == INT_MAX ? INT_MAX : from + cols;
     int column = 0;
@@ -3308,9 +3353,11 @@ static void render_cells(struct buf *out, const struct page *pg, const struct li
             continue;
         }
         if (opt->styled) {
-            if (g->style != style) {
-                put_style(out, &pg->styles[g->style], opt->color);
-                style = g->style;
+            uint8_t mark = marks ? marks[i] : MARK_NONE;
+            long want = (long)g->style * 4 + mark;
+            if (want != state) {
+                put_marked_style(out, &pg->styles[g->style], opt->color, mark);
+                state = want;
             }
             int32_t target = g->link >= 0 && !partial ? g->link : -1;
             if (target != link) {
@@ -3332,19 +3379,20 @@ static void render_cells(struct buf *out, const struct page *pg, const struct li
             put_link(out, NULL);
             link = -1;
         }
-        if (line->pad_style != style) {
+        long want = (long)line->pad_style * 4;
+        if (want != state) {
             put_style(out, &pg->styles[line->pad_style], opt->color);
-            style = line->pad_style;
+            state = want;
         }
         for (int i = pad_start; i < pad_end; ++i) buf_putc(out, ' ');
     }
     if (link >= 0) put_link(out, NULL);
-    if (style != 0) buf_puts(out, "\x1b[0m");
+    if (state != 0) buf_puts(out, "\x1b[0m");
 }
 
 static void render_line(struct buf *out, const struct page *pg, const struct line *line, const struct options *opt)
 {
-    render_cells(out, pg, line, opt, 0, INT_MAX);
+    render_cells(out, pg, line, opt, 0, INT_MAX, NULL);
     buf_putc(out, '\n');
 }
 
@@ -3380,6 +3428,9 @@ static bool print_page(const struct page *pg, const struct options *opt)
 
 /* Pager */
 
+static bool read_input(const char *path, char **data, size_t *len, char *error, size_t error_size);
+static void file_urls(const char *path, char **file_url, char **dir_url);
+
 static volatile sig_atomic_t pager_resized, pager_stop, pager_continued;
 
 static void pager_signal(int sig)
@@ -3388,6 +3439,39 @@ static void pager_signal(int sig)
     else if (sig == SIGCONT) pager_continued = 1;
     else pager_stop = sig;
 }
+
+/* What runs a link that isn't markdown. [links] open sets it in 0.5. */
+#define LINK_OPENER "xdg-open"
+#define BACK_LIMIT 32
+#define PATTERN_LIMIT 255
+
+/* A document the pager has open, or had open: the back stack keeps them. */
+struct view {
+    char *text;
+    struct document *doc;
+    char *path; /* NULL for standard input. */
+    char *file_url, *dir_url;
+    bool owned; /* The first one belongs to main. */
+    int refs;   /* The current view and back stack entries. */
+};
+
+/* A place that survives a new layout: a block, and how far into it. */
+struct anchor {
+    int32_t block;
+    size_t into, length;
+};
+
+struct back_entry {
+    struct view *view;
+    struct anchor where;
+};
+
+/* The first appearance of each link, in reading order, for Tab. */
+struct spot {
+    size_t line;
+    int column;
+    int32_t link;
+};
 
 struct pager {
     int tty;                 /* Keys come from here; frames go to stdout. */
@@ -3398,10 +3482,32 @@ struct pager {
     int left;                /* Columns scrolled off the left of wide lines. */
     int widest;              /* The widest line, padding included. */
     bool fixed_width;        /* --width was given. */
-    const char *name;
-    const struct document *doc;
     struct options *opt;
+    struct view *view;
+    struct back_entry back[BACK_LIMIT];
+    int back_count;
     struct page page;
+    struct spot *spots;
+    size_t spot_count, spot_cap;
+    long focus;              /* Into spots, or -1. */
+
+    uint32_t pattern[PATTERN_LIMIT];
+    size_t pattern_len;
+    char pattern_text[PATTERN_LIMIT + 1];
+    bool fold, backward, highlight;
+    bool found;              /* A current match, at match_line and match_at. */
+    size_t match_line, match_at;
+    bool prompting;
+    char prompt_char;
+    char typed[PATTERN_LIMIT + 1];
+    size_t typed_len;
+
+    bool outline;
+    size_t outline_selected, outline_top;
+
+    char message[PATH_MAX + 128];
+    uint8_t *marks;
+    size_t marks_cap;
     unsigned char input[256];
     size_t input_len;
     bool quit;
@@ -3412,6 +3518,15 @@ static const int pager_signals[] = {SIGWINCH, SIGINT, SIGTERM, SIGHUP, SIGQUIT, 
 static bool pager_write(const char *s)
 {
     return write_all(STDOUT_FILENO, s, strlen(s));
+}
+
+static void pager_message(struct pager *P, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void pager_message(struct pager *P, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vsnprintf(P->message, sizeof P->message, format, args);
+    va_end(args);
 }
 
 /* Raw input with ISIG off, so Ctrl+C and Ctrl+Z arrive as keys; the
@@ -3449,6 +3564,11 @@ static size_t pager_max_top(const struct pager *P)
     return P->page.line_count > rows ? P->page.line_count - rows : 0;
 }
 
+static int line_extent(const struct line *line)
+{
+    return line->width > line->pad_to ? line->width : line->pad_to;
+}
+
 static void pager_clamp(struct pager *P)
 {
     if (P->top > pager_max_top(P)) P->top = pager_max_top(P);
@@ -3457,16 +3577,102 @@ static void pager_clamp(struct pager *P)
     if (P->left < 0) P->left = 0;
 }
 
+/* The first column of a line on screen. */
+static int pager_from(const struct pager *P, const struct line *line)
+{
+    int extent = line_extent(line);
+    if (extent <= P->cols) return 0;
+    return P->left < extent - P->cols ? P->left : extent - P->cols;
+}
+
+static bool pager_visible(const struct pager *P, size_t line)
+{
+    return line >= P->top && line < P->top + (size_t)pager_text_rows(P);
+}
+
+/* Brings a line on screen, a third of the way down, and a column span of
+   it when the line is wider than the screen. */
+static void pager_reveal(struct pager *P, size_t line, int column, int width)
+{
+    size_t rows = (size_t)pager_text_rows(P);
+    if (!pager_visible(P, line)) P->top = line > rows / 3 ? line - rows / 3 : 0;
+    if (line < P->page.line_count) {
+        const struct line *l = &P->page.lines[line];
+        int from = pager_from(P, l);
+        if (line_extent(l) > P->cols && (column < from || column + width > from + P->cols)) {
+            P->left = column - P->cols / 4;
+        }
+    }
+    pager_clamp(P);
+}
+
+static int glyph_column(const struct page *pg, const struct line *line, size_t index)
+{
+    int column = 0;
+    for (size_t i = 0; i < index && i < line->count; ++i) column += pg->glyphs[line->first + i].width;
+    return column;
+}
+
+/* The widest line and where each link first appears. */
+static void pager_index(struct pager *P)
+{
+    struct page *pg = &P->page;
+    P->widest = 0;
+    P->spot_count = 0;
+    bool *seen = calloc(pg->link_count ? pg->link_count : 1, 1);
+    if (!seen) out_of_memory();
+    for (size_t i = 0; i < pg->line_count; ++i) {
+        const struct line *line = &pg->lines[i];
+        if (line_extent(line) > P->widest) P->widest = line_extent(line);
+        int column = 0;
+        for (size_t k = 0; k < line->count; ++k) {
+            const struct glyph *g = &pg->glyphs[line->first + k];
+            if (g->link >= 0 && !seen[g->link]) {
+                seen[g->link] = true;
+                grow(&P->spots, &P->spot_cap, P->spot_count + 1, sizeof *P->spots);
+                P->spots[P->spot_count++] = (struct spot){i, column, g->link};
+            }
+            column += g->width;
+        }
+    }
+    free(seen);
+}
+
 static void pager_layout(struct pager *P)
 {
     free_page(&P->page);
-    layout_document(&P->page, P->doc, P->opt);
-    P->widest = 0;
-    for (size_t i = 0; i < P->page.line_count; ++i) {
-        const struct line *line = &P->page.lines[i];
-        int width = line->width > line->pad_to ? line->width : line->pad_to;
-        if (width > P->widest) P->widest = width;
-    }
+    layout_document(&P->page, P->view->doc, P->opt);
+    pager_index(P);
+    P->focus = -1;
+    P->found = false;
+    if (P->outline_selected >= P->page.heading_count) P->outline_selected = 0;
+}
+
+static struct anchor pager_anchor(const struct pager *P)
+{
+    struct anchor a = {-1, 0, 1};
+    if (P->top >= P->page.line_count) return a;
+    const struct line *lines = P->page.lines;
+    a.block = lines[P->top].block;
+    size_t first = P->top, last = P->top;
+    while (first > 0 && lines[first - 1].block == a.block) --first;
+    while (last + 1 < P->page.line_count && lines[last + 1].block == a.block) ++last;
+    a.into = P->top - first;
+    a.length = last - first + 1;
+    return a;
+}
+
+/* Where an anchor is in the current layout: its block, the same fraction in. */
+static size_t pager_line_of(const struct pager *P, struct anchor a)
+{
+    if (a.block < 0) return 0;
+    const struct line *lines = P->page.lines;
+    size_t first = 0;
+    while (first < P->page.line_count && lines[first].block < a.block) ++first;
+    if (first == P->page.line_count) return first;
+    size_t last = first;
+    while (last + 1 < P->page.line_count && lines[last + 1].block == a.block) ++last;
+    return first + a.into * (last - first + 1) / a.length;
 }
 
 static void pager_size(struct pager *P)
@@ -3482,38 +3688,650 @@ static void pager_size(struct pager *P)
 }
 
 /* A new terminal size. The text reflows when its width follows the
-   terminal, and the block at the top of the screen stays there, as far
-   through itself as it was. */
+   terminal, and the block at the top of the screen stays there. */
 static void pager_resize(struct pager *P)
 {
     pager_size(P);
     int width = P->cols < DEFAULT_WIDTH ? P->cols : DEFAULT_WIDTH;
     if (!P->fixed_width && width != P->opt->width) {
-        int32_t block = -1;
-        size_t into = 0, length = 1;
-        if (P->top < P->page.line_count) {
-            const struct line *lines = P->page.lines;
-            block = lines[P->top].block;
-            size_t first = P->top, last = P->top;
-            while (first > 0 && lines[first - 1].block == block) --first;
-            while (last + 1 < P->page.line_count && lines[last + 1].block == block) ++last;
-            into = P->top - first;
-            length = last - first + 1;
-        }
+        struct anchor where = pager_anchor(P);
         P->opt->width = width;
         pager_layout(P);
-        if (block >= 0) {
-            const struct line *lines = P->page.lines;
-            size_t first = 0;
-            while (first < P->page.line_count && lines[first].block < block) ++first;
-            size_t last = first;
-            while (last + 1 < P->page.line_count && lines[last + 1].block == block) ++last;
-            size_t now = first < P->page.line_count ? last - first + 1 : 1;
-            P->top = first + into * now / length;
-        }
+        P->top = pager_line_of(P, where);
     }
     pager_clamp(P);
 }
+
+/* Documents and the back stack */
+
+static void view_release(struct view *v)
+{
+    if (--v->refs > 0 || !v->owned) return;
+    free_document(v->doc);
+    free(v->text);
+    free(v->path);
+    free(v->file_url);
+    free(v->dir_url);
+    free(v);
+}
+
+static void pager_switch(struct pager *P, struct view *v)
+{
+    P->view = v;
+    P->opt->path = v->path;
+    P->opt->file_url = v->file_url;
+    P->opt->dir_url = v->dir_url;
+    P->left = 0;
+    pager_layout(P);
+}
+
+static void pager_push(struct pager *P)
+{
+    if (P->back_count == BACK_LIMIT) {
+        view_release(P->back[0].view);
+        memmove(P->back, P->back + 1, (BACK_LIMIT - 1) * sizeof *P->back);
+        --P->back_count;
+    }
+    P->back[P->back_count++] = (struct back_entry){P->view, pager_anchor(P)};
+    ++P->view->refs;
+}
+
+static void pager_back(struct pager *P)
+{
+    if (P->back_count == 0) {
+        pager_message(P, "Nothing to go back to");
+        return;
+    }
+    struct back_entry e = P->back[--P->back_count];
+    if (e.view != P->view) {
+        struct view *old = P->view;
+        pager_switch(P, e.view); /* The stack's reference becomes the current one. */
+        view_release(old);
+    } else {
+        --e.view->refs;
+        P->focus = -1;
+    }
+    P->top = pager_line_of(P, e.where);
+    pager_clamp(P);
+}
+
+static int hex_digit(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static char *url_decode(const char *s, size_t n)
+{
+    struct buf out = {0};
+    for (size_t i = 0; i < n; ++i) {
+        int high, low;
+        /* %00 stays as written, so a path can't be cut short. */
+        if (s[i] == '%' && i + 2 < n && (high = hex_digit((unsigned char)s[i + 1])) >= 0 &&
+            (low = hex_digit((unsigned char)s[i + 2])) >= 0 && (high || low)) {
+            buf_putc(&out, (char)(high * 16 + low));
+            i += 2;
+        } else {
+            buf_putc(&out, s[i]);
+        }
+    }
+    return out.data ? out.data : xstrdup("");
+}
+
+/* GitHub's anchor for a heading: lowercase, spaces to hyphens, and
+   anything but letters, digits, marks, - and _ dropped. */
+static char *heading_slug(const char *text)
+{
+    struct buf out = {0};
+    for (size_t i = 0, n = strlen(text); i < n;) {
+        uint32_t cp;
+        i += utf8_decode(text + i, n - i, &cp);
+        if (cp == ' ') {
+            buf_putc(&out, '-');
+        } else if (cp == '-' || cp == '_' || iswalnum((wint_t)cp) || (cp >= 0x300 && char_width(cp) == 0)) {
+            char bytes[4];
+            buf_put(&out, bytes, utf8_encode((uint32_t)towlower((wint_t)cp), bytes));
+        }
+    }
+    return out.data ? out.data : xstrdup("");
+}
+
+/* The heading an #anchor names, counting repeats as GitHub does: the
+   second "Usage" is usage-1. Returns its index, or -1. */
+static long find_heading(const struct page *pg, const char *anchor)
+{
+    char *want = xstrdup(anchor);
+    for (char *c = want; *c; ++c) *c = (char)tolower((unsigned char)*c);
+    struct seen {
+        char *slug;
+        int count;
+    } *seen = NULL;
+    size_t seen_count = 0, seen_cap = 0;
+    long result = -1;
+    for (size_t i = 0; i < pg->heading_count && result < 0; ++i) {
+        char *slug = heading_slug(pg->headings[i].text);
+        size_t len = strlen(slug);
+        /* Only slugs that could produce the anchor need counting. */
+        if (strcmp(slug, want) != 0 && !(strncmp(want, slug, len) == 0 && want[len] == '-')) {
+            free(slug);
+            continue;
+        }
+        size_t k = 0;
+        while (k < seen_count && strcmp(seen[k].slug, slug) != 0) ++k;
+        if (k == seen_count) {
+            grow(&seen, &seen_cap, seen_count + 1, sizeof *seen);
+            seen[seen_count++] = (struct seen){slug, 0};
+        } else {
+            free(slug);
+        }
+        char candidate[32];
+        snprintf(candidate, sizeof candidate, "-%d", seen[k].count);
+        bool match = seen[k].count == 0 ? strcmp(seen[k].slug, want) == 0
+                                        : strncmp(want, seen[k].slug, len) == 0 && strcmp(want + len, candidate) == 0;
+        ++seen[k].count;
+        if (match) result = (long)i;
+    }
+    for (size_t k = 0; k < seen_count; ++k) free(seen[k].slug);
+    free(seen);
+    free(want);
+    return result;
+}
+
+static bool is_markdown_path(const char *path)
+{
+    static const char *const extensions[] = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"};
+    const char *slash = strrchr(path, '/');
+    const char *dot = strrchr(slash ? slash : path, '.');
+    if (!dot) return false;
+    for (size_t i = 0; i < sizeof extensions / sizeof extensions[0]; ++i) {
+        if (strcasecmp(dot, extensions[i]) == 0) return true;
+    }
+    return false;
+}
+
+/* Runs the opener on a target, detached in its own session with nothing
+   on its standard streams, and reports whether it started. */
+static void pager_open_external(struct pager *P, const char *target)
+{
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) {
+        pager_message(P, "Can't open %s: %s", target, strerror(errno));
+        return;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            int null = open("/dev/null", O_RDWR);
+            if (null >= 0) {
+                dup2(null, STDIN_FILENO);
+                dup2(null, STDOUT_FILENO);
+                dup2(null, STDERR_FILENO);
+            }
+            sigset_t none;
+            sigemptyset(&none);
+            sigprocmask(SIG_SETMASK, &none, NULL);
+            execlp(LINK_OPENER, LINK_OPENER, target, (char *)NULL);
+            int error = errno;
+            if (write(fds[1], &error, sizeof error) < 0) _exit(127);
+            _exit(127);
+        }
+        _exit(grandchild < 0 ? 1 : 0);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        pager_message(P, "Can't open %s: %s", target, strerror(errno));
+        return;
+    }
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
+    }
+    int error = 0;
+    ssize_t got;
+    while ((got = read(fds[0], &error, sizeof error)) < 0 && errno == EINTR) {
+    }
+    close(fds[0]);
+    if (got == (ssize_t)sizeof error) {
+        pager_message(P, "Can't run %s (%s): %s", LINK_OPENER, strerror(error), target);
+    } else {
+        pager_message(P, "Opened %s", target);
+    }
+}
+
+/* Opens a markdown file in the pager, remembering where we were. Errors
+   name the file as the link wrote it. */
+static void pager_open_document(struct pager *P, const char *path, const char *written, const char *anchor)
+{
+    char error[PATH_MAX + 64];
+    char *raw;
+    size_t raw_len;
+    if (!read_input(path, &raw, &raw_len, error, sizeof error)) {
+        size_t skip = strlen(path);
+        pager_message(P, "%s%s", written, strncmp(error, path, skip) == 0 ? error + skip : error);
+        return;
+    }
+    struct view *v = calloc(1, sizeof *v);
+    if (!v) out_of_memory();
+    size_t len;
+    v->text = normalize_input(raw, raw_len, &len);
+    free(raw);
+    v->doc = parse_document(v->text, len, true);
+    v->path = xstrdup(path);
+    file_urls(path, &v->file_url, &v->dir_url);
+    v->owned = true;
+    v->refs = 1;
+    pager_push(P);
+    struct view *old = P->view;
+    pager_switch(P, v);
+    view_release(old);
+    P->top = 0;
+    if (anchor && anchor[0]) {
+        long heading = find_heading(&P->page, anchor);
+        if (heading >= 0) P->top = P->page.headings[heading].line;
+        else pager_message(P, "No heading #%s here", anchor);
+    }
+    pager_clamp(P);
+}
+
+static void pager_jump_anchor(struct pager *P, const char *anchor)
+{
+    long heading = find_heading(&P->page, anchor);
+    if (heading < 0) {
+        pager_message(P, "No heading #%s", anchor);
+        return;
+    }
+    pager_push(P);
+    P->top = P->page.headings[heading].line;
+    pager_clamp(P);
+}
+
+/* Follows a link: an #anchor jumps, a markdown file opens here, anything
+   else goes to the opener. */
+static void pager_follow(struct pager *P, int32_t link)
+{
+    const char *raw = P->page.targets ? P->page.targets[link] : NULL;
+    if (!raw) return;
+    P->message[0] = '\0';
+    const char *path = raw;
+    if (raw[0] == '#') {
+        char *anchor = url_decode(raw + 1, strlen(raw + 1));
+        pager_jump_anchor(P, anchor);
+        free(anchor);
+        return;
+    }
+    if (has_scheme(raw)) {
+        if (strncasecmp(raw, "file:", 5) != 0) {
+            pager_open_external(P, P->page.links[link] ? P->page.links[link] : raw);
+            return;
+        }
+        path = raw + 5;
+        if (strncmp(path, "//", 2) == 0) path = strchr(path + 2, '/');
+        if (!path) {
+            pager_open_external(P, raw);
+            return;
+        }
+    }
+    const char *hash = strchr(path, '#');
+    size_t path_len = hash ? (size_t)(hash - path) : strlen(path);
+    char *file = url_decode(path, path_len);
+    char *anchor = hash ? url_decode(hash + 1, strlen(hash + 1)) : NULL;
+    struct buf full = {0};
+    if (file[0] != '/') {
+        const char *current = P->view->path;
+        const char *slash = current ? strrchr(current, '/') : NULL;
+        if (slash) buf_put(&full, current, (size_t)(slash - current) + 1);
+        else buf_puts(&full, "./");
+    }
+    buf_puts(&full, file);
+    if (file[0] == '\0') {
+        /* A link to "" or "?query" is the document itself. */
+    } else if (is_markdown_path(full.data)) {
+        pager_open_document(P, full.data, file, anchor);
+    } else {
+        pager_open_external(P, full.data);
+    }
+    buf_free(&full);
+    free(file);
+    free(anchor);
+}
+
+/* Links */
+
+/* Tab and Shift+Tab: the next link on screen, or the first one past it. */
+static void pager_focus(struct pager *P, bool forward)
+{
+    if (P->spot_count == 0) {
+        pager_message(P, "No links");
+        return;
+    }
+    size_t bottom = P->top + (size_t)pager_text_rows(P);
+    long next;
+    if (P->focus >= 0 && pager_visible(P, P->spots[P->focus].line)) {
+        next = forward ? P->focus + 1 : P->focus - 1;
+    } else if (forward) {
+        next = 0;
+        while ((size_t)next < P->spot_count && P->spots[next].line < P->top) ++next;
+    } else {
+        next = (long)P->spot_count - 1;
+        while (next >= 0 && P->spots[next].line >= bottom) --next;
+    }
+    if (next < 0 || (size_t)next >= P->spot_count) {
+        pager_message(P, forward ? "No more links below" : "No more links above");
+        return;
+    }
+    P->focus = next;
+    const struct spot *s = &P->spots[next];
+    pager_reveal(P, s->line, s->column, 1);
+    const char *raw = P->page.targets ? P->page.targets[s->link] : NULL;
+    if (raw) pager_message(P, "%s", raw);
+}
+
+static void pager_click(struct pager *P, int x, int y)
+{
+    if (y < 1 || y > pager_text_rows(P) || x < 1) return;
+    size_t index = P->top + (size_t)(y - 1);
+    if (P->outline) {
+        size_t heading = P->outline_top + (size_t)(y - 1);
+        if (heading < P->page.heading_count) {
+            P->outline = false;
+            pager_push(P);
+            P->top = P->page.headings[heading].line;
+            pager_clamp(P);
+        }
+        return;
+    }
+    if (index >= P->page.line_count) return;
+    const struct line *line = &P->page.lines[index];
+    int column = pager_from(P, line) + x - 1, at = 0;
+    for (size_t i = 0; i < line->count; ++i) {
+        const struct glyph *g = &P->page.glyphs[line->first + i];
+        if (column >= at && column < at + g->width) {
+            if (g->link < 0) return;
+            for (size_t k = 0; k < P->spot_count; ++k) {
+                if (P->spots[k].link == g->link) P->focus = (long)k;
+            }
+            pager_follow(P, g->link);
+            return;
+        }
+        at += g->width;
+    }
+}
+
+/* Search */
+
+static uint32_t glyph_codepoint(const struct page *pg, const struct glyph *g, bool fold)
+{
+    if (g->length == 0) return 0;
+    uint32_t cp;
+    utf8_decode(pg->text.data + g->offset, g->length, &cp);
+    return fold ? (uint32_t)towlower((wint_t)cp) : cp;
+}
+
+static bool match_at(const struct pager *P, const struct line *line, size_t at)
+{
+    if (P->pattern_len == 0 || at + P->pattern_len > line->count) return false;
+    for (size_t k = 0; k < P->pattern_len; ++k) {
+        if (glyph_codepoint(&P->page, &P->page.glyphs[line->first + at + k], P->fold) != P->pattern[k]) return false;
+    }
+    return true;
+}
+
+/* The first match after glyph start of a line going forward, or the last
+   one before it going backward, wrapping around the document. start may
+   be -1 (before the line) or LONG_MAX (after it). */
+static bool pager_find(const struct pager *P, size_t line, long start, bool forward, size_t *found_line,
+                       size_t *found_at, bool *wrapped)
+{
+    size_t n = P->page.line_count;
+    *wrapped = false;
+    if (n == 0 || P->pattern_len == 0) return false;
+    for (size_t step = 0; step <= n; ++step) {
+        size_t l;
+        if (forward) {
+            l = (line + step) % n;
+            if (line + step >= n) *wrapped = true;
+        } else {
+            l = (line + n - step % n) % n;
+            if (step > line) *wrapped = true;
+        }
+        const struct line *ln = &P->page.lines[l];
+        if (ln->count < P->pattern_len) continue;
+        long last = (long)(ln->count - P->pattern_len);
+        if (forward) {
+            long from = step == 0 ? start + 1 : 0;
+            if (from < 0) from = 0;
+            for (long i = from; i <= last; ++i) {
+                if (match_at(P, ln, (size_t)i)) {
+                    *found_line = l;
+                    *found_at = (size_t)i;
+                    return true;
+                }
+            }
+        } else {
+            long to = step == 0 ? (start == LONG_MAX ? last : start - 1) : last;
+            if (to > last) to = last;
+            for (long i = to; i >= 0; --i) {
+                if (match_at(P, ln, (size_t)i)) {
+                    *found_line = l;
+                    *found_at = (size_t)i;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/* n and N: the next match in the search's direction, or against it. */
+static void pager_search_next(struct pager *P, bool reverse)
+{
+    if (P->pattern_len == 0) {
+        pager_message(P, "No search yet: / or ? starts one");
+        return;
+    }
+    bool forward = P->backward == reverse;
+    size_t line;
+    long start;
+    if (P->found && pager_visible(P, P->match_line)) {
+        line = P->match_line;
+        start = (long)P->match_at;
+    } else if (forward) {
+        line = P->top;
+        start = -1;
+    } else {
+        size_t bottom = P->top + (size_t)pager_text_rows(P);
+        line = bottom < P->page.line_count ? bottom - 1 : (P->page.line_count ? P->page.line_count - 1 : 0);
+        start = LONG_MAX;
+    }
+    size_t found_line, found_at;
+    bool wrapped;
+    P->highlight = true;
+    if (!pager_find(P, line, start, forward, &found_line, &found_at, &wrapped)) {
+        P->found = false;
+        pager_message(P, "Not found: %s", P->pattern_text);
+        return;
+    }
+    if (wrapped) pager_message(P, forward ? "Search wrapped to the top" : "Search wrapped to the bottom");
+    P->found = true;
+    P->match_line = found_line;
+    P->match_at = found_at;
+    const struct line *ln = &P->page.lines[found_line];
+    int column = glyph_column(&P->page, ln, found_at);
+    int width = glyph_column(&P->page, ln, found_at + P->pattern_len) - column;
+    pager_reveal(P, found_line, column, width);
+}
+
+/* Plain text; case matters only when the pattern has a capital. */
+static void pager_search_start(struct pager *P)
+{
+    P->pattern_len = 0;
+    P->fold = true;
+    for (size_t i = 0; i < P->typed_len && P->pattern_len < PATTERN_LIMIT;) {
+        uint32_t cp;
+        i += utf8_decode(P->typed + i, P->typed_len - i, &cp);
+        if (cp < 0x20 || char_width(cp) == 0) continue;
+        if (iswupper((wint_t)cp)) P->fold = false;
+        P->pattern[P->pattern_len++] = cp;
+    }
+    if (P->fold) {
+        for (size_t i = 0; i < P->pattern_len; ++i) P->pattern[i] = (uint32_t)towlower((wint_t)P->pattern[i]);
+    }
+    memcpy(P->pattern_text, P->typed, P->typed_len);
+    P->pattern_text[P->typed_len] = '\0';
+    P->backward = P->prompt_char == '?';
+    P->found = false;
+    pager_search_next(P, false);
+}
+
+static void pager_prompt_key(struct pager *P, int key)
+{
+    switch (key) {
+    case '\r':
+    case '\n':
+        P->prompting = false;
+        if (P->typed_len > 0) pager_search_start(P);
+        break;
+    case 0x1b:
+    case 0x03: P->prompting = false; break;
+    case 0x7f:
+    case 0x08:
+        if (P->typed_len == 0) {
+            P->prompting = false;
+            break;
+        }
+        do --P->typed_len;
+        while (P->typed_len > 0 && ((unsigned char)P->typed[P->typed_len] & 0xc0) == 0x80);
+        break;
+    case 0x15: P->typed_len = 0; break;
+    default:
+        if (key >= 0x20 && key < 0x100 && key != 0x7f && P->typed_len < PATTERN_LIMIT) {
+            P->typed[P->typed_len++] = (char)key;
+        }
+        break;
+    }
+}
+
+/* Overlays for one line: the focused link, then search matches on top. */
+static const uint8_t *pager_marks(struct pager *P, size_t index)
+{
+    const struct line *line = &P->page.lines[index];
+    bool focus = P->focus >= 0;
+    bool search = P->highlight && P->pattern_len > 0;
+    if ((!focus && !search) || line->count == 0) return NULL;
+    grow(&P->marks, &P->marks_cap, line->count, 1);
+    memset(P->marks, MARK_NONE, line->count);
+    if (focus) {
+        int32_t link = P->spots[P->focus].link;
+        for (size_t i = 0; i < line->count; ++i) {
+            if (P->page.glyphs[line->first + i].link == link) P->marks[i] = MARK_FOCUS;
+        }
+    }
+    if (search) {
+        for (size_t i = 0; i + P->pattern_len <= line->count;) {
+            if (!match_at(P, line, i)) {
+                ++i;
+                continue;
+            }
+            bool current = P->found && P->match_line == index && P->match_at == i;
+            memset(P->marks + i, current ? MARK_CURRENT : MARK_MATCH, P->pattern_len);
+            i += P->pattern_len;
+        }
+    }
+    return P->marks;
+}
+
+/* Headings and the outline */
+
+static long pager_heading_at(const struct pager *P)
+{
+    return P->top < P->page.line_count ? P->page.lines[P->top].heading : -1;
+}
+
+static void pager_next_heading(struct pager *P, bool forward)
+{
+    const struct page *pg = &P->page;
+    if (forward) {
+        for (size_t i = 0; i < pg->heading_count; ++i) {
+            if (pg->headings[i].line > P->top && P->top < pager_max_top(P)) {
+                P->top = pg->headings[i].line;
+                pager_clamp(P);
+                return;
+            }
+        }
+        pager_message(P, "No more headings below");
+    } else {
+        for (size_t i = pg->heading_count; i-- > 0;) {
+            if (pg->headings[i].line < P->top) {
+                P->top = pg->headings[i].line;
+                return;
+            }
+        }
+        pager_message(P, "No more headings above");
+    }
+}
+
+static void outline_keep_visible(struct pager *P)
+{
+    size_t rows = (size_t)pager_text_rows(P);
+    if (P->outline_selected < P->outline_top) P->outline_top = P->outline_selected;
+    if (P->outline_selected >= P->outline_top + rows) P->outline_top = P->outline_selected - rows + 1;
+}
+
+static void pager_outline_open(struct pager *P)
+{
+    if (P->page.heading_count == 0) {
+        pager_message(P, "No headings");
+        return;
+    }
+    long current = pager_heading_at(P);
+    P->outline = true;
+    P->outline_selected = current >= 0 ? (size_t)current : 0;
+    P->outline_top = P->outline_selected > (size_t)pager_text_rows(P) / 3
+                         ? P->outline_selected - (size_t)pager_text_rows(P) / 3
+                         : 0;
+    outline_keep_visible(P);
+}
+
+static void outline_move(struct pager *P, long delta)
+{
+    long last = (long)P->page.heading_count - 1;
+    long selected = (long)P->outline_selected + delta;
+    if (selected < 0) selected = 0;
+    if (selected > last) selected = last;
+    P->outline_selected = (size_t)selected;
+    outline_keep_visible(P);
+}
+
+static void pager_suspend(struct pager *P);
+
+static void pager_outline_key(struct pager *P, int key)
+{
+    long page = pager_text_rows(P);
+    switch (key) {
+    case 'j': case 0x0e: case '\t': outline_move(P, 1); break;
+    case 'k': case 0x10: outline_move(P, -1); break;
+    case ' ': case 'f': case 0x06: outline_move(P, page); break;
+    case 'b': case 0x02: outline_move(P, -page); break;
+    case 'd': case 0x04: outline_move(P, page / 2); break;
+    case 'u': case 0x15: outline_move(P, -page / 2); break;
+    case 'g': case '<': outline_move(P, LONG_MIN / 2); break;
+    case 'G': case '>': outline_move(P, LONG_MAX / 2); break;
+    case '\r': case '\n':
+        P->outline = false;
+        pager_push(P);
+        P->top = P->page.headings[P->outline_selected].line;
+        pager_clamp(P);
+        break;
+    case 'q': case 'o': case 0x1b: case 0x03: P->outline = false; break;
+    case 0x1a: pager_suspend(P); break;
+    default: break;
+    }
+}
+
+/* Drawing */
 
 /* Text for the status line, made safe and cut with … to max cells. */
 static int put_clipped(struct buf *out, const char *s, int max)
@@ -3539,9 +4357,11 @@ static int put_clipped(struct buf *out, const char *s, int max)
 
 static void pager_status(const struct pager *P, struct buf *out)
 {
-    char position[32];
+    char position[48];
     size_t rows = (size_t)pager_text_rows(P);
-    if (P->page.line_count <= rows) {
+    if (P->outline) {
+        snprintf(position, sizeof position, "%zu/%zu ", P->outline_selected + 1, P->page.heading_count);
+    } else if (P->page.line_count <= rows) {
         snprintf(position, sizeof position, "All ");
     } else if (P->top == 0) {
         snprintf(position, sizeof position, "Top ");
@@ -3552,36 +4372,79 @@ static void pager_status(const struct pager *P, struct buf *out)
     }
     struct buf left = {0};
     buf_putc(&left, ' ');
-    buf_puts(&left, P->name);
-    int32_t heading = P->top < P->page.line_count ? P->page.lines[P->top].heading : -1;
-    if (heading >= 0) {
-        buf_puts(&left, "  ›  ");
-        buf_puts(&left, P->page.headings[heading]);
+    if (P->prompting) {
+        buf_putc(&left, P->prompt_char);
+        buf_put(&left, P->typed, P->typed_len);
+    } else if (P->message[0]) {
+        buf_puts(&left, P->message);
+    } else if (P->outline) {
+        buf_puts(&left, "Outline: Enter jumps, Escape closes");
+    } else {
+        const char *path = P->view->path;
+        const char *slash = path ? strrchr(path, '/') : NULL;
+        buf_puts(&left, path ? (slash && slash[1] ? slash + 1 : path) : "standard input");
+        long heading = pager_heading_at(P);
+        if (heading >= 0) {
+            buf_puts(&left, "  ›  ");
+            buf_puts(&left, P->page.headings[heading].text);
+        }
     }
     buf_putc(&left, '\0');
-    int right = (int)strlen(position);
+    int right = P->prompting ? 0 : (int)strlen(position);
     buf_puts(out, "\x1b[0;7m");
     int room = P->cols - right - 1;
     int used = room > 0 ? put_clipped(out, left.data, room) : 0;
+    if (P->prompting && used < P->cols) {
+        buf_puts(out, "\x1b[27m \x1b[7m"); /* The cursor. */
+        ++used;
+    }
     for (int i = used; i < P->cols - right; ++i) buf_putc(out, ' ');
-    if (right <= P->cols) buf_puts(out, position);
+    if (right > 0 && right <= P->cols) buf_puts(out, position);
     buf_puts(out, "\x1b[0m");
     buf_free(&left);
 }
 
+static void pager_draw_outline(const struct pager *P, struct buf *out, int row)
+{
+    size_t index = P->outline_top + (size_t)row;
+    if (index >= P->page.heading_count) return;
+    const struct heading *h = &P->page.headings[index];
+    bool selected = index == P->outline_selected;
+    bool current = (long)index == pager_heading_at(P);
+    struct style style = plain_style;
+    if (h->level <= 2) style.fg = COLOR_ACCENT;
+    if (h->level <= 3) style.attr |= ATTR_BOLD;
+    else style.fg = COLOR_MUTED;
+    int indent = (h->level - 1) * 2;
+    if (indent > P->cols / 2) indent = P->cols / 2;
+    put_style(out, &style, P->opt->color);
+    if (selected) buf_puts(out, "\x1b[7m");
+    int used = 0;
+    for (; used < indent; ++used) buf_putc(out, ' ');
+    if (P->cols - used >= 2) {
+        buf_puts(out, current ? "▸ " : "  ");
+        used += 2;
+    }
+    if (P->cols > used) used += put_clipped(out, h->text, P->cols - used);
+    if (selected) {
+        for (; used < P->cols; ++used) buf_putc(out, ' ');
+    }
+    buf_puts(out, "\x1b[0m");
+}
+
 /* One frame, drawn whole inside synchronized output so it never tears. */
-static bool pager_draw(const struct pager *P)
+static bool pager_draw(struct pager *P)
 {
     struct buf out = {0};
     buf_puts(&out, "\x1b[?2026h\x1b[H");
     int rows = pager_text_rows(P);
     for (int r = 0; r < rows; ++r) {
         size_t i = P->top + (size_t)r;
-        if (i < P->page.line_count) {
+        if (P->outline) {
+            pager_draw_outline(P, &out, r);
+        } else if (i < P->page.line_count) {
             const struct line *line = &P->page.lines[i];
-            int width = line->width > line->pad_to ? line->width : line->pad_to;
-            int from = width > P->cols ? (P->left < width - P->cols ? P->left : width - P->cols) : 0;
-            render_cells(&out, &P->page, line, P->opt, from, P->cols);
+            render_cells(&out, &P->page, line, P->opt, pager_from(P, line), P->cols, pager_marks(P, i));
         }
         buf_puts(&out, "\x1b[K");
         if (r + 1 < P->rows) buf_puts(&out, "\r\n");
@@ -3592,6 +4455,8 @@ static bool pager_draw(const struct pager *P)
     buf_free(&out);
     return ok;
 }
+
+/* Keys */
 
 static void pager_scroll(struct pager *P, long delta)
 {
@@ -3608,15 +4473,29 @@ static void pager_suspend(struct pager *P)
     pager_resize(P);
 }
 
-/* Keys: arrows and the like come as CSI or SS3 sequences, the wheel as SGR
-   mouse reports. */
 static void pager_key(struct pager *P, int key)
 {
+    if (P->prompting) {
+        pager_prompt_key(P, key);
+        return;
+    }
+    if (P->outline) {
+        pager_outline_key(P, key);
+        return;
+    }
     long page = pager_text_rows(P);
     long half = page / 2 > 0 ? page / 2 : 1;
     int step = P->cols / 4 > 8 ? P->cols / 4 : 8;
     switch (key) {
-    case 'j': case 'e': case '\r': case '\n': case 0x05: case 0x0e: pager_scroll(P, 1); break;
+    case '\r':
+    case '\n':
+        if (P->focus >= 0 && pager_visible(P, P->spots[P->focus].line)) {
+            pager_follow(P, P->spots[P->focus].link);
+            break;
+        }
+        pager_scroll(P, 1);
+        break;
+    case 'j': case 'e': case 0x05: case 0x0e: pager_scroll(P, 1); break;
     case 'k': case 'y': case 0x10: case 0x19: pager_scroll(P, -1); break;
     case ' ': case 'f': case 0x06: pager_scroll(P, page); break;
     case 'b': case 0x02: pager_scroll(P, -page); break;
@@ -3626,20 +4505,48 @@ static void pager_key(struct pager *P, int key)
     case 'G': case '>': P->top = pager_max_top(P); break;
     case 'l': P->left += step; pager_clamp(P); break;
     case 'h': P->left -= step; pager_clamp(P); break;
-    case 'q': case 'Q': case 0x03: case 0x1b: P->quit = true; break;
+    case '\t': pager_focus(P, true); break;
+    case 0x7f: case 0x08: pager_back(P); break;
+    case '/':
+    case '?':
+        P->prompting = true;
+        P->prompt_char = (char)key;
+        P->typed_len = 0;
+        break;
+    case 'n': pager_search_next(P, false); break;
+    case 'N': pager_search_next(P, true); break;
+    case ']': pager_next_heading(P, true); break;
+    case '[': pager_next_heading(P, false); break;
+    case 'o': pager_outline_open(P); break;
+    case 0x1b:
+        /* Escape clears a focused link or search highlights first. */
+        if (P->focus >= 0 || P->highlight) {
+            P->focus = -1;
+            P->highlight = false;
+        } else {
+            P->quit = true;
+        }
+        break;
+    case 'q': case 'Q': case 0x03: P->quit = true; break;
     case 0x1a: pager_suspend(P); break;
     default: break; /* r and Ctrl+L just redraw, as every key does. */
     }
 }
 
-enum { KEY_UP = 0x100, KEY_DOWN, KEY_RIGHT, KEY_LEFT, KEY_HOME, KEY_END, KEY_PAGE_UP, KEY_PAGE_DOWN };
+enum { KEY_UP = 0x100, KEY_DOWN, KEY_RIGHT, KEY_LEFT, KEY_HOME, KEY_END, KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_BACKTAB };
 
 static void pager_special(struct pager *P, int key)
 {
+    if (P->prompting) return;
     static const int keys[][2] = {
-        {KEY_UP, 'k'},   {KEY_DOWN, 'j'},     {KEY_RIGHT, 'l'},     {KEY_LEFT, 'h'},
-        {KEY_HOME, 'g'}, {KEY_END, 'G'},      {KEY_PAGE_UP, 'b'},   {KEY_PAGE_DOWN, ' '},
+        {KEY_UP, 'k'},   {KEY_DOWN, 'j'}, {KEY_RIGHT, 'l'},   {KEY_LEFT, 'h'},
+        {KEY_HOME, 'g'}, {KEY_END, 'G'},  {KEY_PAGE_UP, 'b'}, {KEY_PAGE_DOWN, ' '},
     };
+    if (key == KEY_BACKTAB) {
+        if (P->outline) outline_move(P, -1);
+        else pager_focus(P, false);
+        return;
+    }
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; ++i) {
         if (keys[i][0] == key) pager_key(P, keys[i][1]);
     }
@@ -3649,12 +4556,24 @@ static void pager_csi(struct pager *P, bool mouse, const int *params, int count,
 {
     int first = count > 0 ? params[0] : 0;
     if (mouse) {
-        if (final != 'M') return;
+        if (P->prompting || count < 3) return;
         int button = first & ~(4 | 8 | 16); /* Without Shift, Alt and Ctrl. */
-        if (button == 64) pager_scroll(P, -3);
-        else if (button == 65) pager_scroll(P, 3);
-        else if (button == 66) pager_special(P, KEY_LEFT);
-        else if (button == 67) pager_special(P, KEY_RIGHT);
+        if (final == 'm') {
+            if (button == 0) pager_click(P, params[1], params[2]);
+            return;
+        }
+        if (P->outline) {
+            if (button == 64) outline_move(P, -3);
+            else if (button == 65) outline_move(P, 3);
+        } else if (button == 64) {
+            pager_scroll(P, -3);
+        } else if (button == 65) {
+            pager_scroll(P, 3);
+        } else if (button == 66) {
+            pager_special(P, KEY_LEFT);
+        } else if (button == 67) {
+            pager_special(P, KEY_RIGHT);
+        }
         return;
     }
     switch (final) {
@@ -3664,6 +4583,7 @@ static void pager_csi(struct pager *P, bool mouse, const int *params, int count,
     case 'D': pager_special(P, KEY_LEFT); break;
     case 'H': pager_special(P, KEY_HOME); break;
     case 'F': pager_special(P, KEY_END); break;
+    case 'Z': pager_special(P, KEY_BACKTAB); break;
     case '~':
         if (first == 1 || first == 7) pager_special(P, KEY_HOME);
         else if (first == 4 || first == 8) pager_special(P, KEY_END);
@@ -3738,22 +4658,18 @@ static void pager_input(struct pager *P, bool flush)
     P->input_len = n - i;
 }
 
-/* Shows the page until a quit key or a signal. Returns false when there's
-   no terminal to page on, and the caller prints instead. */
-static bool run_pager(const struct document *doc, struct options *opt, bool fixed_width)
+/* Shows the document until a quit key or a signal. Returns false when
+   there's no terminal to page on, and the caller prints instead. */
+static bool run_pager(struct document *doc, struct options *opt, bool fixed_width)
 {
-    struct pager P = {.doc = doc, .opt = opt, .fixed_width = fixed_width};
+    struct view first = {.doc = doc, .path = (char *)opt->path, .file_url = opt->file_url, .dir_url = opt->dir_url,
+                         .refs = 1};
+    struct pager P = {.opt = opt, .fixed_width = fixed_width, .view = &first, .focus = -1};
     P.tty = open("/dev/tty", O_RDWR | O_CLOEXEC | O_NOCTTY);
     if (P.tty < 0) return false;
     if (tcgetattr(P.tty, &P.saved) != 0) {
         close(P.tty);
         return false;
-    }
-    if (opt->path) {
-        const char *slash = strrchr(opt->path, '/');
-        P.name = slash && slash[1] ? slash + 1 : opt->path;
-    } else {
-        P.name = "standard input";
     }
 
     sigset_t blocked, waiting;
@@ -3782,6 +4698,7 @@ static bool run_pager(const struct document *doc, struct options *opt, bool fixe
         if (pager_resized) {
             pager_resized = 0;
             pager_resize(&P);
+            if (P.outline) outline_keep_visible(&P);
             redraw = true;
         }
         if (redraw && !pager_draw(&P)) break;
@@ -3795,6 +4712,7 @@ static bool run_pager(const struct document *doc, struct options *opt, bool fixe
             break;
         }
         if (ready == 0) {
+            P.message[0] = '\0';
             pager_input(&P, true);
             redraw = true;
             continue;
@@ -3806,6 +4724,7 @@ static bool run_pager(const struct document *doc, struct options *opt, bool fixe
                 break;
             }
             P.input_len += (size_t)got;
+            P.message[0] = '\0';
             pager_input(&P, P.input_len == sizeof P.input);
             redraw = true;
         } else if (fd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
@@ -3815,6 +4734,14 @@ static bool run_pager(const struct document *doc, struct options *opt, bool fixe
     pager_leave(&P);
     close(P.tty);
     free_page(&P.page);
+    free(P.spots);
+    free(P.marks);
+    while (P.back_count > 0) view_release(P.back[--P.back_count].view);
+    view_release(P.view);
+    /* main frees the first document and its URLs. */
+    opt->path = first.path;
+    opt->file_url = first.file_url;
+    opt->dir_url = first.dir_url;
     struct sigaction ignore = {.sa_handler = SIG_IGN};
     sigemptyset(&ignore.sa_mask);
     sigaction(SIGWINCH, &ignore, NULL);
@@ -3845,17 +4772,18 @@ static void usage(FILE *out)
           out);
 }
 
-static bool read_input(const char *path, char **data, size_t *len)
+/* Reads a file, or standard input for NULL. On failure, error says why. */
+static bool read_input(const char *path, char **data, size_t *len, char *error, size_t error_size)
 {
     int fd = path ? open(path, O_RDONLY | O_CLOEXEC) : STDIN_FILENO;
     const char *name = path ? path : "standard input";
     if (fd < 0) {
-        fprintf(stderr, "mark: %s: %s\n", name, strerror(errno));
+        snprintf(error, error_size, "%s: %s", name, strerror(errno));
         return false;
     }
     struct stat st;
     if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "mark: %s: %s\n", name, strerror(EISDIR));
+        snprintf(error, error_size, "%s: %s", name, strerror(EISDIR));
         if (path) close(fd);
         return false;
     }
@@ -3865,7 +4793,7 @@ static bool read_input(const char *path, char **data, size_t *len)
         ssize_t got = read(fd, b.data + b.len, b.cap - b.len - 1);
         if (got < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "mark: %s: %s\n", name, strerror(errno));
+            snprintf(error, error_size, "%s: %s", name, strerror(errno));
             buf_free(&b);
             if (path) close(fd);
             return false;
@@ -3873,7 +4801,7 @@ static bool read_input(const char *path, char **data, size_t *len)
         if (got == 0) break;
         b.len += (size_t)got;
         if (b.len > MAX_INPUT_BYTES) {
-            fprintf(stderr, "mark: %s: larger than %zu MiB\n", name, MAX_INPUT_BYTES >> 20);
+            snprintf(error, error_size, "%s: larger than %zu MiB", name, MAX_INPUT_BYTES >> 20);
             buf_free(&b);
             if (path) close(fd);
             return false;
@@ -3885,10 +4813,11 @@ static bool read_input(const char *path, char **data, size_t *len)
     return true;
 }
 
-/* file:// URLs for the file and its directory, for relative links. */
-static void set_file_urls(struct options *opt)
+/* file:// URLs for a file and its directory, for relative links. */
+static void file_urls(const char *path, char **file_url, char **dir_url)
 {
-    char *real = realpath(opt->path, NULL);
+    *file_url = *dir_url = NULL;
+    char *real = realpath(path, NULL);
     if (!real) return;
     char host[256] = "";
     if (gethostname(host, sizeof host - 1) != 0) host[0] = '\0';
@@ -3896,14 +4825,14 @@ static void set_file_urls(struct options *opt)
     buf_puts(&url, "file://");
     buf_puts(&url, host);
     url_encode(&url, real);
-    opt->file_url = url.data;
+    *file_url = url.data;
     char *slash = strrchr(real, '/');
     slash[1] = '\0';
     struct buf dir = {0};
     buf_puts(&dir, "file://");
     buf_puts(&dir, host);
     url_encode(&dir, real);
-    opt->dir_url = dir.data;
+    *dir_url = dir.data;
     free(real);
 }
 
@@ -3985,11 +4914,15 @@ int main(int argc, char **argv)
 
     char *raw;
     size_t raw_len;
-    if (!read_input(opt.path, &raw, &raw_len)) return EXIT_FAILED;
+    char error[PATH_MAX + 64];
+    if (!read_input(opt.path, &raw, &raw_len, error, sizeof error)) {
+        fprintf(stderr, "mark: %s\n", error);
+        return EXIT_FAILED;
+    }
     size_t len;
     char *text = normalize_input(raw, raw_len, &len);
     free(raw);
-    if (opt.path) set_file_urls(&opt);
+    if (opt.path) file_urls(opt.path, &opt.file_url, &opt.dir_url);
 
     bool extensions = true;
 #ifdef MARK_TEST

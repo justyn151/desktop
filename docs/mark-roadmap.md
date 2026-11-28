@@ -244,10 +244,23 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 
 ### Manual checks
 
-- From `PLAN.md`, Enter on `docs/view-roadmap.md` opens it, Enter on an `#anchor` link jumps, Backspace returns to the same spot in the plan.
-- `/foot` finds every match in `PLAN.md`, `n` wraps with a message in the status line.
-- `]` steps through headings in order; `o` lists all of them and jumps.
-- An `https://` link with `open` set to `firefox` opens it and mark keeps running.
+- [ ] From `PLAN.md`, Enter on `docs/view-roadmap.md` opens it, Enter on an `#anchor` link jumps, Backspace returns to the same spot in the plan.
+- [ ] `/foot` finds every match in `PLAN.md`, `n` wraps with a message in the status line.
+- [ ] `]` steps through headings in order; `o` lists all of them and jumps.
+- [ ] With `xdg-utils` installed, an `https://` link opens in the browser and mark keeps running. (`[links] open` arrives in 0.5.)
+
+### As built
+
+- Every link occurrence has its own index, so Tab steps through occurrences in reading order (top to bottom, left to right), and a link wrapped over two lines lights up as one. Tab past the last link on screen scrolls to the next one below. The status line shows the focused link's target as written.
+- The focused link is drawn reversed with a dashed underline; the current search match is bold on the highlight color (yellow), other matches reversed. `NO_COLOR` reverses both. The selection colors wait for the palette in 0.5.
+- Following: `#anchor` jumps within the document; a path ending in `.md`, `.markdown`, `.mdown`, `.mkd` or `.mkdn` (with an optional `#anchor`) opens in the pager, relative to the current file (or the working directory for standard input); `file://` URLs are treated as paths. Anything else goes to `xdg-open`, detached, with the URL percent-encoded as in OSC 8. If it can't run, the status line says so and shows the target. `[links] open` comes with the config in 0.5.
+- Anchor slugs follow GitHub: lowercase, spaces to hyphens, anything but letters, digits, marks, `-` and `_` dropped, and repeats numbered `-1`, `-2`. Anchors are percent-decoded and compared case-insensitively.
+- The back stack holds up to 32 places; anchor jumps and outline jumps push too, not only new documents. A place is a block and how far into it, so it survives a resize. Documents stay parsed while the stack refers to them and are freed when it no longer does.
+- Search runs on the laid-out lines, so a phrase broken across two lines isn't found. `/` searches from the top of the screen down, `?` from the bottom up; `n` repeats in the search's direction and `N` against it, wrapping with a message. A pattern with a capital is case-sensitive. Combining marks in the pattern are ignored, matching the base characters. Backspace on an empty prompt and Escape cancel; Ctrl+U clears it.
+- Escape now clears a focused link and search highlights first, and quits only when there is nothing to clear.
+- `]` and `[` put the next or previous heading at the top of the screen. The outline replaces the text while it's open: headings indented by level, the section the top of the screen is in marked `▸`, the selection reversed. Enter, a click or the wheel work in it; `o`, `q` or Escape close it.
+- A click (on release) follows a link under the pointer, or picks a heading in the outline.
+- Checked offline in a pty: Tab, Shift+Tab, Enter and Backspace across two files and anchors, including the second of two same-named headings; a missing file and a missing opener give messages; a stand-in opener on `PATH` receives the URL; search with smartcase, wrapping, `?`, `N` and a pattern that isn't there, and the escapes for highlights; heading jumps, the outline and clicks; following a self-link 40 times and going back 33. Random keys, clicks and searches over four documents, with resizes down to 2×3, under ASan and UBSan.
 
 ---
 
@@ -316,6 +329,6 @@ When stdout is a terminal, mark shows the document in its own pager instead of p
 | 0.1 | CommonMark block and inline parsing, rendering with deal's attributes, print to stdout | Done (652/652 spec examples; live checks in deal pending) |
 | 0.2 | GitHub tables, strikethrough, task lists, extended autolinks | Done (21/21 GitHub examples; live checks in deal pending) |
 | 0.3 | Pager: alternate screen, scrolling, mouse wheel, resize reflow, synchronized output | Done (live checks in deal pending) |
-| 0.4 | Following links, back stack, search, heading jumps, outline | Not started |
+| 0.4 | Following links, back stack, search, heading jumps, outline | Done (live checks in deal pending) |
 | 0.5 | Config, palette colors, reload on save, `e` to edit, desktop entry | Not started |
 | 1.0 | Spec corpus, fuzzing, a week of use, README, tag | Final |
