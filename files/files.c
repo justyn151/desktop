@@ -1743,11 +1743,12 @@ static void update_hover(struct files *files, bool force)
     struct target hover = target_at(files);
     if (!force && hover.kind == files->hover.kind && hover.index == files->hover.index)
         return;
-    bool was_divider = files->hover.kind == TARGET_DIVIDER;
-    if (shows_hover(hover.kind) || shows_hover(files->hover.kind))
-        desk_window_redraw(&files->window);
+    struct target old = files->hover;
+    /* Set before redrawing: the redraw may paint right away. */
     files->hover = hover;
-    if (force || was_divider != (hover.kind == TARGET_DIVIDER))
+    if (shows_hover(hover.kind) || shows_hover(old.kind))
+        desk_window_redraw(&files->window);
+    if (force || (old.kind == TARGET_DIVIDER) != (hover.kind == TARGET_DIVIDER))
         set_cursor(files);
 }
 
