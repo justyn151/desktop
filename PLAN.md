@@ -13,13 +13,17 @@ Ground rules that apply to every phase:
 
 ## Where things stand (2026-11-28)
 
-**Now:** `files` 0.1 to 0.6 are in: an explorer layout, file operations with progress and undo, drag and drop, properties, config, per-folder views, and the file picker (`files --pick`/`--save` plus the FileChooser portal backend, live through `xdg-desktop-portal`). What's left for files is 1.0, which runs alongside daily use. `mark` and `view` are at the same point: features in, 1.0 checks to go. Before more apps, the laptop needs the basics a daily driver can't do without: Bluetooth, working volume, and a browser. Details for the apps are in [docs/files-roadmap.md](docs/files-roadmap.md), [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
+**Now:** the daily-driver basics are in. Bluetooth works (`rtkit` installed, headphones paired), and `blue` 0.3 manages it from a TUI and bar. Volume has keys in dwl, a bar module, and `vol` 0.4: the command line plus a mixer window built like files (`vol mixer`, opened from bar's click). Helium is installed as the browser. `files` 0.1 to 0.6 are in, with the file picker live through `xdg-desktop-portal`; files, `mark` and `view` all have their features in and 1.0 checks to go, alongside daily use. Next is a new app: `read`, the document viewer, since PDFs have nothing to open them. Details are in [docs/read-roadmap.md](docs/read-roadmap.md), [docs/sound-roadmap.md](docs/sound-roadmap.md), [docs/files-roadmap.md](docs/files-roadmap.md), [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
 
 **Next, in order:**
 
-1. Bluetooth: `bluetooth.service` is already enabled and running and PipeWire's Bluetooth plugin is loaded, so what's left is installing `rtkit`, pairing headphones from `bluetoothctl` and checking they come back after a reboot (Stage 0.1 of [docs/sound-roadmap.md](docs/sound-roadmap.md))
-2. Volume: Stages 0.2 and 0.3 and `vol` 0.1 are in and installed: the four audio keys run `vol` from dwl, and bar has a `[volume]` module fed by `vol --follow` (`Vol 30%`). Restart dwl to pick them up, then check the keys and scrolling the bar by hand. The volume popup (vol 0.2) is skipped and will come with `notify`. `blue` 0.1–0.3 are in (devices, connect, power, searching, pairing as BlueZ's agent, the bar module and dwl rule); vol's mixer (0.3) is in, as a window like files (`vol mixer`), with its config, desktop entry, dwl rule and bar click (0.4); next are the 1.0 checks for blue and vol
-3. A browser: none is installed. Install one, make it the default for `http`, `https` and `text/html` in `mimeapps.list`, and check its upload and download dialogs come up as files through the portal (the reason for files 0.6)
+1. `read`, the document viewer: PDF first, then EPUB, MOBI, FB2, XPS, CBZ, on libmupdf in a desk window. 0.1 (open a PDF, turn pages) to 0.6 (config, remembered place, default for documents), then 1.0. Install `libmupdf` first. The plan is [docs/read-roadmap.md](docs/read-roadmap.md)
+2. Alongside `read`, `vol` and `blue` toward 1.0 (hands-on, see [docs/sound-roadmap.md](docs/sound-roadmap.md)):
+   - Restart dwl, then check the audio keys, scrolling and clicking bar's `Vol` (the mixer opens floating and centered) and `BT` (blue opens)
+   - The open mixer checks: a browser tab's stream moved to headphones stays there, a headset switched to HFP adds its mic under Input, removing the default output moves its streams
+   - A week of use: calls with a headset, HDMI out, suspend with headphones connected
+   - READMEs, tags `vol-1.0.0` and `blue-1.0.0`
+3. The browser's last steps: check Helium is the default for `http`, `https` and `text/html` in `mimeapps.list`, and that its upload and download dialogs come up as files through the portal (the reason for files 0.6)
 4. `files` toward 1.0: live checks, a week of daily use, fuzzing the listing and the portal input, final README, tag `files-1.0.0`. After 1.0: dialogs as windows of their own that can be dragged. files is a mouse-first explorer, not a keyboard-first one.
 5. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
 6. Alongside `files`, `view` toward 1.0:
@@ -34,6 +38,12 @@ Ground rules that apply to every phase:
 
 | What | Result |
 |---|---|
+| vol 0.4 | `[mixer] start_view` and `show_monitors`, one mixer window at a time, `vol.desktop`, dwl floats and centers app ID `vol`, bar's `[volume] click` defaults to `vol mixer` |
+| vol 0.3 | The mixer, first as a TUI and then rebuilt as a desk window like files (`vol mixer`): Output, Input, Playback and Devices tabs, sliders with live peak meters, mute buttons, the default dot, a stream's output and a card's profile as dropdowns. One libpulse main loop drives Wayland and the sound server |
+| vol 0.1 | `vol get/up/down/set/mute` and `--follow` over libpulse, replacing the `wpctl` stopgaps in dwl's keys and bar. 0.2, the popup, moved to `notify` |
+| blue 0.1–0.3 | Bluetooth TUI over BlueZ's D-Bus API: known devices, connect, power, searching and pairing as BlueZ's agent; bar's `[bluetooth]` module (`BT`, device and battery) opens it; dwl rule; config |
+| Sound Stage 0 | `rtkit` installed, headphones paired from `bluetoothctl`, volume keys in dwl, a `[volume]` module in bar |
+| Browser | Helium installed from Chaotic-AUR (the default and portal checks are still to do) |
 | Portal setup | `xdg-desktop-portal` installed and live: dwl sets `XDG_CURRENT_DESKTOP=dwl` and hands it and `WAYLAND_DISPLAY` to D-Bus and systemd activation at startup, the session file names `DesktopNames=dwl`, and file dialogs reach files through `~/.config/xdg-desktop-portal/dwl-portals.conf`. dwl floats the dialog (`files-picker`) centered |
 | files 0.6 | The file picker: `files --pick` (`--multiple`, `--directory`) and `--save NAME`, a bottom bar with the name, type filter, Cancel and Open/Save, exit 3 on cancel, the last folder per application. `files --portal` serves `org.freedesktop.impl.portal.FileChooser` (OpenFile, SaveFile, SaveFiles) with sd-bus, one dialog process per request. The background is 0.8 opaque by default (`[layout] opacity`) |
 | files 0.5 | `files.conf`, a view per folder, tooltips for cut-off names, single-click option, `files.desktop` as the folder handler, Super+E in dwl |
@@ -220,7 +230,8 @@ Rough order, based on what gets touched most often day to day:
 1. `lock`
 2. `notify`
 3. `clip`
-4. `vol`, with `blue` beside it: both pulled forward after the browser (see [docs/sound-roadmap.md](docs/sound-roadmap.md))
+4. `vol`, with `blue` beside it: both pulled forward after the browser; features done, 1.0 in progress (see [docs/sound-roadmap.md](docs/sound-roadmap.md))
+   - `read` follows them, pulled forward ahead of the rest of this list (see below)
 5. `power`
 6. `mount`
 7. `view`: pulled forward; features done, 1.0 in progress (see below)
@@ -241,6 +252,20 @@ The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on d
 | 0.4 | GIF (built-in) and WebP, EXIF orientation, checkerboard, unsupported formats named | Done (live checks wait for sample files) |
 | 0.5 | Config, palette background, start directory, dwl float rule, desktop entry, shot's open-after-capture | Code done, live checks pending |
 | 1.0 | Live checks, a week of use, fuzzing the decoders, README, tag | In progress alongside `mark` |
+
+### read
+
+The detailed plan is in [docs/read-roadmap.md](docs/read-roadmap.md). A desk window over libmupdf, which parses and renders PDF, EPUB, MOBI, FB2, XPS, CBZ and SVG, so read never parses a document itself. It shares files' pieces: the pointer handling, the sidebar, the text field, the clipboard and a worker thread. The text field and clipboard move into desk when read needs them (0.4), the first real step toward the toolkit.
+
+| Version | Milestone | Status |
+|---|---|---|
+| 0.1 | One PDF, turn pages, fit width, sharp at any scale | Next |
+| 0.2 | Continuous scrolling, zoom around the pointer, rendering on a worker thread with a bounded cache | Planned |
+| 0.3 | Outline sidebar, go to page, links, back and forward | Planned |
+| 0.4 | Search with highlights, text selection and copy; text field and clipboard move into desk | Planned |
+| 0.5 | EPUB, MOBI, FB2, XPS, CBZ, SVG with reflow; passwords; reload on change; dark reading | Planned |
+| 0.6 | Config, remembered place per file, palette, desktop entry and default for documents | Planned |
+| 1.0 | Checks, a week of use, fuzzing and sanitizers, README, tag | Planned |
 
 ### files
 
@@ -296,9 +321,9 @@ These are the pieces a laptop daily driver needs that aren't one of the 30 proje
 
 | Gap | Current state | Route |
 |---|---|---|
-| Volume keys | Bound to `vol` 0.1 in dwl, level shown in bar; the popup comes with `notify` | `vol` + XF86Audio bindings in dwl, plan in [docs/sound-roadmap.md](docs/sound-roadmap.md). Stopgap: bind `wpctl` in `config.h` |
+| Volume keys | Bound to `vol` in dwl, level shown in bar, mixer from bar's click (`vol` 0.4); the popup comes with `notify` | `vol` + XF86Audio bindings in dwl, plan in [docs/sound-roadmap.md](docs/sound-roadmap.md). Stopgap: bind `wpctl` in `config.h` |
 | Bluetooth | `blue` 0.3: lists, searches, pairs, connects; bar shows it and opens blue; floats in dwl | `bluetoothctl` to start, then `blue` and a bar module ([docs/sound-roadmap.md](docs/sound-roadmap.md)) |
-| Browser | None installed. Pulled forward: next | Install one, default for web links, file dialogs through the portal |
+| Browser | Helium installed; default and portal dialogs to check | Default for web links, file dialogs through the portal |
 | Brightness keys + OSD | Missing | backlight via logind `SetBrightness`, the popup through `notify` (shared with volume) |
 | Idle dim/lock/suspend | Missing | `ext-idle-notify-v1` (dwl supports it) → `lock` |
 | Polkit agent | Missing (net's README notes one may be needed) | polkit over D-Bus (sd-bus) |
@@ -340,7 +365,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 30 proje
 | 18 | `ctl` | Desktop configuration tool for fonts, theme and shared settings |
 | 19 | `music` | Local music player |
 | 20 | `video` | Video frontend, with mpv as the playback backend |
-| 21 | `read` | PDF and document reader |
+| 21 | `read` | PDF and document reader on libmupdf (PDF, EPUB, MOBI, FB2, XPS, CBZ); next, roadmap in `docs/read-roadmap.md` |
 | 22 | shell | Lightweight Fish-inspired command interpreter |
 | 23 | `login` | Login screen, as a greetd greeter |
 | 24 | `pkg` | Build and install tool for the desktop repo |
