@@ -48,7 +48,9 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Delete | Move the selection to the trash (in the trash: delete it permanently, after asking) |
 | Shift+Delete | Delete the selection permanently, after asking |
 | Ctrl+Shift+N | New folder |
-| Ctrl+Z | Undo the last rename, new folder or file, or move to the trash |
+| Ctrl+C, Ctrl+X | Copy or cut the selection (for files and other file managers) |
+| Ctrl+V | Paste here: copies, or moves what was cut |
+| Ctrl+Z | Undo the last rename, new folder or file, move to the trash, copy or move |
 | Enter | Open: into a directory, or a file with its application (see Opening files) |
 | Backspace, Alt+Up | Up to the parent, with the directory you came from selected |
 | Alt+Left, Alt+Right | Back, forward through the directories visited |
@@ -101,11 +103,11 @@ Programs aren't run by double-clicking: an executable opens like any other file 
 
 | Right-click on | Menu |
 |---|---|
-| A file | Open, Open with ▸ (the applications for its type, the default first), Run (executables), Rename, Move to trash, Delete permanently, Copy path |
-| A folder | Open, Open in new tab, Rename, Move to trash, Delete permanently, Copy path, Add to sidebar |
+| A file | Open, Open with ▸ (the applications for its type, the default first), Run (executables), Cut, Copy, Rename, Move to trash, Delete permanently, Copy path |
+| A folder | Open, Open in new tab, Cut, Copy, Paste into folder, Rename, Move to trash, Delete permanently, Copy path, Add to sidebar |
 | Something in the trash | Open, Restore, Delete permanently, Copy path |
 | A place in the sidebar | Open, Open in new tab, Empty trash (the Trash), Copy path, Remove from sidebar (bookmarks) |
-| The empty part of the list | New folder, New file (Empty trash in the trash), Undo when there's something to undo, Show hidden files, Sort by ▸ (Name, Type, Size, Modified, Descending), Refresh, Copy path (of the folder) |
+| The empty part of the list | New folder, New file (Empty trash in the trash), Paste, Undo when there's something to undo, Show hidden files, Sort by ▸ (Name, Type, Size, Modified, Descending), Refresh, Copy path (of the folder) |
 
 Items show their keys on the right. Right-clicking an entry that's part of the selection keeps the selection, and Move to trash and Delete permanently act on all of it. Outside home, the items that would change something are greyed out.
 
@@ -121,8 +123,11 @@ It's a popup the compositor places, so it flips or slides to stay on screen; a c
 - **New folder** and **New file** make "New folder" (or "New folder 2" and so on) in the current directory, select it and start renaming it. The search is cleared first, so it shows.
 - **Move to trash** (Delete) uses the freedesktop trash in `~/.local/share/Trash`, so other file managers and `gio trash --list` see the same items: each gets an info file with where it came from and when, and a name not yet used there (`notes.2.txt`). Only the home drive's trash is used for now: something on another drive can't be trashed and the message says Shift+Delete deletes it.
 - **The Trash** is a place in the sidebar. Right-clicking in it offers Restore, which puts an item back where it came from (making its folder again if that went too, and refusing to replace anything), Delete permanently, and Empty trash.
-- **Delete permanently** (Shift+Delete) asks first, over the window: "Delete report.pdf permanently?" with Cancel, which has the focus, and Delete. Tab or the arrows move between them, Enter picks, Escape cancels. Deleting never follows a symlink (a link to `/` inside a folder removes the link, not `/`) and never goes into another mounted file system, like `rm -r --one-file-system`. It runs in the window for now; a big folder holds it until done (a progress bar comes with copying).
-- **Undo** (Ctrl+Z) reverses the last rename, new folder or file (only while it's still empty), or move to the trash. One step; deleting permanently can't be undone.
+- **Delete permanently** (Shift+Delete) asks first, over the window: "Delete report.pdf permanently?" with Cancel, which has the focus, and Delete. Tab or the arrows move between them, Enter picks, Escape cancels. Deleting never follows a symlink (a link to `/` inside a folder removes the link, not `/`) and never goes into another mounted file system, like `rm -r --one-file-system`. It runs in the background with the progress bar, like copying.
+- **Cut, Copy and Paste** (Ctrl+X, Ctrl+C, Ctrl+V) put the selection on the clipboard as files, in the forms other file managers use (`x-special/gnome-copied-files`, `text/uri-list`) and as their paths for text, and paste files copied or cut in other applications too. Paste copies into the folder shown, or the folder right-clicked; what was cut is moved, once.
+- **Copying, moving and deleting** run in the background, one job at a time, with a bar along the window's foot: what's being done, how many, the bytes, and a × that cancels. A copy is written to a hidden file beside its place and renamed into it when whole, so cancelling never leaves half a file. Modes and times are kept and symlinks are copied as links. A move on the same drive is a rename; across drives it's a copy, then the original goes once all of it arrived. Nothing goes inside itself, and copying never follows a link or goes into another mounted drive.
+- **A name that's taken** stops the job with a question: Skip, Keep both (the copy becomes `notes (2).txt`) or Replace, or Merge for two folders, which goes through what's inside asking again. "Do this for all conflicts" answers the rest the same; Escape cancels the job. Pasting where the things already are makes copies beside them.
+- **Undo** (Ctrl+Z) reverses the last rename, new folder or file (only while it's still empty), move to the trash, copy (the copies go to the trash) or move (back where they were). One step; deleting permanently and merging can't be undone.
 
 ## Mouse
 
@@ -236,6 +241,9 @@ files will only change things inside your home directory (and your trash, wherev
 - [ ] F2 renames in the list and the icon view; Ctrl+Shift+N makes a folder ready to name; Ctrl+Z undoes each.
 - [ ] Delete moves files to the trash and they show in the Trash place (and in `gio trash --list`, if installed); Restore puts them back; Empty trash asks, then empties it.
 - [ ] Shift+Delete asks before deleting; Escape cancels. In `/etc` or `/tmp` none of these change anything.
+- [ ] Ctrl+C then Ctrl+V in another folder copies, with the bar for a big file; × cancels and leaves nothing half copied.
+- [ ] Ctrl+X then Ctrl+V moves; Ctrl+Z moves it back. Copying onto a name that's there asks Skip, Keep both, Replace.
+- [ ] Files copied in files paste in another file manager, and the other way round.
 - [ ] Narrowing the window hides the sidebar.
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
 - [ ] Images show thumbnails in the icon view, quickly on a second visit; a photo taken sideways shows upright; editing an image updates its thumbnail.

@@ -3410,16 +3410,145 @@ static void restore_selection(struct files *files)
     refresh(files);
 }
 
-/* Deleting for good */
+/* Jobs
 
-/* Remove name in directory fd and everything under it, never following a
+   Copying, moving and deleting for good run on a worker thread, one job
+   at a time, with a progress bar along the window's foot and a × that
+   cancels. A copy is written to a hidden file beside its target and only
+   renamed into place when whole, so cancelling or failing never leaves
+   half a file. Nothing is replaced without asking: a name that's taken
+   stops the job with a question (Skip, Keep both, Replace or Merge).
+   Recursive work never follows symlinks (they're copied as links) and
+   never goes into another mounted file system. */
+
+enum job_kind { JOB_COPY, JOB_MOVE, JOB_DELETE };
+enum answer { ANSWER_NONE, ANSWER_SKIP, ANSWER_BOTH, ANSWER_REPLACE, ANSWER_CANCEL };
+
+struct job {
+    enum job_kind kind;
+    char **sources;
+    size_t count;
+    char *destination;              /* Copy and move: the directory they go into. */
+    bool trash_info;                /* Delete: they're in the trash, so their info files go too. */
+    _Atomic long long bytes_done, bytes_total;
+    _Atomic long items_done, items_total;
+    _Atomic bool cancel;
+    bool counted;                   /* The totals are known. */
+    char current[256];              /* The name being worked on. Under the lock. */
+    /* A question for the window: target is taken. Under the lock. */
+    bool asking;
+    char *ask_target;
+    bool ask_directories;           /* Both are directories: Merge instead of Replace. */
+    enum answer answer, answer_all; /* The reply, and the one for every conflict when ticked. */
+    /* Results, for the message and undo. */
+    int error;                      /* The first, or 0. */
+    char *error_name;
+    size_t failed, skipped, merged;
+    char **made_from, **made;       /* Each top-level item done: where it was and where it is. */
+    size_t made_count;
+};
+
+struct worker {
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    int event;                      /* eventfd: progress, a question or a job done. */
+    bool quit;
+    struct job **queue;             /* queue[0] is the one running. */
+    size_t queue_count;
+    struct job **finished;
+    size_t finished_count;
+    uint64_t signalled_ms;
+};
+
+static uint64_t now_ms(void);
+
+static void job_free(struct job *job)
+{
+    if (!job)
+        return;
+    free_paths(job->sources, job->count);
+    free_paths(job->made_from, job->made_count);
+    free_paths(job->made, job->made_count);
+    free(job->destination);
+    free(job->ask_target);
+    free(job->error_name);
+    free(job);
+}
+
+/* Tell the window, at most ten times a second unless it matters. */
+static void worker_signal(struct worker *worker, bool now)
+{
+    uint64_t time = now_ms();
+    if (!now && time - worker->signalled_ms < 100)
+        return;
+    worker->signalled_ms = time;
+    uint64_t one = 1;
+    (void)!write(worker->event, &one, sizeof one);
+}
+
+static void job_status(struct worker *worker, struct job *job, const char *name)
+{
+    pthread_mutex_lock(&worker->lock);
+    snprintf(job->current, sizeof job->current, "%s", name);
+    worker_signal(worker, false);
+    pthread_mutex_unlock(&worker->lock);
+}
+
+static void job_failed(struct job *job, int error, const char *name)
+{
+    if (error == ECANCELED)
+        return;
+    ++job->failed;
+    if (!job->error) {
+        job->error = error;
+        job->error_name = strdup(name);
+    }
+}
+
+static bool cancelled(struct job *job)
+{
+    return atomic_load(&job->cancel);
+}
+
+/* Count what's under path, as the job will go through it. */
+static void job_count(struct job *job, int directory, const char *name, dev_t device)
+{
+    struct stat info;
+    if (cancelled(job) || fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0)
+        return;
+    atomic_fetch_add(&job->items_total, 1);
+    if (S_ISREG(info.st_mode) && job->kind != JOB_DELETE)
+        atomic_fetch_add(&job->bytes_total, (long long)info.st_size);
+    if (!S_ISDIR(info.st_mode) || info.st_dev != device)
+        return;
+    int fd = openat(directory, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (!dir) {
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    struct dirent *item;
+    while ((item = readdir(dir))) {
+        if (strcmp(item->d_name, ".") != 0 && strcmp(item->d_name, "..") != 0)
+            job_count(job, dirfd(dir), item->d_name, device);
+    }
+    closedir(dir);
+}
+
+/* Remove name in directory and everything under it, never following a
    link and never leaving the file system it's on, like rm -r
    --one-file-system. Returns the first error. */
-static int remove_at(int directory, const char *name, dev_t device)
+static int remove_at(struct job *job, int directory, const char *name, dev_t device)
 {
+    if (job && cancelled(job))
+        return ECANCELED;
     struct stat info;
     if (fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0)
         return errno == ENOENT ? 0 : errno;
+    if (job)
+        atomic_fetch_add(&job->items_done, 1);
     if (!S_ISDIR(info.st_mode))
         return unlinkat(directory, name, 0) == 0 ? 0 : errno;
     if (info.st_dev != device)
@@ -3438,17 +3567,17 @@ static int remove_at(int directory, const char *name, dev_t device)
     while ((item = readdir(dir))) {
         if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
             continue;
-        int error = remove_at(fd, item->d_name, device);
+        int error = remove_at(job, fd, item->d_name, device);
         if (error && !first)
             first = error;
     }
     closedir(dir);
-    if (unlinkat(directory, name, AT_REMOVEDIR) != 0 && !first)
+    if (!first && unlinkat(directory, name, AT_REMOVEDIR) != 0)
         first = errno;
     return first;
 }
 
-static int remove_path(const char *path)
+static int remove_path(struct job *job, const char *path)
 {
     char *parent = parent_path(path);
     int fd = parent ? open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
@@ -3456,25 +3585,569 @@ static int remove_path(const char *path)
     if (fd < 0)
         return errno;
     struct stat info;
-    int error = fstatat(fd, base_name(path), &info, AT_SYMLINK_NOFOLLOW) == 0 ? remove_at(fd, base_name(path), info.st_dev)
-                                                                            : errno;
+    int error = fstatat(fd, base_name(path), &info, AT_SYMLINK_NOFOLLOW) == 0
+                    ? remove_at(job, fd, base_name(path), info.st_dev)
+                    : errno;
     close(fd);
     return error;
 }
 
-enum { DIALOG_DELETE, DIALOG_EMPTY_TRASH };
+/* "name (2).ext" and so on: the first not taken in directory. */
+static char *unused_name(const char *directory, const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    size_t stem = dot && dot != name ? (size_t)(dot - name) : strlen(name);
+    for (int n = 2; n < 10000; ++n) {
+        char *candidate = NULL, *path;
+        if (asprintf(&candidate, "%.*s (%d)%s", (int)stem, name, n, name + stem) < 0)
+            return NULL;
+        path = join_path(directory, candidate);
+        free(candidate);
+        struct stat info;
+        if (!path || lstat(path, &info) != 0)
+            return path;
+        free(path);
+    }
+    return NULL;
+}
 
-static void open_dialog(struct files *files, int action, char **paths, size_t count, const char *confirm,
-                        const char *title, const char *message)
+/* Ask the window what to do about target, taken; waits for the reply. */
+static enum answer job_ask(struct worker *worker, struct job *job, const char *target, bool directories)
+{
+    pthread_mutex_lock(&worker->lock);
+    if (job->answer_all != ANSWER_NONE) {
+        enum answer all = job->answer_all;
+        pthread_mutex_unlock(&worker->lock);
+        return all;
+    }
+    free(job->ask_target);
+    job->ask_target = strdup(target);
+    job->ask_directories = directories;
+    job->answer = ANSWER_NONE;
+    job->asking = true;
+    worker_signal(worker, true);
+    while (job->answer == ANSWER_NONE && !cancelled(job) && !worker->quit)
+        pthread_cond_wait(&worker->wake, &worker->lock);
+    enum answer answer = cancelled(job) || worker->quit ? ANSWER_CANCEL : job->answer;
+    job->asking = false;
+    pthread_mutex_unlock(&worker->lock);
+    return answer;
+}
+
+/* Where source goes in directory: *target, or NULL to skip it. *merge when
+   both are directories and the reply was Merge; *replace when what's there
+   gives way. */
+static int resolve(struct worker *worker, struct job *job, const char *source, bool source_directory,
+                   const char *directory, char **target, bool *merge, bool *replace)
+{
+    *merge = *replace = false;
+    *target = join_path(directory, base_name(source));
+    if (!*target)
+        return ENOMEM;
+    struct stat there;
+    if (lstat(*target, &there) != 0)
+        return 0;
+    if (strcmp(*target, source) == 0) {
+        free(*target);
+        *target = NULL;
+        if (job->kind == JOB_MOVE)
+            return 0; /* Already there. */
+        *target = unused_name(directory, base_name(source)); /* A copy beside it. */
+        return *target ? 0 : ENOMEM;
+    }
+    bool directories = source_directory && S_ISDIR(there.st_mode);
+    switch (job_ask(worker, job, *target, directories)) {
+    case ANSWER_SKIP:
+        ++job->skipped;
+        free(*target);
+        *target = NULL;
+        return 0;
+    case ANSWER_BOTH:
+        free(*target);
+        *target = unused_name(directory, base_name(source));
+        return *target ? 0 : ENOMEM;
+    case ANSWER_REPLACE:
+        *merge = directories;
+        *replace = !directories;
+        return 0;
+    default:
+        free(*target);
+        *target = NULL;
+        return ECANCELED;
+    }
+}
+
+/* Copy a regular file's bytes, mode and times to a hidden file beside
+   target, then rename it into place. */
+static int copy_file(struct worker *worker, struct job *job, const char *source, const struct stat *info,
+                     const char *target, bool replace)
+{
+    job_status(worker, job, base_name(source));
+    int in = open(source, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (in < 0)
+        return errno;
+    char *directory = parent_path(target), *partial = NULL;
+    if (!directory || asprintf(&partial, "%s/.%s.files-partial-%ld", directory, base_name(target), (long)getpid()) < 0) {
+        free(directory);
+        close(in);
+        return ENOMEM;
+    }
+    free(directory);
+    int out = open(partial, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int error = out < 0 ? errno : 0;
+    bool plain = false;
+    char *buffer = NULL;
+    while (!error) {
+        if (cancelled(job)) {
+            error = ECANCELED;
+            break;
+        }
+        ssize_t moved;
+        if (!plain) {
+            moved = copy_file_range(in, NULL, out, NULL, 4 << 20, 0);
+            if (moved < 0 && (errno == EXDEV || errno == EINVAL || errno == ENOSYS || errno == EOPNOTSUPP)) {
+                plain = true;
+                continue;
+            }
+        } else {
+            if (!buffer && !(buffer = malloc(1 << 20))) {
+                error = ENOMEM;
+                break;
+            }
+            moved = read(in, buffer, 1 << 20);
+            for (ssize_t written = 0; moved > 0 && written < moved;) {
+                ssize_t step = write(out, buffer + written, (size_t)(moved - written));
+                if (step < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    moved = -1;
+                    break;
+                }
+                written += step;
+            }
+        }
+        if (moved < 0) {
+            if (errno == EINTR)
+                continue;
+            error = errno;
+        } else if (moved == 0) {
+            break;
+        } else {
+            atomic_fetch_add(&job->bytes_done, (long long)moved);
+            pthread_mutex_lock(&worker->lock);
+            worker_signal(worker, false);
+            pthread_mutex_unlock(&worker->lock);
+        }
+    }
+    free(buffer);
+    close(in);
+    if (!error) {
+        struct timespec times[2] = {info->st_atim, info->st_mtim};
+        fchmod(out, info->st_mode & 07777);
+        futimens(out, times);
+    }
+    if (out >= 0 && close(out) != 0 && !error)
+        error = errno;
+    if (!error) {
+        if (replace)
+            error = rename(partial, target) == 0 ? 0 : errno;
+        else
+            error = move_no_replace(partial, target);
+    }
+    if (error && out >= 0)
+        unlink(partial);
+    free(partial);
+    return error;
+}
+
+/* Copy source (described by info) to target, the whole tree. merge: target
+   is a directory already, so go into it. */
+static int copy_tree(struct worker *worker, struct job *job, const char *source, const struct stat *info,
+                     const char *target, bool merge, bool replace, dev_t device)
+{
+    if (cancelled(job))
+        return ECANCELED;
+    atomic_fetch_add(&job->items_done, 1);
+    if (replace) {
+        /* A file over a file is renamed over it when whole; anything else
+           takes the old one's place once it's gone. */
+        struct stat there;
+        if (lstat(target, &there) == 0 && (S_ISDIR(there.st_mode) || !S_ISREG(info->st_mode))) {
+            int error = remove_path(NULL, target);
+            if (error)
+                return error;
+            replace = false;
+        }
+    }
+    if (S_ISREG(info->st_mode))
+        return copy_file(worker, job, source, info, target, replace);
+    if (S_ISLNK(info->st_mode)) {
+        char link[PATH_MAX];
+        ssize_t length = readlink(source, link, sizeof link - 1);
+        if (length < 0)
+            return errno;
+        link[length] = 0;
+        return symlink(link, target) == 0 ? 0 : errno;
+    }
+    if (!S_ISDIR(info->st_mode))
+        return ENOTSUP; /* Devices, pipes, sockets. */
+    job_status(worker, job, base_name(source));
+    if (!merge && mkdir(target, (info->st_mode & 07777) | 0700) != 0)
+        return errno;
+    if (info->st_dev != device)
+        return 0; /* A mount point: its folder, not what's mounted. */
+    DIR *dir = opendir(source);
+    if (!dir)
+        return errno;
+    int first = 0;
+    struct dirent *item;
+    while ((item = readdir(dir))) {
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
+            continue;
+        char *child = join_path(source, item->d_name);
+        struct stat child_info;
+        int error = child && lstat(child, &child_info) == 0 ? 0 : errno ? errno : ENOMEM;
+        char *child_target = NULL;
+        bool child_merge = false, child_replace = false;
+        if (!error && merge)
+            error = resolve(worker, job, child, S_ISDIR(child_info.st_mode), target, &child_target, &child_merge,
+                            &child_replace);
+        else if (!error)
+            child_target = join_path(target, item->d_name);
+        if (!error && child_target)
+            error = copy_tree(worker, job, child, &child_info, child_target, child_merge, child_replace, device);
+        if (error == ECANCELED) {
+            free(child);
+            free(child_target);
+            first = ECANCELED;
+            break;
+        }
+        if (error)
+            job_failed(job, error, item->d_name);
+        if (error && !first)
+            first = error;
+        free(child);
+        free(child_target);
+    }
+    closedir(dir);
+    if (!merge) {
+        struct timespec times[2] = {info->st_atim, info->st_mtim};
+        chmod(target, info->st_mode & 07777);
+        utimensat(AT_FDCWD, target, times, AT_SYMLINK_NOFOLLOW);
+    }
+    return first == ECANCELED ? ECANCELED : first ? -1 : 0; /* -1: already counted. */
+}
+
+/* Move source into target: a rename on the same file system (merging a
+   directory into one that's there by moving what's inside), else a copy
+   and then removing the original once all of it was copied. */
+static int move_tree(struct worker *worker, struct job *job, const char *source, const struct stat *info,
+                     const char *target, bool merge, bool replace)
+{
+    if (cancelled(job))
+        return ECANCELED;
+    job_status(worker, job, base_name(source));
+    if (!merge) {
+        int error = replace ? (rename(source, target) == 0 ? 0 : errno) : move_no_replace(source, target);
+        if (error == EISDIR || error == ENOTDIR || error == ENOTEMPTY || error == EEXIST) {
+            /* Replacing across kinds: the old one goes first. */
+            if (replace && (error = remove_path(NULL, target)) == 0)
+                error = move_no_replace(source, target);
+        }
+        if (error != EXDEV) {
+            if (!error)
+                atomic_fetch_add(&job->items_done, 1);
+            return error;
+        }
+        error = copy_tree(worker, job, source, info, target, false, replace, info->st_dev);
+        return error ? error : remove_path(NULL, source);
+    }
+    /* Both directories: move each thing inside, then the emptied one goes. */
+    DIR *dir = opendir(source);
+    if (!dir)
+        return errno;
+    int first = 0;
+    struct dirent *item;
+    while ((item = readdir(dir))) {
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
+            continue;
+        char *child = join_path(source, item->d_name), *child_target = NULL;
+        struct stat child_info;
+        bool child_merge, child_replace;
+        int error = child && lstat(child, &child_info) == 0 ? 0 : errno ? errno : ENOMEM;
+        if (!error)
+            error = resolve(worker, job, child, S_ISDIR(child_info.st_mode), target, &child_target, &child_merge,
+                            &child_replace);
+        if (!error && child_target)
+            error = move_tree(worker, job, child, &child_info, child_target, child_merge, child_replace);
+        free(child);
+        free(child_target);
+        if (error == ECANCELED) {
+            first = ECANCELED;
+            break;
+        }
+        if (error > 0) {
+            job_failed(job, error, item->d_name);
+            first = first ? first : -1;
+        }
+    }
+    closedir(dir);
+    if (!first)
+        rmdir(source); /* Skipped things keep it. */
+    atomic_fetch_add(&job->items_done, 1);
+    return first;
+}
+
+static void job_made(struct job *job, const char *from, const char *to)
+{
+    char **froms = realloc(job->made_from, (job->made_count + 1) * sizeof *froms);
+    if (froms)
+        job->made_from = froms;
+    char **tos = realloc(job->made, (job->made_count + 1) * sizeof *tos);
+    if (tos)
+        job->made = tos;
+    if (!froms || !tos)
+        return;
+    job->made_from[job->made_count] = strdup(from);
+    job->made[job->made_count++] = strdup(to);
+}
+
+static void job_run(struct worker *worker, struct job *job)
+{
+    /* Count first, for the bar; a move within a file system is one rename
+       a piece. */
+    struct stat destination;
+    bool have_destination = job->destination && stat(job->destination, &destination) == 0;
+    for (size_t i = 0; i < job->count && !cancelled(job); ++i) {
+        struct stat info;
+        if (lstat(job->sources[i], &info) != 0)
+            continue;
+        if (job->kind == JOB_MOVE && have_destination && info.st_dev == destination.st_dev) {
+            atomic_fetch_add(&job->items_total, 1);
+            continue;
+        }
+        char *parent = parent_path(job->sources[i]);
+        int fd = parent ? open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+        if (fd >= 0) {
+            job_count(job, fd, base_name(job->sources[i]), info.st_dev);
+            close(fd);
+        }
+        free(parent);
+    }
+    pthread_mutex_lock(&worker->lock);
+    job->counted = true;
+    worker_signal(worker, true);
+    pthread_mutex_unlock(&worker->lock);
+
+    for (size_t i = 0; i < job->count && !cancelled(job); ++i) {
+        const char *source = job->sources[i];
+        struct stat info;
+        if (lstat(source, &info) != 0) {
+            job_failed(job, errno, base_name(source));
+            continue;
+        }
+        int error = 0;
+        if (job->kind == JOB_DELETE) {
+            job_status(worker, job, base_name(source));
+            error = remove_path(job, source);
+            if (!error) {
+                job_made(job, source, source);
+                if (job->trash_info && job->destination) {
+                    char *info_path = NULL;
+                    if (asprintf(&info_path, "%s/info/%s.trashinfo", job->destination, base_name(source)) >= 0)
+                        unlink(info_path);
+                    free(info_path);
+                }
+            }
+        } else {
+            size_t length = strlen(source);
+            if (S_ISDIR(info.st_mode) && strncmp(job->destination, source, length) == 0 &&
+                (job->destination[length] == '/' || job->destination[length] == 0) &&
+                !(job->kind == JOB_MOVE && strcmp(job->destination, source) == 0)) {
+                job_failed(job, ELOOP, base_name(source)); /* Into itself. */
+                continue;
+            }
+            char *target = NULL;
+            bool merge, replace;
+            error = resolve(worker, job, source, S_ISDIR(info.st_mode), job->destination, &target, &merge, &replace);
+            if (!error && target) {
+                error = job->kind == JOB_COPY ? copy_tree(worker, job, source, &info, target, merge, replace, info.st_dev)
+                                              : move_tree(worker, job, source, &info, target, merge, replace);
+                if (!error && !merge)
+                    job_made(job, source, target);
+                else if (!error)
+                    ++job->merged;
+            }
+            free(target);
+        }
+        if (error == ECANCELED)
+            break;
+        if (error > 0)
+            job_failed(job, error == ELOOP ? ELOOP : error, base_name(source));
+    }
+}
+
+static void *worker_main(void *data)
+{
+    struct worker *worker = data;
+    pthread_mutex_lock(&worker->lock);
+    while (!worker->quit) {
+        if (!worker->queue_count) {
+            pthread_cond_wait(&worker->wake, &worker->lock);
+            continue;
+        }
+        struct job *job = worker->queue[0];
+        pthread_mutex_unlock(&worker->lock);
+        job_run(worker, job);
+        pthread_mutex_lock(&worker->lock);
+        memmove(worker->queue, worker->queue + 1, --worker->queue_count * sizeof *worker->queue);
+        struct job **finished = realloc(worker->finished, (worker->finished_count + 1) * sizeof *finished);
+        if (finished) {
+            worker->finished = finished;
+            worker->finished[worker->finished_count++] = job;
+        } else {
+            job_free(job);
+        }
+        worker_signal(worker, true);
+    }
+    pthread_mutex_unlock(&worker->lock);
+    return NULL;
+}
+
+static struct worker *worker_create(void)
+{
+    struct worker *worker = calloc(1, sizeof *worker);
+    if (!worker)
+        return NULL;
+    worker->event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    pthread_mutex_init(&worker->lock, NULL);
+    pthread_cond_init(&worker->wake, NULL);
+    if (worker->event < 0 || pthread_create(&worker->thread, NULL, worker_main, worker) != 0) {
+        if (worker->event >= 0)
+            close(worker->event);
+        pthread_mutex_destroy(&worker->lock);
+        pthread_cond_destroy(&worker->wake);
+        free(worker);
+        return NULL;
+    }
+    return worker;
+}
+
+/* Closing the window cancels what's running; nothing is left half done. */
+static void worker_destroy(struct worker *worker)
+{
+    if (!worker)
+        return;
+    pthread_mutex_lock(&worker->lock);
+    worker->quit = true;
+    for (size_t i = 0; i < worker->queue_count; ++i)
+        atomic_store(&worker->queue[i]->cancel, true);
+    pthread_cond_broadcast(&worker->wake);
+    pthread_mutex_unlock(&worker->lock);
+    pthread_join(worker->thread, NULL);
+    for (size_t i = 0; i < worker->queue_count; ++i)
+        job_free(worker->queue[i]);
+    for (size_t i = 0; i < worker->finished_count; ++i)
+        job_free(worker->finished[i]);
+    free(worker->queue);
+    free(worker->finished);
+    close(worker->event);
+    pthread_mutex_destroy(&worker->lock);
+    pthread_cond_destroy(&worker->wake);
+    free(worker);
+}
+
+/* Queue a job (taking over sources). Copying and moving need the
+   destination to be changeable, moving and deleting the sources' folders. */
+static void start_job(struct files *files, enum job_kind kind, char **sources, size_t count, const char *destination)
+{
+    if (!count) {
+        free(sources);
+        return;
+    }
+    if (kind != JOB_DELETE && !may_modify(files, destination)) {
+        protected_notice(files, destination);
+        free_paths(sources, count);
+        return;
+    }
+    size_t kept = 0;
+    for (size_t i = 0; i < count; ++i) {
+        char *parent = parent_path(sources[i]);
+        bool allowed = kind == JOB_COPY || (parent && may_modify(files, parent));
+        if (!allowed) {
+            protected_notice(files, parent ? parent : sources[i]);
+            free(sources[i]);
+        } else {
+            sources[kept++] = sources[i];
+        }
+        free(parent);
+    }
+    struct job *job = kept ? calloc(1, sizeof *job) : NULL;
+    if (!job || !files->worker) {
+        if (kept && !files->worker)
+            notify(files, "Couldn't start a thread for this");
+        free_paths(sources, kept);
+        free(job);
+        return;
+    }
+    job->kind = kind;
+    job->sources = sources;
+    job->count = kept;
+    job->destination = destination ? strdup(destination) : NULL;
+    /* Deleting from the trash: their info files go too. */
+    char *first_parent = parent_path(sources[0]);
+    job->trash_info = kind == JOB_DELETE && files->trash_files && first_parent &&
+                      strcmp(first_parent, files->trash_files) == 0;
+    free(first_parent);
+    if (job->trash_info)
+        job->destination = strdup(files->trash_dir);
+    struct worker *worker = files->worker;
+    pthread_mutex_lock(&worker->lock);
+    struct job **queue = realloc(worker->queue, (worker->queue_count + 1) * sizeof *queue);
+    if (queue) {
+        worker->queue = queue;
+        worker->queue[worker->queue_count++] = job;
+        pthread_cond_broadcast(&worker->wake);
+    }
+    pthread_mutex_unlock(&worker->lock);
+    if (!queue)
+        job_free(job);
+    desk_window_redraw(&files->window);
+}
+
+/* The progress bar's ×. */
+static void cancel_job(struct files *files)
+{
+    struct worker *worker = files->worker;
+    if (!worker)
+        return;
+    pthread_mutex_lock(&worker->lock);
+    if (worker->queue_count) {
+        atomic_store(&worker->queue[0]->cancel, true);
+        pthread_cond_broadcast(&worker->wake);
+    }
+    pthread_mutex_unlock(&worker->lock);
+}
+
+/* The dialog */
+
+enum { DIALOG_DELETE, DIALOG_EMPTY_TRASH, DIALOG_CONFLICT };
+
+/* labels left to right; danger is drawn red (or -1); focus has Enter. */
+static void open_dialog(struct files *files, int action, char **paths, size_t count, const char *title,
+                        const char *message, const char *const *labels, int buttons, int danger, int focus)
 {
     struct dialog *dialog = &files->dialog;
     free_paths(dialog->paths, dialog->count);
-    *dialog = (struct dialog){.open = true, .action = action, .paths = paths, .count = count};
+    *dialog = (struct dialog){.open = true, .action = action, .paths = paths, .count = count,
+                              .button_count = buttons, .danger = danger, .focus = focus};
     snprintf(dialog->title, sizeof dialog->title, "%s", title);
     snprintf(dialog->message, sizeof dialog->message, "%s", message);
-    snprintf(dialog->confirm, sizeof dialog->confirm, "%s", confirm);
+    for (int i = 0; i < buttons && i < DIALOG_BUTTONS; ++i)
+        snprintf(dialog->labels[i], sizeof dialog->labels[i], "%s", labels[i]);
     close_menus(files);
-    stop_rename(files);
+    if (files->renaming)
+        stop_rename(files);
     desk_window_redraw(&files->window);
 }
 
@@ -3505,10 +4178,12 @@ static void ask_delete(struct files *files)
         snprintf(title, sizeof title, "Delete %s permanently?", base_name(paths[0]));
     else
         snprintf(title, sizeof title, "Delete %zu items permanently?", count);
-    open_dialog(files, DIALOG_DELETE, paths, count, "Delete", title,
-                count == 1 && shown_entry(files, files->cursor)->directory
+    static const char *const labels[] = {"Cancel", "Delete"};
+    open_dialog(files, DIALOG_DELETE, paths, count, title,
+                count == 1 && cursor_entry(files) && cursor_entry(files)->directory
                     ? "It and everything in it will be gone. This can't be undone."
-                    : "This can't be undone.");
+                    : "This can't be undone.",
+                labels, 2, 1, 0);
 }
 
 static void ask_empty_trash(struct files *files)
@@ -3525,97 +4200,182 @@ static void ask_empty_trash(struct files *files)
         return;
     }
     char message[100];
-    snprintf(message, sizeof message, count == 1 ? "%zu item will be deleted permanently."
-                                                 : "%zu items will be deleted permanently.", count);
-    open_dialog(files, DIALOG_EMPTY_TRASH, NULL, 0, "Empty trash", "Empty the trash?", message);
+    snprintf(message, sizeof message,
+             count == 1 ? "%zu item will be deleted permanently." : "%zu items will be deleted permanently.", count);
+    static const char *const labels[] = {"Cancel", "Empty trash"};
+    open_dialog(files, DIALOG_EMPTY_TRASH, NULL, 0, "Empty the trash?", message, labels, 2, 1, 0);
 }
 
-/* Remove everything in a directory, keeping it. */
-static int empty_directory(const char *path)
+/* The running job asks about a name that's taken. */
+static void ask_conflict(struct files *files, const char *target, bool directories, bool several)
 {
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0)
-        return errno == ENOENT ? 0 : errno;
-    struct stat self;
-    DIR *dir = fstat(fd, &self) == 0 ? fdopendir(fd) : NULL;
-    if (!dir) {
-        close(fd);
-        return errno;
-    }
-    int first = 0;
-    struct dirent *item;
-    while ((item = readdir(dir))) {
-        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
-            continue;
-        int error = remove_at(dirfd(dir), item->d_name, self.st_dev);
-        if (error && !first)
-            first = error;
-    }
-    closedir(dir);
-    return first;
+    char title[300], message[300], shown[PATH_MAX];
+    char *parent = parent_path(target);
+    display_path(files, parent ? parent : target, shown, sizeof shown);
+    free(parent);
+    snprintf(title, sizeof title, directories ? "Merge %s?" : "Replace %s?", base_name(target));
+    snprintf(message, sizeof message,
+             directories ? "A folder with this name is already in %.200s." : "Something with this name is already in %.200s.",
+             shown);
+    const char *labels[] = {"Skip", "Keep both", directories ? "Merge" : "Replace"};
+    open_dialog(files, DIALOG_CONFLICT, NULL, 0, title, message, labels, 3, -1, 0);
+    files->dialog.has_check = several;
 }
 
-/* The dialog's button: do what it asked. */
-static void dialog_confirmed(struct files *files)
+/* Reply to the running job's question. */
+static void answer_job(struct files *files, enum answer answer, bool all)
+{
+    struct worker *worker = files->worker;
+    pthread_mutex_lock(&worker->lock);
+    if (worker->queue_count && worker->queue[0]->asking) {
+        struct job *job = worker->queue[0];
+        if (answer == ANSWER_CANCEL)
+            atomic_store(&job->cancel, true);
+        job->answer = answer;
+        if (all && answer != ANSWER_CANCEL)
+            job->answer_all = answer;
+        pthread_cond_broadcast(&worker->wake);
+    }
+    pthread_mutex_unlock(&worker->lock);
+}
+
+/* A button of the dialog: do what it says. */
+static void dialog_choose(struct files *files, int button)
 {
     struct dialog *dialog = &files->dialog;
     int action = dialog->action;
+    bool all = dialog->has_check && dialog->checked;
     char **paths = dialog->paths;
     size_t count = dialog->count;
     dialog->paths = NULL;
     dialog->count = 0;
     close_dialog(files);
-    if (action == DIALOG_EMPTY_TRASH) {
-        char *info = NULL;
-        int error = files->trash_files ? empty_directory(files->trash_files) : ENOENT;
-        if (asprintf(&info, "%s/info", files->trash_dir) >= 0)
-            empty_directory(info);
-        free(info);
-        char *sizes = NULL;
-        if (asprintf(&sizes, "%s/directorysizes", files->trash_dir) >= 0)
-            unlink(sizes);
-        free(sizes);
-        if (error)
-            notify(files, "Couldn't empty all of the trash: %s", strerror(error));
-        undo_forget(files);
-        refresh(files);
-        return;
-    }
-    size_t deleted = 0;
-    for (size_t i = 0; i < count; ++i) {
-        char *parent = parent_path(paths[i]);
-        bool allowed = parent && may_modify(files, parent);
-        free(parent);
-        if (!allowed) {
-            protected_notice(files, paths[i]);
-            continue;
+    if (action == DIALOG_CONFLICT) {
+        static const enum answer answers[] = {ANSWER_SKIP, ANSWER_BOTH, ANSWER_REPLACE};
+        answer_job(files, button >= 0 && button < 3 ? answers[button] : ANSWER_CANCEL, all);
+    } else if (button == 1 && action == DIALOG_DELETE) {
+        start_job(files, JOB_DELETE, paths, count, NULL);
+        paths = NULL;
+    } else if (button == 1 && action == DIALOG_EMPTY_TRASH && files->trash_files) {
+        /* Everything in the trash, with its info files. */
+        DIR *dir = opendir(files->trash_files);
+        size_t used = 0, capacity = 0;
+        char **items = NULL;
+        struct dirent *item;
+        while (dir && (item = readdir(dir))) {
+            if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
+                continue;
+            if (used == capacity) {
+                capacity = capacity ? capacity * 2 : 32;
+                char **grown = realloc(items, capacity * sizeof *grown);
+                if (!grown)
+                    break;
+                items = grown;
+            }
+            if ((items[used] = join_path(files->trash_files, item->d_name)))
+                ++used;
         }
-        int error = remove_path(paths[i]);
-        if (error == EXDEV)
-            notify(files, "%s has another drive mounted in it, which was left alone", base_name(paths[i]));
-        else if (error)
-            notify(files, "Couldn't delete all of %s: %s", base_name(paths[i]), strerror(error));
-        else
-            ++deleted;
-        if (in_trash(files)) {
-            char *info = trash_info_path(files, base_name(paths[i]));
-            if (info && error == 0)
-                unlink(info);
-            free(info);
-        }
+        if (dir)
+            closedir(dir);
+        start_job(files, JOB_DELETE, items, used, NULL);
     }
-    if (!count)
-        ;
-    else if (deleted == count && count == 1)
-        notify(files, "Deleted %s", base_name(paths[0]));
-    else if (deleted == count)
-        notify(files, "Deleted %zu items", count);
     free_paths(paths, count);
-    undo_forget(files);
-    refresh(files);
 }
 
-/* Ctrl+Z: undo the last rename, new folder or file, or move to the trash. */
+/* What a job did, once it's done: a line about it, and undo. */
+static void job_finished(struct files *files, struct job *job)
+{
+    static const char *const verbs[] = {"copy", "move", "delete"};
+    static const char *const done[] = {"Copied", "Moved", "Deleted"};
+    if (job->failed) {
+        const char *why = job->error == ELOOP ? "a folder can't go inside itself"
+                        : job->error == EXDEV ? "another drive is mounted in it, and was left alone"
+                        : job->error == ENOTSUP ? "it's a special file"
+                                                : strerror(job->error);
+        if (job->failed > 1)
+            notify(files, "Couldn't %s %s and %zu more: %s", verbs[job->kind], job->error_name ? job->error_name : "?",
+                   job->failed - 1, why);
+        else
+            notify(files, "Couldn't %s %s: %s", verbs[job->kind], job->error_name ? job->error_name : "?", why);
+    } else if (atomic_load(&job->cancel)) {
+        notify(files, "Cancelled; what was done stays");
+    } else if (job->made_count == 1) {
+        notify(files, "%s %s%s", done[job->kind], base_name(job->made[0]),
+               job->kind == JOB_DELETE ? "" : ". Ctrl+Z undoes it");
+    } else if (job->made_count) {
+        notify(files, "%s %zu items%s", done[job->kind], job->made_count,
+               job->kind == JOB_DELETE ? "" : ". Ctrl+Z undoes it");
+    } else if (job->merged) {
+        notify(files, job->merged == 1 ? "Merged into the folder that was there" : "Merged into the folders that were there");
+    } else if (job->skipped) {
+        notify(files, "Nothing to do: all skipped");
+    }
+    bool recorded = false;
+    if (job->kind == JOB_DELETE) {
+        undo_forget(files);
+    } else if (job->made_count && !atomic_load(&job->cancel)) {
+        undo_set(files, job->kind == JOB_COPY ? UNDO_COPY : UNDO_MOVE, job->made_from, job->made, job->made_count);
+        job->made_from = job->made = NULL;
+        job->made_count = 0;
+        recorded = true;
+    } else if (job->merged) {
+        undo_forget(files); /* A merge can't be taken apart. */
+    }
+    /* Show what came, selected, when it came here. */
+    if (job->kind != JOB_DELETE && job->destination && strcmp(job->destination, files->path) == 0 &&
+        recorded) {
+        load(files, NULL, files->cursor, true);
+        clear_selection(files);
+        for (size_t i = 0; i < files->undo.count; ++i) {
+            size_t index;
+            if (find_shown(&files->listing, base_name(files->undo.to[i]), &index)) {
+                shown_entry(files, index)->selected = true;
+                files->cursor = files->anchor = index;
+            }
+        }
+        files->free_scroll = false;
+        desk_window_redraw(&files->window);
+    } else {
+        refresh(files);
+    }
+}
+
+/* The worker said something: progress, a question, or a job done. */
+static void jobs_event(struct files *files)
+{
+    struct worker *worker = files->worker;
+    uint64_t count;
+    (void)!read(worker->event, &count, sizeof count);
+    pthread_mutex_lock(&worker->lock);
+    struct job **finished = worker->finished;
+    size_t finished_count = worker->finished_count;
+    worker->finished = NULL;
+    worker->finished_count = 0;
+    char *target = NULL;
+    bool directories = false, several = false;
+    if (worker->queue_count && worker->queue[0]->asking && worker->queue[0]->answer == ANSWER_NONE &&
+        !(files->dialog.open && files->dialog.action == DIALOG_CONFLICT)) {
+        struct job *job = worker->queue[0];
+        target = job->ask_target ? strdup(job->ask_target) : NULL;
+        directories = job->ask_directories;
+        several = job->count > 1 || atomic_load(&job->items_total) > 1;
+    }
+    pthread_mutex_unlock(&worker->lock);
+    if (target && !files->dialog.open)
+        ask_conflict(files, target, directories, several);
+    free(target);
+    for (size_t i = 0; i < finished_count; ++i) {
+        job_finished(files, finished[i]);
+        job_free(finished[i]);
+    }
+    free(finished);
+    desk_window_redraw(&files->window);
+}
+
+/* Undo */
+
+/* Ctrl+Z: undo the last rename, new folder or file, move to the trash,
+   copy (the copies go to the trash) or move (back where they were). */
 static void undo(struct files *files)
 {
     struct undo *undo = &files->undo;
@@ -3636,7 +4396,7 @@ static void undo(struct files *files)
         else if (S_ISDIR(info.st_mode) ? rmdir(undo->to[0]) != 0 : info.st_size ? (errno = ENOTEMPTY, 1)
                                                                               : unlink(undo->to[0]) != 0)
             error = errno;
-        what = S_ISDIR(info.st_mode) ? "New folder removed" : "New file removed";
+        what = !error && S_ISDIR(info.st_mode) ? "New folder removed" : "New file removed";
         if (error == ENOTEMPTY || error == EEXIST) {
             notify(files, "%s has something in it now, so it stays", base_name(undo->to[0]));
             undo_forget(files);
@@ -3648,8 +4408,7 @@ static void undo(struct files *files)
         for (size_t i = 0; i < undo->count; ++i) {
             int failed = move_no_replace(undo->to[i], undo->from[i]);
             if (failed) {
-                if (!error)
-                    error = failed;
+                error = error ? error : failed;
                 continue;
             }
             char *info = trash_info_path(files, base_name(undo->to[i]));
@@ -3659,10 +4418,60 @@ static void undo(struct files *files)
         }
         what = "Put back from the trash";
         break;
+    case UNDO_COPY: {
+        size_t moved = 0;
+        for (size_t i = 0; i < undo->count; ++i) {
+            char *trashed;
+            int failed = trash_one(files, undo->to[i], &trashed);
+            free(trashed);
+            if (failed)
+                error = error ? error : failed;
+            else
+                ++moved;
+        }
+        what = moved == 1 ? "The copy went to the trash" : "The copies went to the trash";
+        break;
     }
-    char *select = undo->kind == UNDO_RENAME || undo->kind == UNDO_TRASH ? strdup(base_name(undo->from[0])) : NULL;
+    case UNDO_MOVE: {
+        /* Back where each came from: a rename when it can be, else a move job. */
+        char **again = NULL;
+        size_t again_count = 0;
+        char *again_to = NULL;
+        for (size_t i = 0; i < undo->count; ++i) {
+            int failed = move_no_replace(undo->to[i], undo->from[i]);
+            if (failed == EXDEV && strcmp(base_name(undo->to[i]), base_name(undo->from[i])) == 0) {
+                char *parent = parent_path(undo->from[i]);
+                if (!again_to || (parent && strcmp(parent, again_to) == 0)) {
+                    char **grown = realloc(again, (again_count + 1) * sizeof *grown);
+                    if (grown && (grown[again_count] = strdup(undo->to[i]))) {
+                        again = grown;
+                        ++again_count;
+                        if (!again_to)
+                            again_to = parent, parent = NULL;
+                    }
+                }
+                free(parent);
+            } else if (failed) {
+                error = error ? error : failed;
+            }
+        }
+        if (again_count) {
+            char *to = again_to;
+            undo->kind = UNDO_NONE; /* The job sets its own. */
+            start_job(files, JOB_MOVE, again, again_count, to);
+            free(to);
+        } else {
+            free(again);
+        }
+        what = "Moved back";
+        break;
+    }
+    }
+    char *select = undo->kind == UNDO_RENAME || undo->kind == UNDO_TRASH || undo->kind == UNDO_MOVE
+                       ? strdup(base_name(undo->from[0]))
+                       : NULL;
     if (error)
-        notify(files, "Couldn't undo: %s", error == EEXIST ? "something has taken its name" : strerror(error));
+        notify(files, "Couldn't undo all of it: %s", error == EEXIST ? "something has taken its name" : strerror(error));
     else
         notify(files, "%s", what);
     undo_forget(files);
@@ -3676,27 +4485,43 @@ static void dialog_key(struct files *files, xkb_keysym_t sym)
     struct dialog *dialog = &files->dialog;
     switch (sym) {
     case XKB_KEY_Escape:
-        close_dialog(files);
+        if (dialog->action == DIALOG_CONFLICT) {
+            close_dialog(files);
+            answer_job(files, ANSWER_CANCEL, false);
+        } else {
+            close_dialog(files);
+        }
         break;
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
+        dialog_choose(files, dialog->focus);
+        break;
     case XKB_KEY_space:
-        if (dialog->focus == 1)
-            dialog_confirmed(files);
-        else
-            close_dialog(files);
+        if (dialog->has_check) {
+            dialog->checked = !dialog->checked;
+            desk_window_redraw(&files->window);
+        } else {
+            dialog_choose(files, dialog->focus);
+        }
         break;
     case XKB_KEY_Tab:
+    case XKB_KEY_Right:
+        dialog->focus = (dialog->focus + 1) % dialog->button_count;
+        desk_window_redraw(&files->window);
+        break;
     case XKB_KEY_ISO_Left_Tab:
     case XKB_KEY_Left:
-    case XKB_KEY_Right:
-        dialog->focus = !dialog->focus;
+        dialog->focus = (dialog->focus + dialog->button_count - 1) % dialog->button_count;
         desk_window_redraw(&files->window);
         break;
     default:
         break;
     }
 }
+
+static void copy_files(struct files *files, bool cut);
+static void paste_files(struct files *files, const char *destination);
+static bool clipboard_has_files(const struct files *files);
 
 /* Keys */
 
@@ -3731,6 +4556,9 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         case XKB_KEY_0:
         case XKB_KEY_KP_0: zoom(files, 0); return false;
         case XKB_KEY_z: undo(files); return false;
+        case XKB_KEY_c: copy_files(files, false); return false;
+        case XKB_KEY_x: copy_files(files, true); return false;
+        case XKB_KEY_v: paste_files(files, files->path); return false;
         case XKB_KEY_N: create_item(files, true); return false;
         case XKB_KEY_n:
             if (mods & DESK_MOD_SHIFT)
@@ -4944,6 +5772,84 @@ static void paint_notice(struct files *files, DeskCanvas *canvas, const struct l
                  top + ui->baseline, files->notice, colors->foreground);
 }
 
+/* Whether a job is queued or running, so the progress bar shows. */
+static bool jobs_running(struct files *files)
+{
+    if (!files->worker)
+        return false;
+    pthread_mutex_lock(&files->worker->lock);
+    bool running = files->worker->queue_count > 0;
+    pthread_mutex_unlock(&files->worker->lock);
+    return running;
+}
+
+/* The progress bar along the window's foot: what's being done, how far,
+   and a × that cancels it. */
+static void paint_progress(struct files *files, DeskCanvas *canvas, const struct layout *ui, int top)
+{
+    struct worker *worker = files->worker;
+    files->job_top = -1;
+    if (!worker)
+        return;
+    pthread_mutex_lock(&worker->lock);
+    if (!worker->queue_count) {
+        pthread_mutex_unlock(&worker->lock);
+        return;
+    }
+    struct job *job = worker->queue[0];
+    enum job_kind kind = job->kind;
+    char current[256];
+    snprintf(current, sizeof current, "%s", job->current);
+    bool counted = job->counted, asking = job->asking;
+    long done = atomic_load(&job->items_done), total = atomic_load(&job->items_total);
+    long long bytes = atomic_load(&job->bytes_done), bytes_total = atomic_load(&job->bytes_total);
+    size_t waiting = worker->queue_count - 1;
+    pthread_mutex_unlock(&worker->lock);
+
+    const struct colors *colors = &files->colors;
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    int pad = ui->padding, row = ui->row_height, left = pad, right = canvas->width - pad;
+    desk_canvas_fill(canvas, 0, top, canvas->width, canvas->height - top, mix(colors->background, colors->muted, 25));
+    desk_canvas_fill(canvas, 0, top, canvas->width, line, mix(colors->background, colors->muted, 70));
+    /* The × on the right. */
+    files->job_top = top;
+    files->job_cancel_left = right - row;
+    files->job_cancel_right = right;
+    if (hovering(files, TARGET_JOB_CANCEL, 0))
+        desk_canvas_fill(canvas, right - row, top + pad / 2, row, row, mix(colors->background, colors->muted, 80));
+    draw_icon(ui->font, canvas, right - row, right, top + pad / 2 + ui->baseline, ICON_CLOSE, colors->foreground);
+    right -= row + pad;
+
+    static const char *const verbs[] = {"Copying", "Moving", "Deleting"};
+    char text[400], amount[80] = "";
+    if (asking)
+        snprintf(text, sizeof text, "%s: waiting for an answer", verbs[kind]);
+    else if (!counted)
+        snprintf(text, sizeof text, "%s: counting…", verbs[kind]);
+    else
+        snprintf(text, sizeof text, "%s %ld of %ld%s%s", verbs[kind], done < 1 ? 1 : done > total ? total : done, total,
+                 current[0] ? " — " : "", current);
+    if (waiting)
+        snprintf(text + strlen(text), sizeof text - strlen(text), " (%zu more waiting)", waiting);
+    if (counted && bytes_total > 0) {
+        char a[32], b[32];
+        format_size((off_t)bytes, a, sizeof a);
+        format_size((off_t)bytes_total, b, sizeof b);
+        snprintf(amount, sizeof amount, "%s of %s", a, b);
+    }
+    int amount_width = amount[0] ? desk_text_width(ui->mono, amount, strlen(amount)) + pad : 0;
+    draw_clipped(ui->font, canvas, left, right - amount_width, top + pad / 2 + ui->baseline, text, colors->foreground);
+    if (amount[0])
+        draw_right(ui->mono, canvas, right - amount_width, right, top + pad / 2 + ui->baseline, amount, colors->muted);
+    /* The bar: bytes when there are any, else items. */
+    double fraction = bytes_total > 0 ? (double)bytes / (double)bytes_total : total > 0 ? (double)done / total : 0;
+    if (fraction > 1)
+        fraction = 1;
+    int bar_top = top + pad / 2 + row, bar_height = 3 * line, width = right - left;
+    desk_canvas_fill(canvas, left, bar_top, width, bar_height, mix(colors->background, colors->muted, 60));
+    desk_canvas_fill(canvas, left, bar_top, (int)(width * fraction), bar_height, colors->directory);
+}
+
 static void paint(struct files *files, DeskCanvas *canvas)
 {
     files->rename_top = files->rename_bottom = -1;
@@ -4958,6 +5864,12 @@ static void paint(struct files *files, DeskCanvas *canvas)
     paint_tabs(files, canvas, &ui, ui.padding / 2);
     paint_toolbar(files, canvas, &ui, files->toolbar.tabs_bottom + ui.padding / 2);
     int top = files->toolbar.bottom + ui.padding, bottom = canvas->height - ui.padding / 2;
+    int strip = jobs_running(files) ? ui.row_height + ui.padding + 3 * (scale >= 2 ? (int)scale : 1) + ui.padding / 2 : 0;
+    bottom -= strip;
+    if (strip)
+        paint_progress(files, canvas, &ui, canvas->height - strip);
+    else
+        files->job_top = -1;
 
     int cell = desk_char_width(files->mono, '0');
     int cells = canvas->width / (cell > 0 ? cell : 1);
@@ -5090,8 +6002,11 @@ static void paint_suggestions(struct files *files, DeskCanvas *canvas)
     }
 }
 
-/* The dialog: the window dimmed, a box with the question, and Cancel and
-   the button that does it, which is red. */
+static void draw_check(DeskCanvas *canvas, int x, int y, int size, uint32_t color, uint32_t background);
+
+/* The dialog: the window dimmed, a box with the question, a "Do this for
+   all" box when it has one, and its buttons on the right, the dangerous
+   one red. */
 static void paint_dialog(struct files *files, DeskCanvas *canvas)
 {
     struct dialog *dialog = &files->dialog;
@@ -5102,10 +6017,10 @@ static void paint_dialog(struct files *files, DeskCanvas *canvas)
     struct layout ui = make_layout(files->font, files->italic, files->mono, scale);
     int line = scale >= 2 ? (int)scale : 1, pad = ui.padding, row = ui.row_height;
     desk_canvas_fill(canvas, 0, 0, canvas->width, canvas->height, 0x80000000);
-    int width = (int)lround(440 * scale);
+    int width = (int)lround(460 * scale);
     if (width > canvas->width - 2 * pad)
         width = canvas->width - 2 * pad;
-    int height = pad + 2 * row + pad + row + pad;
+    int height = pad + 2 * row + pad + (dialog->has_check ? row + pad / 2 : 0) + row + pad;
     int left = (canvas->width - width) / 2, top = (canvas->height - height) / 3;
     uint32_t background = mix(colors->background, colors->muted, 25);
     desk_canvas_fill(canvas, left, top, width, height, background);
@@ -5114,25 +6029,42 @@ static void paint_dialog(struct files *files, DeskCanvas *canvas)
                  colors->foreground);
     draw_clipped(ui.font, canvas, left + pad, left + width - pad, top + pad + row + ui.baseline, dialog->message,
                  colors->muted);
-    const char *labels[2] = {"Cancel", dialog->confirm};
-    int right = left + width - pad, button_top = top + height - pad - row;
-    dialog->button_top = button_top;
-    dialog->button_bottom = button_top + row;
-    for (int i = 1; i >= 0; --i) {
-        int text = desk_text_width(ui.font, labels[i], strlen(labels[i]));
+    int y = top + pad + 2 * row + pad;
+    dialog->check_top = dialog->check_bottom = -1;
+    if (dialog->has_check) {
+        int box = row / 2, box_top = y + (row - box) / 2;
+        bool lit = hovering(files, TARGET_DIALOG_CHECK, 0);
+        desk_canvas_fill(canvas, left + pad, box_top, box, box, mix(colors->background, colors->muted, lit ? 90 : 50));
+        if (dialog->checked)
+            draw_check(canvas, left + pad, box_top, box, colors->foreground, mix(colors->background, colors->muted, 50));
+        const char *label = "Do this for all conflicts";
+        draw_clipped(ui.font, canvas, left + pad + box + pad / 2, left + width - pad, y + ui.baseline, label,
+                     colors->foreground);
+        dialog->check_left = left + pad;
+        dialog->check_right = left + pad + box + pad / 2 + desk_text_width(ui.font, label, strlen(label));
+        dialog->check_top = y;
+        dialog->check_bottom = y + row;
+        y += row + pad / 2;
+    }
+    int right = left + width - pad;
+    dialog->button_top = y;
+    dialog->button_bottom = y + row;
+    for (int i = dialog->button_count - 1; i >= 0; --i) {
+        const char *label = dialog->labels[i];
+        int text = desk_text_width(ui.font, label, strlen(label));
         int button = text + 2 * pad > (int)lround(90 * scale) ? text + 2 * pad : (int)lround(90 * scale);
         dialog->button_left[i] = right - button;
         dialog->button_right[i] = right;
-        bool lit = hovering(files, TARGET_DIALOG_BUTTON, (size_t)i);
-        uint32_t fill = i == 1 ? colors->urgent : mix(colors->background, colors->muted, 60);
+        bool lit = hovering(files, TARGET_DIALOG_BUTTON, (size_t)i), danger = i == dialog->danger;
+        uint32_t fill = danger ? colors->urgent : mix(colors->background, colors->muted, 60);
         if (lit)
             fill = mix(fill, colors->foreground, 40);
-        desk_canvas_fill(canvas, right - button, button_top, button, row, fill);
+        desk_canvas_fill(canvas, right - button, y, button, row, fill);
         if (dialog->focus == i)
-            outline(canvas, right - button - 2 * line, button_top - 2 * line, button + 4 * line, row + 4 * line, line,
+            outline(canvas, right - button - 2 * line, y - 2 * line, button + 4 * line, row + 4 * line, line,
                     colors->foreground);
-        desk_text_draw(ui.font, canvas, right - button + (button - text) / 2, button_top + ui.baseline, labels[i],
-                       strlen(labels[i]), i == 1 ? colors->background : colors->foreground);
+        desk_text_draw(ui.font, canvas, right - button + (button - text) / 2, y + ui.baseline, label, strlen(label),
+                       danger ? colors->background : colors->foreground);
         right -= button + pad;
     }
 }
@@ -5293,12 +6225,18 @@ static struct target target_at(const struct files *files)
     if (files->dialog.open) {
         /* Modal: only its buttons. */
         const struct dialog *dialog = &files->dialog;
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < dialog->button_count; ++i) {
             if (y >= dialog->button_top && y < dialog->button_bottom && x >= dialog->button_left[i] &&
                 x < dialog->button_right[i])
                 return (struct target){TARGET_DIALOG_BUTTON, (size_t)i};
         }
+        if (dialog->has_check && y >= dialog->check_top && y < dialog->check_bottom && x >= dialog->check_left &&
+            x < dialog->check_right)
+            return (struct target){TARGET_DIALOG_CHECK, 0};
         return (struct target){TARGET_NONE, 0};
+    }
+    if (files->job_top >= 0 && y >= files->job_top && x >= files->job_cancel_left && x < files->job_cancel_right) {
+        return (struct target){TARGET_JOB_CANCEL, 0};
     }
     if (files->renaming && files->rename_bottom >= 0 && y >= files->rename_top && y < files->rename_bottom &&
         x >= files->rename_field.left - files->panes.line_height / 4 && x < files->rename_field.right)
@@ -5380,12 +6318,45 @@ static void clip_target(void *data, struct wl_data_source *source, const char *m
     (void)mime;
 }
 
+/* Copied files as other file managers read them: GNOME's list ("copy" or
+   "cut", then a URI a line) or a plain URI list. */
+static char *clip_uri_text(const struct files *files, bool uri_list)
+{
+    size_t length = 8;
+    char **uris = calloc(files->clip_count, sizeof *uris);
+    for (size_t i = 0; uris && i < files->clip_count; ++i) {
+        uris[i] = path_uri(files->clip_paths[i]);
+        length += (uris[i] ? strlen(uris[i]) : 0) + 2;
+    }
+    char *text = uris ? malloc(length) : NULL;
+    if (text) {
+        size_t used = 0;
+        if (!uri_list)
+            used = (size_t)sprintf(text, "%s", files->clip_cut ? "cut" : "copy");
+        for (size_t i = 0; i < files->clip_count; ++i) {
+            if (!uris[i])
+                continue;
+            used += (size_t)sprintf(text + used, uri_list ? "%s\r\n" : "\n%s", uris[i]);
+        }
+        text[used] = 0;
+    }
+    for (size_t i = 0; uris && i < files->clip_count; ++i)
+        free(uris[i]);
+    free(uris);
+    return text;
+}
+
 static void clip_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd)
 {
     (void)source;
-    (void)mime;
     struct files *files = data;
     const char *text = files->clip_text ? files->clip_text : "";
+    char *owned = NULL;
+    bool gnome = strcmp(mime, "x-special/gnome-copied-files") == 0, uris = strcmp(mime, "text/uri-list") == 0;
+    if (files->clip_paths && (gnome || uris)) {
+        owned = clip_uri_text(files, uris);
+        text = owned ? owned : "";
+    }
     size_t left = strlen(text);
     while (left) {
         ssize_t written = write(fd, text, left);
@@ -5397,6 +6368,15 @@ static void clip_send(void *data, struct wl_data_source *source, const char *mim
         left -= (size_t)written;
     }
     close(fd);
+    free(owned);
+}
+
+static void clip_forget_files(struct files *files)
+{
+    free_paths(files->clip_paths, files->clip_count);
+    files->clip_paths = NULL;
+    files->clip_count = 0;
+    files->clip_cut = false;
 }
 
 static void clip_cancelled(void *data, struct wl_data_source *source)
@@ -5406,6 +6386,8 @@ static void clip_cancelled(void *data, struct wl_data_source *source)
         files->clip_source = NULL;
         free(files->clip_text);
         files->clip_text = NULL;
+        clip_forget_files(files);
+        desk_window_redraw(&files->window);
     }
     wl_data_source_destroy(source);
 }
@@ -5458,6 +6440,69 @@ static void copy_text(struct files *files, const char *text)
     free(files->clip_text);
     files->clip_source = source;
     files->clip_text = copy;
+    clip_forget_files(files);
+}
+
+/* Ctrl+C, Ctrl+X: the selection on the clipboard as files, for files and
+   other file managers (and as their paths, for text). */
+static void copy_files(struct files *files, bool cut)
+{
+    size_t count;
+    char **paths = selected_paths(files, &count);
+    if (!count) {
+        free(paths);
+        return;
+    }
+    if (cut && in_trash(files)) {
+        notify(files, "Restore takes things out of the trash");
+        free_paths(paths, count);
+        return;
+    }
+    if (cut && !files->writable) {
+        protected_notice(files, files->path);
+        free_paths(paths, count);
+        return;
+    }
+    if (!files->data_device) {
+        notify(files, "The compositor has no clipboard to copy to");
+        free_paths(paths, count);
+        return;
+    }
+    size_t length = 1;
+    for (size_t i = 0; i < count; ++i)
+        length += strlen(paths[i]) + 1;
+    char *text = malloc(length);
+    if (!text) {
+        free_paths(paths, count);
+        return;
+    }
+    text[0] = 0;
+    for (size_t i = 0; i < count; ++i) {
+        strcat(text, paths[i]);
+        if (i + 1 < count)
+            strcat(text, "\n");
+    }
+    struct wl_data_source *source = wl_data_device_manager_create_data_source(files->data_manager);
+    wl_data_source_add_listener(source, &clip_listener, files);
+    static const char *const types[] = {"x-special/gnome-copied-files", "text/uri-list", "text/plain;charset=utf-8",
+                                        "text/plain", "UTF8_STRING", "TEXT", "STRING"};
+    for (size_t i = 0; i < sizeof types / sizeof *types; ++i)
+        wl_data_source_offer(source, types[i]);
+    wl_data_device_set_selection(files->data_device, source, files->input_serial);
+    if (files->clip_source)
+        wl_data_source_destroy(files->clip_source);
+    free(files->clip_text);
+    clip_forget_files(files);
+    files->clip_source = source;
+    files->clip_text = text;
+    files->clip_paths = paths;
+    files->clip_count = count;
+    files->clip_cut = cut;
+    if (count == 1)
+        notify(files, cut ? "Cut %s: Ctrl+V moves it" : "Copied %s: Ctrl+V pastes it", base_name(paths[0]));
+    else
+        notify(files, cut ? "Cut %zu items: Ctrl+V moves them" : "Copied %zu items: Ctrl+V pastes them", count);
+    desk_window_redraw(&files->window);
 }
 
 /* Other clients' clipboard: each new offer lists its types before it's
@@ -5477,6 +6522,12 @@ static void offer_offer(void *data, struct wl_data_offer *offer, const char *mim
     struct files *files = data;
     if (offer != files->pending_offer)
         return;
+    /* Files: GNOME's list (which says copy or cut) before a plain URI list. */
+    if (strcmp(mime, "x-special/gnome-copied-files") == 0 ||
+        (strcmp(mime, "text/uri-list") == 0 && !files->pending_files_type)) {
+        free(files->pending_files_type);
+        files->pending_files_type = strdup(mime);
+    }
     int rank = text_type_rank(mime);
     if (rank < 0 || (files->pending_type && text_type_rank(files->pending_type) <= rank))
         return;
@@ -5510,22 +6561,106 @@ static void device_data_offer(void *data, struct wl_data_device *device, struct 
     struct files *files = data;
     free(files->pending_type);
     files->pending_type = NULL;
+    free(files->pending_files_type);
+    files->pending_files_type = NULL;
     files->pending_offer = offer;
     wl_data_offer_add_listener(offer, &offer_listener, files);
 }
 
 /* The clipboard's text, or NULL when it has none. Waits for the other
    client, at most a second. */
+static char *receive_offer(struct files *files, const char *mime);
+
 static char *paste_text(struct files *files)
 {
     if (files->clip_source && files->clip_text)
         return strdup(files->clip_text); /* Ours. */
     if (!files->selection_offer || !files->offer_type)
         return NULL;
+    return receive_offer(files, files->offer_type);
+}
+
+/* Whether the clipboard has files to paste. */
+static bool clipboard_has_files(const struct files *files)
+{
+    return (files->clip_source && files->clip_paths) || (files->selection_offer && files->offer_files_type);
+}
+
+/* Ctrl+V: the clipboard's files into destination: moved when they were
+   cut, else copied. */
+static void paste_files(struct files *files, const char *destination)
+{
+    char **paths = NULL;
+    size_t count = 0;
+    bool cut = false;
+    if (files->trash_files && strcmp(destination, files->trash_files) == 0) {
+        notify(files, "Delete moves things to the trash; pasting doesn't");
+        return;
+    }
+    if (files->clip_source && files->clip_paths) {
+        paths = calloc(files->clip_count, sizeof *paths);
+        for (size_t i = 0; paths && i < files->clip_count; ++i) {
+            if ((paths[count] = strdup(files->clip_paths[i])))
+                ++count;
+        }
+        cut = files->clip_cut;
+    } else if (files->selection_offer && files->offer_files_type) {
+        bool gnome = strcmp(files->offer_files_type, "x-special/gnome-copied-files") == 0;
+        char *text = receive_offer(files, files->offer_files_type);
+        size_t capacity = 0;
+        char *save = NULL;
+        bool first = true;
+        for (char *line = text ? strtok_r(text, "\r\n", &save) : NULL; line; line = strtok_r(NULL, "\r\n", &save)) {
+            if (gnome && first) {
+                first = false;
+                cut = strcmp(line, "cut") == 0;
+                if (cut || strcmp(line, "copy") == 0)
+                    continue;
+            }
+            first = false;
+            if (line[0] == '#')
+                continue;
+            char *path = uri_path(line, strlen(line));
+            if (!path)
+                continue;
+            if (count == capacity) {
+                capacity = capacity ? capacity * 2 : 16;
+                char **grown = realloc(paths, capacity * sizeof *grown);
+                if (!grown) {
+                    free(path);
+                    break;
+                }
+                paths = grown;
+            }
+            paths[count++] = path;
+        }
+        free(text);
+    }
+    if (!count) {
+        free(paths);
+        notify(files, files->offer_type || files->clip_text ? "The clipboard has no files, only text" : "Nothing to paste");
+        return;
+    }
+    start_job(files, cut ? JOB_MOVE : JOB_COPY, paths, count, destination);
+    /* Cut things are moved once: the clipboard lets go of them. */
+    if (cut && files->clip_source && files->clip_paths && files->data_device) {
+        wl_data_device_set_selection(files->data_device, NULL, files->input_serial);
+        wl_data_source_destroy(files->clip_source);
+        files->clip_source = NULL;
+        free(files->clip_text);
+        files->clip_text = NULL;
+        clip_forget_files(files);
+    }
+}
+
+/* The clipboard's offer as mime, read through a pipe; waits for the other
+   client, at most a second. */
+static char *receive_offer(struct files *files, const char *mime)
+{
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0)
         return NULL;
-    wl_data_offer_receive(files->selection_offer, files->offer_type, fds[1]);
+    wl_data_offer_receive(files->selection_offer, mime, fds[1]);
     close(fds[1]);
     wl_display_flush(files->display);
     char *text = NULL;
@@ -5600,9 +6735,13 @@ static void device_selection(void *data, struct wl_data_device *device, struct w
     files->selection_offer = offer;
     free(files->offer_type);
     files->offer_type = NULL;
+    free(files->offer_files_type);
+    files->offer_files_type = NULL;
     if (offer && offer == files->pending_offer) {
         files->offer_type = files->pending_type;
         files->pending_type = NULL;
+        files->offer_files_type = files->pending_files_type;
+        files->pending_files_type = NULL;
     }
     files->pending_offer = NULL;
 }
@@ -5640,6 +6779,9 @@ enum {
     MENU_NEW_FOLDER,
     MENU_NEW_FILE,
     MENU_UNDO,
+    MENU_CUT,
+    MENU_COPY,
+    MENU_PASTE,           /* Into the directory the menu is for. */
     MENU_NOTHING,         /* A disabled line such as "No applications". */
 };
 
@@ -5952,6 +7094,9 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
             snprintf(item->shortcut, sizeof item->shortcut, "Ctrl+Shift+N");
             menu_add(menu, MENU_NEW_FILE, 0, "New file")->enabled = writable;
         }
+        struct menu_item *paste = menu_add(menu, MENU_PASTE, 0, "Paste");
+        paste->enabled = writable && clipboard_has_files(files) && !in_trash(files);
+        snprintf(paste->shortcut, sizeof paste->shortcut, "Ctrl+V");
         if (files->undo.kind != UNDO_NONE)
             snprintf(menu_add(menu, MENU_UNDO, 0, "Undo")->shortcut, sizeof menu->items[0].shortcut, "Ctrl+Z");
         menu_separator(menu);
@@ -5978,6 +7123,15 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
                 item = menu_add(menu, MENU_DELETE, 0, "Delete permanently");
                 snprintf(item->shortcut, sizeof item->shortcut, "Delete");
             } else {
+                item = menu_add(menu, MENU_CUT, 0, "Cut");
+                item->enabled = writable;
+                snprintf(item->shortcut, sizeof item->shortcut, "Ctrl+X");
+                item = menu_add(menu, MENU_COPY, 0, "Copy");
+                snprintf(item->shortcut, sizeof item->shortcut, "Ctrl+C");
+                if (directory && selected <= 1)
+                    menu_add(menu, MENU_PASTE, 0, "Paste into folder")->enabled =
+                        clipboard_has_files(files) && may_modify(files, path);
+                menu_separator(menu);
                 item = menu_add(menu, MENU_RENAME, 0, "Rename");
                 item->enabled = writable && selected <= 1;
                 snprintf(item->shortcut, sizeof item->shortcut, "F2");
@@ -6127,6 +7281,13 @@ static void menu_choose(struct files *files, struct menu *menu, int index, bool 
         break;
     case MENU_UNDO:
         undo(files);
+        break;
+    case MENU_CUT:
+    case MENU_COPY:
+        copy_files(files, action == MENU_CUT);
+        break;
+    case MENU_PASTE:
+        paste_files(files, path);
         break;
     default:
         break;
@@ -6445,10 +7606,10 @@ static void click(struct files *files, uint32_t time)
     unsigned mods = desk_keyboard_mods(&files->keyboard);
     if (files->dialog.open) {
         if (target.kind == TARGET_DIALOG_BUTTON) {
-            if (target.index == 1)
-                dialog_confirmed(files);
-            else
-                close_dialog(files);
+            dialog_choose(files, (int)target.index);
+        } else if (target.kind == TARGET_DIALOG_CHECK) {
+            files->dialog.checked = !files->dialog.checked;
+            desk_window_redraw(&files->window);
         }
         update_hover(files, true);
         return;
@@ -6540,6 +7701,10 @@ static void click(struct files *files, uint32_t time)
         field_press(files, &files->rename_field, twice);
         break;
     case TARGET_DIALOG_BUTTON:
+    case TARGET_DIALOG_CHECK:
+        break;
+    case TARGET_JOB_CANCEL:
+        cancel_job(files);
         break;
     case TARGET_COLUMN_EDGE:
         if (twice) {
@@ -6920,6 +8085,9 @@ static void close_window(struct files *files)
         wl_data_offer_destroy(files->selection_offer);
     free(files->offer_type);
     free(files->pending_type);
+    free(files->offer_files_type);
+    free(files->pending_files_type);
+    clip_forget_files(files);
     free_suggestions(files);
     desk_text_free(&files->search.text);
     desk_text_free(&files->path_field.text);
@@ -6965,7 +8133,7 @@ static bool run(struct files *files)
             wl_display_cancel_read(display);
             return false;
         }
-        struct pollfd fds[8] = {
+        struct pollfd fds[9] = {
             {.fd = wl_display_get_fd(display), .events = POLLIN},
             {.fd = files->repeat.fd, .events = POLLIN},
             {.fd = files->inotify, .events = POLLIN},
@@ -6974,8 +8142,9 @@ static bool run(struct files *files)
             {.fd = files->mounts, .events = POLLPRI},
             {.fd = files->sizer ? files->sizer->event : -1, .events = POLLIN},
             {.fd = files->thumbnailer ? files->thumbnailer->event : -1, .events = POLLIN},
+            {.fd = files->worker ? files->worker->event : -1, .events = POLLIN},
         };
-        if (poll(fds, 8, -1) < 0) {
+        if (poll(fds, 9, -1) < 0) {
             wl_display_cancel_read(display);
             if (errno == EINTR)
                 continue;
@@ -7016,6 +8185,8 @@ static bool run(struct files *files)
             sizes_arrived(files);
         if (files->thumbnailer && fds[7].revents & POLLIN)
             thumbs_arrived(files);
+        if (files->worker && fds[8].revents & POLLIN)
+            jobs_event(files);
         if (files->mounts >= 0 && fds[5].revents & (POLLPRI | POLLERR)) {
             build_places(files); /* A drive came or went. */
             desk_window_redraw(&files->window);
@@ -7148,6 +8319,8 @@ int main(int argc, char **argv)
         files.trash_files = NULL;
     }
     files.thumbnailer = thumbnailer_create(files.thumbs_dir); /* Without it, images show their icon. */
+    files.worker = worker_create(); /* Without it, copying and deleting say so. */
+    files.job_top = -1;
     files.terminal = terminal_command();
     files.bookmarks_path = bookmarks_file();
     signal(SIGCHLD, SIG_IGN); /* Applications started are left to themselves. */
@@ -7178,6 +8351,7 @@ int main(int argc, char **argv)
     sizer_destroy(files.sizer);
     thumbs_clear(&files);
     thumbnailer_destroy(files.thumbnailer);
+    worker_destroy(files.worker);
     free(files.thumbs_dir);
     free(files.trash_dir);
     free(files.trash_files);

@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.4.2"
+#define FILES_VERSION "0.4.3"
 
 /* Exit statuses. */
 enum {
@@ -132,7 +132,9 @@ enum target_kind {
     TARGET_PATH,            /* The path box: its empty part, or the field while typing a path */
     TARGET_SUGGESTION,      /* index into suggestions */
     TARGET_RENAME,          /* The field a name is being edited in */
-    TARGET_DIALOG_BUTTON,   /* index: 0 Cancel, 1 the button that does it */
+    TARGET_DIALOG_BUTTON,   /* index: the dialog's button */
+    TARGET_DIALOG_CHECK,    /* Its "Do this for all" box */
+    TARGET_JOB_CANCEL,      /* The × on the progress bar */
     TARGET_COLUMN_EDGE,     /* index: the COLUMN_ to its right, resized by dragging */
 };
 
@@ -164,25 +166,33 @@ struct tab {
 /* A question over the window, such as "Delete 3 items permanently?",
    answered with Cancel or the button that does it. Nothing else can be
    used while it's open. */
+#define DIALOG_BUTTONS 3
 struct dialog {
     bool open;
-    int action;             /* What the button does: a DIALOG_ value in files.c. */
+    int action;             /* What it's for: a DIALOG_ value in files.c. */
     char title[300], message[300];
-    char confirm[32];       /* The button's label. */
-    int focus;              /* 0 Cancel, 1 the button. Cancel to start with. */
+    char labels[DIALOG_BUTTONS][32]; /* Left to right. */
+    int button_count;
+    int danger;             /* The button drawn red, or -1. */
+    int focus;              /* The button Enter picks. */
+    bool has_check, checked; /* "Do this for all conflicts". */
     char **paths;           /* What it acts on. */
     size_t count;
     /* As drawn, for clicks. */
-    int button_left[2], button_right[2], button_top, button_bottom;
+    int button_left[DIALOG_BUTTONS], button_right[DIALOG_BUTTONS], button_top, button_bottom;
+    int check_left, check_right, check_top, check_bottom;
 };
 
 /* The last change, for Ctrl+Z. */
-enum undo_kind { UNDO_NONE, UNDO_RENAME, UNDO_CREATE, UNDO_TRASH };
+enum undo_kind { UNDO_NONE, UNDO_RENAME, UNDO_CREATE, UNDO_TRASH, UNDO_COPY, UNDO_MOVE };
 struct undo {
     enum undo_kind kind;
-    char **from, **to;      /* Rename: from[0] to to[0]. Create: to[0]. Trash: each from[i] went to to[i]. */
+    /* Rename: from[0] to to[0]. Create: to[0]. Trash and move: each from[i]
+       went to to[i]. Copy: to[i] are the copies. */
+    char **from, **to;
     size_t count;
 };
+struct worker;
 
 /* An image's thumbnail, as made for a box of size buffer pixels. Kept in
    a hash by path while the directory is shown. */
@@ -288,6 +298,13 @@ struct files {
     int rename_top, rename_bottom; /* The field as drawn, or -1. */
     struct dialog dialog;
     struct undo undo;
+    struct worker *worker;    /* Copies, moves and deletes on a thread, one job at a time. */
+    int job_cancel_left, job_cancel_right, job_top; /* The progress bar's ×, as drawn; job_top -1 when none. */
+    char **clip_paths;        /* What Copy or Cut put on the clipboard... */
+    size_t clip_count;
+    bool clip_cut;            /* ...and whether it's to be moved. */
+    char *offer_files_type;   /* The files type the clipboard's offer has, or NULL. */
+    char *pending_files_type;
     char *sized_path;         /* The directory whose sizes it's summing. */
     char typed[64];           /* Type to select: what's been typed lately... */
     uint64_t typed_at;        /* ...and when, monotonic ms. */
