@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.5.0"
+#define FILES_VERSION "0.6.0"
 
 /* Exit statuses. */
 enum {
@@ -135,6 +135,9 @@ enum target_kind {
     TARGET_DIALOG_BUTTON,   /* index: the dialog's button */
     TARGET_DIALOG_CHECK,    /* Its "Do this for all" box */
     TARGET_JOB_CANCEL,      /* The × on the progress bar */
+    TARGET_PICKER_NAME,     /* The picker's name field */
+    TARGET_PICKER_FILTER,   /* Its file type dropdown */
+    TARGET_PICKER_BUTTON,   /* index: 0 Cancel, 1 Open or Save */
     TARGET_COLUMN_EDGE,     /* index: the COLUMN_ to its right, resized by dragging */
 };
 
@@ -195,9 +198,13 @@ struct undo {
 struct worker;
 struct counter;
 
+/* files --portal, in portal.c. */
+int portal_main(void);
+
 /* ~/.config/files/files.conf. */
 struct config {
     double font_points;
+    double opacity;           /* Of the window's background; text stays solid. */
     enum view view;           /* For folders without their own. */
     bool hidden, directories_first, single_click, thumbnails;
     enum column sort;
@@ -283,6 +290,30 @@ struct memory {
     char *path, *name;
 };
 
+/* --filter NAME:PATTERNS: globs or MIME types. */
+struct picker_filter {
+    char *name;
+    char **patterns;        /* None: everything ("All files"). */
+    size_t count;
+};
+
+/* files --pick or --save. */
+struct picker {
+    bool active, save, multiple, directory;
+    bool nul;               /* -0: NUL after each path. */
+    bool print_filter;      /* For the portal: "filter:N" first. */
+    char *title, *accept, *app_id;
+    struct picker_filter *filters; /* The last is All files. */
+    size_t filter_count, filter;
+    struct field name;      /* Saving: the name. */
+    bool name_focus;
+    DeskApps apps;          /* For MIME filters, loaded when first needed. */
+    bool apps_loaded;
+    int status;             /* The exit status once chosen or cancelled. */
+    /* The bar, as drawn. */
+    int bar_top, filter_left, filter_right, button_left[2], button_right[2];
+};
+
 struct files {
     char *home;               /* $HOME without a trailing slash, or NULL. */
     char *path;               /* The current directory, absolute. */
@@ -330,6 +361,7 @@ struct files {
     DeskBufferPool drag_buffers;
     struct counter *counter;  /* Counting for Properties. */
     struct config config;
+    struct picker picker;
     struct folder_view *views; /* Oldest first. */
     size_t view_count;
     char *views_path;         /* ~/.local/state/files/views */

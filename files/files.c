@@ -2,6 +2,7 @@
 #include "files.h"
 
 #include <ctype.h>
+#include <fnmatch.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <png.h>
@@ -94,11 +95,19 @@ static const struct colors default_colors = {
     .urgent = 0xfff7768e,
 };
 
+static void set_opacity(struct files *files)
+{
+    double opacity = files->config.opacity > 0 ? files->config.opacity : 1;
+    uint32_t alpha = (uint32_t)lround(opacity * 255);
+    files->colors.background = (alpha << 24) | (files->colors.background & 0xffffff);
+}
+
 static void update_colors(struct files *files)
 {
     DeskPalette palette;
     if (!files->palette_path || desk_palette_load(files->palette_path, &palette) != 0) {
         files->colors = default_colors;
+        set_opacity(files);
         return;
     }
     files->colors = (struct colors){
@@ -110,6 +119,7 @@ static void update_colors(struct files *files)
         .selection_foreground = 0xff000000u | palette.rgb[DESK_SELECTION_FOREGROUND],
         .urgent = 0xff000000u | palette.rgb[DESK_URGENT],
     };
+    set_opacity(files);
 }
 
 /* Paths */
@@ -668,6 +678,12 @@ static void config_entry(void *data, const char *section, const char *key, const
             config->font_points = points;
         else
             valid = false;
+    } else if (strcmp(section, "layout") == 0 && strcmp(key, "opacity") == 0) {
+        double opacity = strtod(value, &end);
+        if (end != value && !*end && opacity >= 0.1 && opacity <= 1)
+            config->opacity = opacity;
+        else
+            valid = false;
     } else if (strcmp(section, "view") == 0 && strcmp(key, "view") == 0) {
         if (strcmp(value, "list") == 0 || strcmp(value, "details") == 0)
             config->view = VIEW_LIST;
@@ -737,7 +753,7 @@ static void config_entry(void *data, const char *section, const char *key, const
    when it's missing so there's always one to edit. */
 static void config_load(struct config *config)
 {
-    *config = (struct config){.font_points = FONT_POINTS, .view = VIEW_LIST, .sort = COLUMN_NAME,
+    *config = (struct config){.font_points = FONT_POINTS, .opacity = 0.8, .view = VIEW_LIST, .sort = COLUMN_NAME,
                               .directories_first = true, .thumbnails = true, .image_limit = 256u << 20};
     struct config_parse parse = {.config = config, .label = "built-in config"};
     desk_ini_parse((const char *)default_config, sizeof default_config, config_entry, &parse);
@@ -2038,14 +2054,26 @@ static int pointer_buffer_x(const struct files *files);
 
 static void update_title(struct files *files)
 {
+    if (files->picker.active) {
+        const struct picker *picker = &files->picker;
+        desk_window_set_title(&files->window, picker->title ? picker->title
+                                              : picker->save ? "Save file"
+                                              : picker->directory ? "Choose a folder"
+                                              : picker->multiple ? "Open files" : "Open file");
+        return;
+    }
     char title[PATH_MAX + 2];
     display_path(files, files->path, title, sizeof title);
     desk_window_set_title(&files->window, title);
 }
 
+static void picker_filter_listing(struct files *files);
+
 static void filter(struct files *files)
 {
     listing_filter(&files->listing, files->show_hidden, field_text(&files->search));
+    if (files->picker.active)
+        picker_filter_listing(files);
 }
 
 /* Replace the listing with path's, keeping the cursor on keep (a name) when
@@ -2206,6 +2234,7 @@ static void go_up(struct files *files)
 }
 
 static void notify(struct files *files, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static bool picker_refuses(struct files *files);
 
 /* A line over the foot of the list, until the next click or key. */
 static void notify(struct files *files, const char *format, ...)
@@ -2280,6 +2309,9 @@ static void open_file(struct files *files, const char *path_in)
 }
 
 /* Enter or double-click: into a directory, or open a file. */
+static void picker_accept(struct files *files);
+static void picker_entry_pressed(struct files *files, size_t index);
+
 static void go_in(struct files *files)
 {
     struct entry *entry = cursor_entry(files);
@@ -2290,6 +2322,15 @@ static void go_in(struct files *files)
         return;
     if (entry->directory) {
         go_to(files, path, NULL);
+        return;
+    }
+    if (files->picker.active) {
+        free(path);
+        if (!entry->selected)
+            select_only(files, files->cursor);
+        if (files->picker.save)
+            picker_entry_pressed(files, files->cursor);
+        picker_accept(files);
         return;
     }
     if (!entry->broken)
@@ -2728,6 +2769,8 @@ static const char *tab_path(const struct files *files, size_t index)
 
 static void search_focus(struct files *files, bool focus)
 {
+    if (focus)
+        files->picker.name_focus = false;
     if (files->search_focus != focus) {
         files->search_focus = focus;
         desk_window_redraw(&files->window);
@@ -3247,6 +3290,8 @@ static void refresh_selecting(struct files *files, const char *name)
    the part before the extension for a file. */
 static void start_rename(struct files *files, size_t index, bool created)
 {
+    if (picker_refuses(files))
+        return;
     if (index >= files->listing.shown_count)
         return;
     if (!files->writable) {
@@ -3528,6 +3573,8 @@ static void trash_paths(struct files *files, char **paths, size_t count);
 /* Delete, outside the trash: move the selection there. */
 static void trash_selection(struct files *files)
 {
+    if (picker_refuses(files))
+        return;
     size_t count;
     char **paths = selected_paths(files, &count);
     if (!count) {
@@ -3591,6 +3638,8 @@ static void trash_paths(struct files *files, char **paths, size_t count)
 /* Put items from the trash back where they came from. */
 static void restore_selection(struct files *files)
 {
+    if (picker_refuses(files))
+        return;
     size_t count;
     char **paths = selected_paths(files, &count);
     size_t restored = 0;
@@ -4296,6 +4345,10 @@ static void worker_destroy(struct worker *worker)
    destination to be changeable, moving and deleting the sources' folders. */
 static void start_job(struct files *files, enum job_kind kind, char **sources, size_t count, const char *destination)
 {
+    if (picker_refuses(files)) {
+        free_paths(sources, count);
+        return;
+    }
     if (!count) {
         free(sources);
         return;
@@ -4406,6 +4459,8 @@ static void close_dialog(struct files *files)
 /* Shift+Delete, or Delete in the trash: ask, then delete for good. */
 static void ask_delete(struct files *files)
 {
+    if (picker_refuses(files))
+        return;
     size_t count;
     char **paths = selected_paths(files, &count);
     if (!count) {
@@ -4432,6 +4487,8 @@ static void ask_delete(struct files *files)
 
 static void ask_empty_trash(struct files *files)
 {
+    if (picker_refuses(files))
+        return;
     DIR *dir = files->trash_files ? opendir(files->trash_files) : NULL;
     size_t count = 0;
     struct dirent *item;
@@ -4483,6 +4540,8 @@ static void answer_job(struct files *files, enum answer answer, bool all)
     pthread_mutex_unlock(&worker->lock);
 }
 
+static void picker_finish(struct files *files, char *const *paths, size_t count);
+
 /* A button of the dialog: do what it says. */
 static void dialog_choose(struct files *files, int button)
 {
@@ -4494,7 +4553,10 @@ static void dialog_choose(struct files *files, int button)
     dialog->paths = NULL;
     dialog->count = 0;
     close_dialog(files);
-    if (action == DIALOG_CONFLICT) {
+    if (action == 100 /* DIALOG_REPLACE_SAVE */) {
+        if (button == 1 && count == 1)
+            picker_finish(files, paths, 1);
+    } else if (action == DIALOG_CONFLICT) {
         static const enum answer answers[] = {ANSWER_SKIP, ANSWER_BOTH, ANSWER_REPLACE};
         answer_job(files, button >= 0 && button < 3 ? answers[button] : ANSWER_CANCEL, all);
     } else if (button == 1 && action == DIALOG_DELETE) {
@@ -4926,6 +4988,8 @@ static void jobs_event(struct files *files)
    copy (the copies go to the trash) or move (back where they were). */
 static void undo(struct files *files)
 {
+    if (picker_refuses(files))
+        return;
     struct undo *undo = &files->undo;
     int error = 0;
     const char *what = NULL;
@@ -5071,6 +5135,371 @@ static void copy_files(struct files *files, bool cut);
 static void paste_files(struct files *files, const char *destination);
 static bool clipboard_has_files(const struct files *files);
 
+/* The picker
+
+   files --pick and --save: the normal window as a file dialog for other
+   programs. A bar along the foot has the type filter, Cancel and Open (or
+   Save), and when saving a name field. The choice goes to stdout and files
+   exits: 0 chosen, 3 cancelled. Only New folder changes anything here;
+   cut, paste, rename, trash and delete are off, so a stray click in a
+   dialog can't move a file. */
+
+enum { EXIT_CANCELLED = 3 };
+
+static bool picker_refuses(struct files *files)
+{
+    if (!files->picker.active)
+        return false;
+    notify(files, "Not in a file dialog: only New folder is");
+    return true;
+}
+
+/* "Images:*.png;*.jpg;image/webp". */
+static bool picker_add_filter(struct picker *picker, const char *text)
+{
+    const char *colon = strchr(text, ':');
+    struct picker_filter *grown = realloc(picker->filters, (picker->filter_count + 1) * sizeof *grown);
+    if (!grown)
+        return false;
+    picker->filters = grown;
+    struct picker_filter *filter = &picker->filters[picker->filter_count];
+    *filter = (struct picker_filter){0};
+    filter->name = colon ? strndup(text, (size_t)(colon - text)) : strdup(text);
+    char *list = strdup(colon ? colon + 1 : ""), *save = NULL;
+    for (char *part = list ? strtok_r(list, ";", &save) : NULL; part; part = strtok_r(NULL, ";", &save)) {
+        while (*part == ' ')
+            ++part;
+        if (!*part)
+            continue;
+        char **patterns = realloc(filter->patterns, (filter->count + 1) * sizeof *patterns);
+        if (!patterns)
+            break;
+        filter->patterns = patterns;
+        if ((filter->patterns[filter->count] = strdup(part)))
+            ++filter->count;
+    }
+    free(list);
+    ++picker->filter_count;
+    return filter->name != NULL;
+}
+
+static void picker_free(struct picker *picker)
+{
+    for (size_t i = 0; i < picker->filter_count; ++i) {
+        free(picker->filters[i].name);
+        for (size_t j = 0; j < picker->filters[i].count; ++j)
+            free(picker->filters[i].patterns[j]);
+        free(picker->filters[i].patterns);
+    }
+    free(picker->filters);
+    desk_text_free(&picker->name.text);
+    if (picker->apps_loaded)
+        desk_apps_free(&picker->apps);
+}
+
+/* Whether a file passes the chosen filter: a glob on the name, or a MIME
+   type (image/png, or image/ and a star) through shared-mime-info. */
+static bool picker_matches(struct files *files, const struct entry *entry)
+{
+    struct picker *picker = &files->picker;
+    if (picker->filter >= picker->filter_count)
+        return true;
+    const struct picker_filter *filter = &picker->filters[picker->filter];
+    if (!filter->count)
+        return true;
+    const char *mime = NULL;
+    for (size_t i = 0; i < filter->count; ++i) {
+        const char *pattern = filter->patterns[i];
+        if (!strchr(pattern, '/')) {
+            if (fnmatch(pattern, entry->name, FNM_CASEFOLD) == 0)
+                return true;
+            continue;
+        }
+        if (!mime) {
+            if (!picker->apps_loaded)
+                picker->apps_loaded = desk_apps_load(&picker->apps) == 0;
+            char *path = join_path(files->path, entry->name);
+            DeskApps none = {0};
+            mime = path ? desk_mime_type(picker->apps_loaded ? &picker->apps : &none, path, entry->name) : NULL;
+            free(path);
+            if (!mime)
+                mime = "";
+        }
+        if (fnmatch(pattern, mime, 0) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* After the usual filtering: directories always show; files only when
+   they pass the filter, and not at all when choosing a directory. */
+static void picker_filter_listing(struct files *files)
+{
+    struct listing *listing = &files->listing;
+    size_t kept = 0;
+    for (size_t i = 0; i < listing->shown_count; ++i) {
+        const struct entry *entry = &listing->entries[listing->shown[i]];
+        if (entry->directory || (!files->picker.directory && picker_matches(files, entry)))
+            listing->shown[kept++] = listing->shown[i];
+    }
+    listing->shown_count = kept;
+}
+
+/* $XDG_STATE_HOME/files/picker: per application, the last folder opened
+   from and saved to. */
+static char *picker_state_path(const struct files *files)
+{
+    char *directory = files->state_path ? parent_path(files->state_path) : NULL, *path = NULL;
+    if (directory && asprintf(&path, "%s/picker", directory) < 0)
+        path = NULL;
+    free(directory);
+    return path;
+}
+
+static char *picker_last(const struct files *files, bool save)
+{
+    char *path = picker_state_path(files), *found = NULL, *line = NULL;
+    FILE *file = path ? fopen(path, "re") : NULL;
+    size_t capacity = 0;
+    ssize_t length;
+    const char *app = files->picker.app_id ? files->picker.app_id : "";
+    while (file && (length = getline(&line, &capacity, file)) > 0) {
+        while (length && line[length - 1] == '\n')
+            line[--length] = 0;
+        char *kind = strchr(line, '\t'), *where = kind ? strchr(kind + 1, '\t') : NULL;
+        if (!where)
+            continue;
+        *kind++ = 0;
+        *where++ = 0;
+        if (strcmp(line, app) == 0 && strcmp(kind, save ? "save" : "open") == 0 && is_directory(where)) {
+            free(found);
+            found = strdup(where);
+        }
+    }
+    free(line);
+    if (file)
+        fclose(file);
+    free(path);
+    return found;
+}
+
+static void picker_remember(const struct files *files, const char *directory)
+{
+    char *path = picker_state_path(files);
+    if (!path)
+        return;
+    const char *app = files->picker.app_id ? files->picker.app_id : "", *kind = files->picker.save ? "save" : "open";
+    /* Keep the other lines, then this one; at most 200. */
+    char **lines = NULL, *line = NULL;
+    size_t count = 0, capacity = 0;
+    ssize_t length;
+    FILE *file = fopen(path, "re");
+    while (file && (length = getline(&line, &capacity, file)) > 0) {
+        char prefix[300];
+        snprintf(prefix, sizeof prefix, "%s\t%s\t", app, kind);
+        if (strncmp(line, prefix, strlen(prefix)) == 0)
+            continue;
+        char **grown = realloc(lines, (count + 1) * sizeof *grown);
+        if (!grown)
+            break;
+        lines = grown;
+        if ((lines[count] = strdup(line)))
+            ++count;
+    }
+    free(line);
+    if (file)
+        fclose(file);
+    char *parent = parent_path(path);
+    DeskAtomic atomic;
+    if (parent && desk_mkdirs(parent, 0700) == 0 && desk_atomic_open(&atomic, path, 0600) == 0) {
+        for (size_t i = count > 199 ? count - 199 : 0; i < count; ++i)
+            fputs(lines[i], atomic.file);
+        fprintf(atomic.file, "%s\t%s\t%s\n", app, kind, directory);
+        desk_atomic_commit(&atomic, true);
+        desk_atomic_abort(&atomic);
+    }
+    free(parent);
+    for (size_t i = 0; i < count; ++i)
+        free(lines[i]);
+    free(lines);
+    free(path);
+}
+
+/* Print the choice and close. */
+static void picker_finish(struct files *files, char *const *paths, size_t count)
+{
+    struct picker *picker = &files->picker;
+    char end = picker->nul ? '\0' : '\n';
+    if (picker->print_filter)
+        printf("filter:%zu%c", picker->filter, end);
+    for (size_t i = 0; i < count; ++i)
+        printf("%s%c", paths[i], end);
+    fflush(stdout);
+    char *directory = count ? (picker->directory && !picker->save ? strdup(paths[0]) : parent_path(paths[0])) : NULL;
+    if (directory)
+        picker_remember(files, directory);
+    free(directory);
+    picker->status = EXIT_CLOSED;
+    files->running = false;
+}
+
+static void picker_cancel(struct files *files)
+{
+    files->picker.status = EXIT_CANCELLED;
+    files->running = false;
+}
+
+enum { DIALOG_REPLACE_SAVE = 100 };
+
+/* Save: the name in the field, in the folder shown (or where a path in it
+   points). An existing file is replaced only after asking; files never
+   writes it, the program that asked does. */
+static void picker_save(struct files *files)
+{
+    const char *typed = field_text(&files->picker.name);
+    if (!typed[0]) {
+        notify(files, "Type a name to save as");
+        files->picker.name_focus = true;
+        return;
+    }
+    char *target = strchr(typed, '/') ? typed_path(files, typed) : join_path(files->path, typed);
+    if (!target)
+        return;
+    if (is_directory(target)) {
+        /* A folder: go into it, keeping the name when the path was typed. */
+        if (strchr(typed, '/'))
+            desk_text_set(&files->picker.name.text, "");
+        go_to(files, target, NULL);
+        return;
+    }
+    char *directory = parent_path(target);
+    if (!directory || !is_directory(directory)) {
+        notify(files, "There's no folder %s", directory ? directory : typed);
+        free(directory);
+        free(target);
+        return;
+    }
+    if (access(directory, W_OK) != 0) {
+        char shown[PATH_MAX];
+        display_path(files, directory, shown, sizeof shown);
+        notify(files, "You can't save in %s", shown);
+        free(directory);
+        free(target);
+        return;
+    }
+    free(directory);
+    struct stat info;
+    if (lstat(target, &info) == 0) {
+        char title[300], message[300], shown[PATH_MAX];
+        char *parent = parent_path(target);
+        display_path(files, parent ? parent : target, shown, sizeof shown);
+        free(parent);
+        snprintf(title, sizeof title, "Replace %s?", base_name(target));
+        snprintf(message, sizeof message, "It's already in %.200s. Saving replaces it.", shown);
+        char **paths = malloc(sizeof *paths);
+        if (!paths) {
+            free(target);
+            return;
+        }
+        paths[0] = target;
+        static const char *const labels[] = {"Cancel", "Replace"};
+        open_dialog(files, DIALOG_REPLACE_SAVE, paths, 1, title, message, labels, 2, 1, 0);
+        return;
+    }
+    picker_finish(files, &target, 1);
+    free(target);
+}
+
+/* Open (or Enter, or a double-click on a file): what's chosen. */
+static void picker_accept(struct files *files)
+{
+    struct picker *picker = &files->picker;
+    if (picker->save) {
+        picker_save(files);
+        return;
+    }
+    if (picker->directory) {
+        /* The selected folder, or the one shown. */
+        size_t count;
+        char **paths = selected_paths(files, &count);
+        char *chosen = count == 1 && is_directory(paths[0]) ? strdup(paths[0]) : strdup(files->path);
+        free_paths(paths, count);
+        if (chosen)
+            picker_finish(files, &chosen, 1);
+        free(chosen);
+        return;
+    }
+    size_t count = 0;
+    char **paths = calloc(files->listing.shown_count + 1, sizeof *paths);
+    if (!paths)
+        return;
+    struct entry *current = cursor_entry(files);
+    if (!picker->multiple) {
+        /* One: the cursor's file, when it's selected. */
+        if (current && current->selected && !current->directory && !current->broken &&
+            (paths[0] = join_path(files->path, current->name)))
+            count = 1;
+    } else {
+        for (size_t i = 0; i < files->listing.shown_count; ++i) {
+            struct entry *entry = shown_entry(files, i);
+            if (entry->selected && !entry->directory && !entry->broken &&
+                (paths[count] = join_path(files->path, entry->name)))
+                ++count;
+        }
+    }
+    if (count) {
+        picker_finish(files, paths, count);
+    } else if (current && current->directory && current->selected) {
+        go_in(files); /* A folder: into it, as in other dialogs. */
+    } else {
+        notify(files, picker->multiple ? "Select files to open" : "Select a file to open");
+    }
+    free_paths(paths, count);
+}
+
+/* Save: a file clicked puts its name in the field. */
+static void picker_entry_pressed(struct files *files, size_t index)
+{
+    if (!files->picker.save || index >= files->listing.shown_count)
+        return;
+    struct entry *entry = shown_entry(files, index);
+    if (entry->directory)
+        return;
+    desk_text_set(&files->picker.name.text, entry->name);
+    desk_text_select_all(&files->picker.name.text);
+}
+
+/* Keys while the name field has them. Returns -1 when not taken. */
+static int picker_name_key(struct files *files, uint32_t key, xkb_keysym_t sym, unsigned mods)
+{
+    switch (sym) {
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+        picker_save(files);
+        return 0;
+    case XKB_KEY_Escape:
+        picker_cancel(files);
+        return 0;
+    case XKB_KEY_Tab:
+    case XKB_KEY_Down:
+        files->picker.name_focus = false;
+        desk_window_redraw(&files->window);
+        return 0;
+    default:
+        break;
+    }
+    bool changed;
+    int repeats = field_key(files, &files->picker.name, key, sym, mods, &changed);
+    desk_window_redraw(&files->window);
+    return repeats >= 0 ? repeats : (mods & (DESK_MOD_CTRL | DESK_MOD_ALT | DESK_MOD_LOGO)) ? -1 : 0;
+}
+
+static const char *picker_accept_label(const struct files *files)
+{
+    const struct picker *picker = &files->picker;
+    return picker->accept ? picker->accept : picker->save ? "Save" : picker->directory ? "Select" : "Open";
+}
+
 /* Keys */
 
 static void menu_key(struct files *files, xkb_keysym_t sym);
@@ -5215,9 +5644,12 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
         toggle_sidebar(files);
         return false;
     case XKB_KEY_Escape:
-        /* First the search, then the selection (the cursor stays). */
+        /* First the search, then the selection (the cursor stays); in a
+           dialog, then the dialog. */
         if (field_text(&files->search)[0]) {
             search_clear(files);
+        } else if (files->picker.active) {
+            picker_cancel(files);
         } else {
             clear_selection(files);
             desk_window_redraw(&files->window);
@@ -5307,6 +5739,10 @@ static bool handle_key(struct files *files, uint32_t key)
     }
     if (files->path_editing) {
         int repeats = path_key(files, key, sym, mods);
+        if (repeats >= 0)
+            return repeats;
+    } else if (files->picker.active && files->picker.name_focus) {
+        int repeats = picker_name_key(files, key, sym, mods);
         if (repeats >= 0)
             return repeats;
     } else if (files->search_focus) {
@@ -5496,10 +5932,12 @@ static struct layout make_layout(DeskFont *font, DeskFont *italic, DeskFont *mon
     return layout;
 }
 
+/* Between a and b, alpha too, so tints of a see-through background stay
+   see-through. */
 static uint32_t mix(uint32_t a, uint32_t b, unsigned amount)
 {
-    uint32_t out = 0xff000000u;
-    for (int shift = 0; shift < 24; shift += 8) {
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
         unsigned x = (a >> shift) & 0xff, y = (b >> shift) & 0xff;
         out |= ((x * (255 - amount) + y * amount + 127) / 255) << shift;
     }
@@ -6451,6 +6889,63 @@ static void paint_tip(struct files *files, DeskCanvas *canvas, const struct layo
     draw_clipped(ui->font, canvas, x + pad / 2, x + width - pad / 2, y + ui->baseline, name, colors->foreground);
 }
 
+/* The picker's bar along the foot: the name when saving, the type
+   filter, Cancel and Open. */
+static void paint_picker_bar(struct files *files, DeskCanvas *canvas, const struct layout *ui, int top)
+{
+    struct picker *picker = &files->picker;
+    const struct colors *colors = &files->colors;
+    double scale = desk_window_scale(&files->window);
+    int pad = ui->padding, row = ui->row_height, line = scale >= 2 ? (int)scale : 1;
+    picker->bar_top = top;
+    desk_canvas_fill(canvas, 0, top, canvas->width, canvas->height - top, mix(colors->background, colors->muted, 25));
+    desk_canvas_fill(canvas, 0, top, canvas->width, line, mix(colors->background, colors->muted, 70));
+    int y = top + pad / 2, right = canvas->width - pad, least = (int)lround(90 * scale);
+    for (int i = 1; i >= 0; --i) {
+        const char *label = i ? picker_accept_label(files) : "Cancel";
+        int text = desk_text_width(ui->font, label, strlen(label));
+        int width = text + 2 * pad > least ? text + 2 * pad : least;
+        picker->button_left[i] = right - width;
+        picker->button_right[i] = right;
+        bool lit = hovering(files, TARGET_PICKER_BUTTON, (size_t)i);
+        uint32_t fill = i ? colors->directory : mix(colors->background, colors->muted, 60) | 0xff000000u;
+        if (lit)
+            fill = mix(fill, colors->foreground, 40) | 0xff000000u;
+        desk_canvas_fill(canvas, right - width, y, width, row, fill);
+        desk_text_draw(ui->font, canvas, right - width + (width - text) / 2, y + ui->baseline, label, strlen(label),
+                       i ? colors->background | 0xff000000u : colors->foreground);
+        right -= width + pad / 2;
+    }
+    picker->filter_left = picker->filter_right = 0;
+    if (picker->filter_count > 1) {
+        char label[200];
+        snprintf(label, sizeof label, "%s  \u25be", picker->filters[picker->filter].name);
+        int width = desk_text_width(ui->font, label, strlen(label)) + 2 * pad;
+        if (width > canvas->width / 3)
+            width = canvas->width / 3;
+        right -= pad / 2;
+        picker->filter_left = right - width;
+        picker->filter_right = right;
+        bool lit = hovering(files, TARGET_PICKER_FILTER, 0);
+        desk_canvas_fill(canvas, right - width, y, width, row, mix(colors->background, colors->muted, lit ? 80 : 45));
+        draw_clipped(ui->font, canvas, right - width + pad, right - pad / 2, y + ui->baseline, label, colors->foreground);
+        right -= width + pad;
+    }
+    if (picker->save) {
+        const char *label = "Name";
+        int label_width = desk_text_width(ui->font, label, strlen(label));
+        desk_text_draw(ui->font, canvas, pad, y + ui->baseline, label, strlen(label), colors->muted);
+        int left = pad + label_width + pad, inner = pad / 4;
+        if (right - left > 4 * pad) {
+            desk_canvas_fill(canvas, left, y, right - left, row, files->colors.background | 0xff000000u);
+            outline(canvas, left, y, right - left, row, line,
+                    picker->name_focus ? colors->directory : mix(colors->background, colors->muted, 90));
+            draw_field(files, canvas, ui, &picker->name, left + inner + line, right - inner - line, y,
+                       picker->name_focus, "File name");
+        }
+    }
+}
+
 /* Dropping into the folder shown: a frame around the list. */
 static void paint_drop_frame(struct files *files, DeskCanvas *canvas, int top, int bottom)
 {
@@ -6469,16 +6964,27 @@ static void paint(struct files *files, DeskCanvas *canvas)
     fonts_resize(files);
     struct layout ui = make_layout(files->font, files->italic, files->mono, scale);
     struct layout list = make_layout(files->list_font, files->list_italic, files->list_mono, scale);
-    desk_canvas_fill(canvas, 0, 0, canvas->width, canvas->height, colors->background);
+    /* The background is set, not blended: it may be see-through. */
+    uint32_t alpha = colors->background >> 24, premultiplied = alpha << 24;
+    for (int shift = 0; shift < 24; shift += 8)
+        premultiplied |= ((((colors->background >> shift) & 0xff) * alpha + 127) / 255) << shift;
+    for (int y = 0; y < canvas->height; ++y)
+        for (int x = 0; x < canvas->width; ++x)
+            canvas->pixels[(size_t)y * (size_t)canvas->stride + x] = premultiplied;
 
     /* Tabs at the top, then the toolbar; the sidebar and the entries below. */
     paint_tabs(files, canvas, &ui, ui.padding / 2);
     paint_toolbar(files, canvas, &ui, files->toolbar.tabs_bottom + ui.padding / 2);
     int top = files->toolbar.bottom + ui.padding, bottom = canvas->height - ui.padding / 2;
+    if (files->picker.active) {
+        int bar = ui.row_height + ui.padding;
+        paint_picker_bar(files, canvas, &ui, canvas->height - bar);
+        bottom -= bar;
+    }
     int strip = jobs_running(files) ? ui.row_height + ui.padding + 3 * (scale >= 2 ? (int)scale : 1) + ui.padding / 2 : 0;
     bottom -= strip;
     if (strip)
-        paint_progress(files, canvas, &ui, canvas->height - strip);
+        paint_progress(files, canvas, &ui, bottom + ui.padding / 2);
     else
         files->job_top = -1;
 
@@ -6646,7 +7152,7 @@ static void paint_dialog(struct files *files, DeskCanvas *canvas)
     int left = (canvas->width - width) / 2, top = (canvas->height - height) / 3;
     if (top + height > canvas->height)
         top = canvas->height - height > 0 ? canvas->height - height : 0;
-    uint32_t background = mix(colors->background, colors->muted, 25);
+    uint32_t background = mix(colors->background, colors->muted, 25) | 0xff000000u;
     desk_canvas_fill(canvas, left, top, width, height, background);
     outline(canvas, left, top, width, height, line, mix(colors->background, colors->muted, 110));
     draw_clipped(ui.font, canvas, left + pad, left + width - pad, top + pad + ui.baseline, dialog->title,
@@ -6711,7 +7217,8 @@ static void paint_dialog(struct files *files, DeskCanvas *canvas)
 static void draw(void *data, DeskWindow *window)
 {
     struct files *files = data;
-    DeskBuffer *buffer = desk_window_buffer(window, WL_SHM_FORMAT_XRGB8888);
+    bool see_through = files->colors.background >> 24 != 0xff;
+    DeskBuffer *buffer = desk_window_buffer(window, see_through ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888);
     if (!buffer)
         return; /* Both busy: retried after a release. */
     DeskCanvas canvas = desk_canvas(buffer->pixels, buffer->width, buffer->height);
@@ -6725,12 +7232,29 @@ static void window_close(void *data, DeskWindow *window)
 {
     (void)window;
     struct files *files = data;
+    if (files->picker.active)
+        files->picker.status = EXIT_CANCELLED;
     files->running = false;
+}
+
+/* A picker starts at about 60% of the screen; files at 800×600 unless
+   the compositor says otherwise. */
+static void initial_size(void *data, DeskWindow *window, int *width, int *height)
+{
+    struct files *files = data;
+    if (files->picker.active && window->bounds_width > 0 && window->bounds_height > 0) {
+        *width = window->bounds_width * 6 / 10;
+        *height = window->bounds_height * 6 / 10;
+    } else {
+        *width = files->picker.active ? 900 : 800;
+        *height = files->picker.active ? 600 : 600;
+    }
 }
 
 static const DeskWindowListener window_listener = {
     .draw = draw,
     .close = window_close,
+    .initial_size = initial_size,
 };
 
 /* Keyboard */
@@ -6876,6 +7400,18 @@ static struct target target_at(const struct files *files)
         if (dialog->has_check && y >= dialog->check_top && y < dialog->check_bottom && x >= dialog->check_left &&
             x < dialog->check_right)
             return (struct target){TARGET_DIALOG_CHECK, 0};
+        return (struct target){TARGET_NONE, 0};
+    }
+    if (files->picker.active && files->picker.bar_top > 0 && y >= files->picker.bar_top) {
+        const struct picker *picker = &files->picker;
+        for (int i = 0; i < 2; ++i) {
+            if (x >= picker->button_left[i] && x < picker->button_right[i])
+                return (struct target){TARGET_PICKER_BUTTON, (size_t)i};
+        }
+        if (picker->filter_right > picker->filter_left && x >= picker->filter_left && x < picker->filter_right)
+            return (struct target){TARGET_PICKER_FILTER, 0};
+        if (picker->save && x >= picker->name.left && x < picker->name.right)
+            return (struct target){TARGET_PICKER_NAME, 0};
         return (struct target){TARGET_NONE, 0};
     }
     if (files->job_top >= 0 && y >= files->job_top && x >= files->job_cancel_left && x < files->job_cancel_right) {
@@ -7095,6 +7631,8 @@ static void copy_text(struct files *files, const char *text)
    other file managers (and as their paths, for text). */
 static void copy_files(struct files *files, bool cut)
 {
+    if (cut && picker_refuses(files))
+        return;
     size_t count;
     char **paths = selected_paths(files, &count);
     if (!count) {
@@ -7239,6 +7777,8 @@ static bool clipboard_has_files(const struct files *files)
    cut, else copied. */
 static void paste_files(struct files *files, const char *destination)
 {
+    if (picker_refuses(files))
+        return;
     char **paths = NULL;
     size_t count = 0;
     bool cut = false;
@@ -7524,7 +8064,7 @@ static void start_drag(struct files *files)
         wl_data_source_offer(source, types[i]);
     if (wl_data_source_get_version(source) >= WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION) {
         uint32_t actions = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
-        if (files->writable && !in_trash(files))
+        if (files->writable && !in_trash(files) && !files->picker.active)
             actions |= WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
         wl_data_source_set_actions(source, actions);
     }
@@ -7596,7 +8136,7 @@ static void drop_update(struct files *files)
     struct target target = target_at(files);
     const char *into = NULL;
     char *owned = NULL;
-    if (files->drop_type && !files->dialog.open) {
+    if (files->drop_type && !files->dialog.open && !files->picker.active) {
         if (target.kind == TARGET_PLACE) {
             into = files->places[target.index].path;
             files->drop_target = target;
@@ -7785,6 +8325,7 @@ enum {
     MENU_COPY,
     MENU_PASTE,           /* Into the directory the menu is for. */
     MENU_PROPERTIES,
+    MENU_FILTER,          /* index: the picker's filter */
     MENU_NOTHING,         /* A disabled line such as "No applications". */
 };
 
@@ -7962,7 +8503,11 @@ static void menu_draw(void *data, DeskWindow *window)
     if (!menu || !buffer)
         return;
     DeskCanvas canvas = desk_canvas(buffer->pixels, buffer->width, buffer->height);
+    /* Menus are solid, whatever the window's opacity. */
+    uint32_t background = files->colors.background;
+    files->colors.background |= 0xff000000u;
     paint_menu(files, menu, &canvas);
+    files->colors.background = background;
     desk_window_commit(window, buffer);
 }
 
@@ -8088,6 +8633,26 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
     if (!files->menu_path)
         return false;
     bool writable = files->writable;
+    if (files->picker.active) {
+        /* A dialog: choosing and looking, and New folder. */
+        if (context == CONTEXT_BACKGROUND) {
+            struct menu_item *item = menu_add(menu, MENU_NEW_FOLDER, 0, "New folder");
+            item->enabled = writable;
+            snprintf(item->shortcut, sizeof item->shortcut, "Ctrl+Shift+N");
+            menu_separator(menu);
+            menu_add(menu, MENU_HIDDEN, 0, "Show hidden files")->checked = files->show_hidden;
+            menu_add(menu, MENU_SORT_LIST, 0, "Sort by")->submenu = true;
+            menu_add(menu, MENU_REFRESH, 0, "Refresh");
+        } else {
+            menu_add(menu, MENU_OPEN, 0, directory ? "Open" : picker_accept_label(files));
+            if (directory)
+                menu_add(menu, MENU_NEW_TAB, 0, "Open in new tab");
+        }
+        menu_separator(menu);
+        menu_add(menu, MENU_COPY_PATH, 0, "Copy path");
+        menu_add(menu, MENU_PROPERTIES, 0, "Properties");
+        return true;
+    }
     if (context == CONTEXT_BACKGROUND) {
         if (in_trash(files)) {
             menu_add(menu, MENU_EMPTY_TRASH, 0, "Empty trash")->enabled = files->listing.count > 0;
@@ -8165,6 +8730,22 @@ static bool build_menu(struct files *files, enum menu_context context, const cha
 }
 
 /* Build and open the right-click menu for context at x, y in the window. */
+/* The picker's file type dropdown, above or below its button. */
+static void open_filter_menu(struct files *files)
+{
+    close_menus(files);
+    struct menu *menu = &files->menus[0];
+    *menu = (struct menu){.hover = -1};
+    files->menu_context = CONTEXT_BACKGROUND;
+    files->menu_path = strdup(files->path);
+    files->menu_directory = true;
+    for (size_t i = 0; i < files->picker.filter_count; ++i)
+        menu_add(menu, MENU_FILTER, (int)i, files->picker.filters[i].name)->checked = i == files->picker.filter;
+    double scale = desk_window_scale(&files->window);
+    menu_show(files, menu, &files->window, (int)lround(files->picker.filter_left / scale),
+              (int)lround(files->picker.bar_top / scale));
+}
+
 static void open_menu(struct files *files, enum menu_context context, const char *path, bool directory,
                       bool executable, int x, int y, bool keyboard)
 {
@@ -8226,8 +8807,14 @@ static void menu_choose(struct files *files, struct menu *menu, int index, bool 
     case MENU_OPEN:
         if (directory)
             go_to(files, strdup(path), NULL);
+        else if (files->picker.active)
+            picker_accept(files);
         else
             open_file(files, path);
+        break;
+    case MENU_FILTER:
+        files->picker.filter = (size_t)which;
+        refilter(files);
         break;
     case MENU_OPEN_WITH:
         if (app)
@@ -8444,7 +9031,7 @@ static void context_key(struct files *files)
 /* Everything clickable lights up under the pointer, entries too. */
 static bool shows_hover(enum target_kind kind)
 {
-    return kind != TARGET_NONE && kind != TARGET_SEARCH && kind != TARGET_PATH;
+    return kind != TARGET_NONE && kind != TARGET_SEARCH && kind != TARGET_PATH && kind != TARGET_PICKER_NAME;
 }
 
 /* The pointer moved to something else: the tooltip goes, and comes back
@@ -8564,6 +9151,10 @@ static void press_entries(struct files *files, size_t index, unsigned mods)
     files->band_pending = true;
     files->press_row = index;
     files->press_mods = mods;
+    if (files->picker.active && index != (size_t)-1) {
+        picker_entry_pressed(files, index);
+        files->picker.name_focus = false;
+    }
     files->press_on_name = index != (size_t)-1 && on_name(files, index);
     files->band_x0 = files->band_x1 = pointer_buffer_x(files);
     files->band_y0 = files->band_y1 = content_y(files);
@@ -8734,7 +9325,22 @@ static void click(struct files *files, uint32_t time)
         break;
     case TARGET_SEARCH:
         files->search_focus = true;
+        files->picker.name_focus = false;
         field_press(files, &files->search, twice);
+        break;
+    case TARGET_PICKER_NAME:
+        files->picker.name_focus = true;
+        files->search_focus = false;
+        field_press(files, &files->picker.name, twice);
+        break;
+    case TARGET_PICKER_FILTER:
+        open_filter_menu(files);
+        break;
+    case TARGET_PICKER_BUTTON:
+        if (target.index == 1)
+            picker_accept(files);
+        else
+            picker_cancel(files);
         break;
     case TARGET_PATH:
         if (!files->path_editing)
@@ -9126,7 +9732,8 @@ static bool open_window(struct files *files)
         files->data_device = wl_data_device_manager_get_data_device(files->data_manager, files->seat);
         wl_data_device_add_listener(files->data_device, &device_listener, files);
     }
-    if (!desk_window_open(&files->window, &files->globals, "files", &window_listener, files)) {
+    if (!desk_window_open(&files->window, &files->globals, files->picker.active ? "files-picker" : "files",
+                          &window_listener, files)) {
         fprintf(stderr, "files: out of memory\n");
         return false;
     }
@@ -9272,12 +9879,30 @@ static bool run(struct files *files)
 static void usage(FILE *stream)
 {
     fputs("Usage: files [DIR | FILE]\n"
+          "       files --pick [--multiple] [--directory] [OPTION]... [DIR | FILE]\n"
+          "       files --save NAME [OPTION]... [DIR]\n"
+          "       files --portal\n"
           "\n"
           "Browse a directory, the home directory by default. A FILE opens its\n"
           "directory with it selected.\n"
           "\n"
-          "  -h, --help     Show this help\n"
-          "  -v, --version  Show the version\n"
+          "  -h, --help             Show this help\n"
+          "  -v, --version          Show the version\n"
+          "\n"
+          "As a file dialog, printing the choice, one path a line, and exiting 0, or\n"
+          "3 when cancelled:\n"
+          "  --pick                 Choose an existing file\n"
+          "  --multiple             ...or several\n"
+          "  --directory            Choose a directory instead\n"
+          "  --save NAME            Choose where to save NAME; asks before replacing\n"
+          "  --filter NAME:PATTERNS File types, as globs or MIME types separated by ';'\n"
+          "                         (Images:*.png;image/jpeg). Repeatable; the first is\n"
+          "                         chosen, and All files is added last\n"
+          "  --title TEXT           The window's title\n"
+          "  --accept LABEL         The Open or Save button's label\n"
+          "  --app-id ID            Remember the last folder for ID\n"
+          "  -0                     End each path with NUL instead of a newline\n"
+          "  --portal               Serve org.freedesktop.impl.portal.FileChooser\n"
           "\n"
           "Keys: arrows move, Enter opens, Backspace goes up, Alt+Left/Right back and\n"
           "forward, Alt+Home home, typing a name selects it, Ctrl+T/W new and close\n"
@@ -9322,19 +9947,73 @@ int main(int argc, char **argv)
     static const struct option options[] = {
         {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'v'},
+        {"pick", no_argument, NULL, 'p'},
+        {"save", required_argument, NULL, 's'},
+        {"multiple", no_argument, NULL, 'm'},
+        {"directory", no_argument, NULL, 'd'},
+        {"filter", required_argument, NULL, 'f'},
+        {"title", required_argument, NULL, 't'},
+        {"accept", required_argument, NULL, 'a'},
+        {"app-id", required_argument, NULL, 'i'},
+        {"print-filter", no_argument, NULL, 'P'},
+        {"portal", no_argument, NULL, 'R'},
         {0},
     };
+    struct picker picker = {.status = EXIT_CANCELLED};
+    bool pick = false, picker_options = false, portal = false;
+    char *save_name = NULL;
     int option;
-    while ((option = getopt_long(argc, argv, "hv", options, NULL)) != -1) {
+    while ((option = getopt_long(argc, argv, "hv0", options, NULL)) != -1) {
         switch (option) {
         case 'h': usage(stdout); return EXIT_CLOSED;
         case 'v': puts("files " FILES_VERSION); return EXIT_CLOSED;
+        case 'p': pick = true; break;
+        case 's': save_name = optarg; break;
+        case 'm': picker.multiple = picker_options = true; break;
+        case 'd': picker.directory = picker_options = true; break;
+        case 'f':
+            picker_options = true;
+            if (!picker_add_filter(&picker, optarg)) {
+                fprintf(stderr, "files: out of memory\n");
+                return EXIT_FAILED;
+            }
+            break;
+        case 't': picker.title = optarg; picker_options = true; break;
+        case 'a': picker.accept = optarg; picker_options = true; break;
+        case 'i': picker.app_id = optarg; picker_options = true; break;
+        case '0': picker.nul = picker_options = true; break;
+        case 'P': picker.print_filter = picker_options = true; break;
+        case 'R': portal = true; break;
         default: usage(stderr); return EXIT_USAGE;
         }
     }
-    if (argc - optind > 1) {
+    if (portal) {
+        if (pick || save_name || picker_options || optind < argc) {
+            usage(stderr);
+            return EXIT_USAGE;
+        }
+        return portal_main();
+    }
+    if (argc - optind > 1 || (pick && save_name) || (picker_options && !pick && !save_name) ||
+        (save_name && (picker.multiple || picker.directory))) {
         usage(stderr);
         return EXIT_USAGE;
+    }
+    if (pick || save_name) {
+        picker.active = true;
+        picker.save = save_name != NULL;
+        if (!picker_add_filter(&picker, "All files")) {
+            fprintf(stderr, "files: out of memory\n");
+            return EXIT_FAILED;
+        }
+        if (save_name) {
+            /* The name with its stem selected, so typing replaces it. */
+            desk_text_set(&picker.name.text, save_name);
+            const char *dot = strrchr(save_name, '.');
+            picker.name.text.anchor = 0;
+            picker.name.text.cursor = dot && dot != save_name ? (size_t)(dot - save_name) : strlen(save_name);
+            picker.name_focus = true;
+        }
     }
 
     struct files files = {
@@ -9364,8 +10043,24 @@ int main(int argc, char **argv)
         free(directory);
     }
     views_load(&files);
+    files.picker = picker;
+    /* A dialog starts where this application last chose, or saves to the
+       download folder. */
+    char *start = NULL;
+    if (picker.active && optind >= argc) {
+        start = picker_last(&files, picker.save);
+        if (!start && picker.save) {
+            start = user_dir(&files, "DOWNLOAD", "Downloads");
+            if (start && !is_directory(start)) {
+                free(start);
+                start = NULL;
+            }
+        }
+    }
     char *directory, *select = NULL;
-    int status = start_at(optind < argc ? argv[optind] : files.home ? files.home : "/", &directory, &select);
+    int status = start_at(optind < argc ? argv[optind] : start ? start : files.home ? files.home : "/", &directory,
+                          &select);
+    free(start);
     if (status) {
         free(files.home);
         free(files.home_real);
@@ -9474,5 +10169,8 @@ int main(int argc, char **argv)
     free(files.views_path);
     if (files.tip_timer > 0)
         close(files.tip_timer);
+    if (files.picker.active && status == EXIT_CLOSED)
+        status = files.picker.status;
+    picker_free(&files.picker);
     return status;
 }

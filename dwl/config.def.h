@@ -36,6 +36,7 @@ static const Rule rules[] = {
 	{ net_app_id,         NULL,       0,            1,           -1 },
 	{ wall_browser_app_id, NULL,      0,            1,           -1 },
 	{ "view",             NULL,       0,            1,           -1 }, /* Floats at the image's size */
+	{ "files-picker",     NULL,       0,            1,           -1 }, /* files as a file dialog, centered */
     /* default/example rule: can be changed but cannot be eliminated; at least one rule must exist */
 };
 

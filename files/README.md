@@ -6,12 +6,16 @@ It's a normal xdg-shell window with app ID `files`, so dwl tiles it like any oth
 
 ## Build
 
-On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-protocols`, `libxkbcommon`, `freetype2`, `fontconfig`, `libpng`, `libjpeg-turbo` and `libwebp` (the last three for thumbnails).
+On Arch Linux the build needs `gcc`, `make`, `pkgconf`, `wayland`, `wayland-protocols`, `libxkbcommon`, `freetype2`, `fontconfig`, `libpng`, `libjpeg-turbo` and `libwebp` (the last three for thumbnails), and `systemd-libs` (sd-bus, for the portal).
 
 ```sh
 make
 make install      # /usr/local/bin/files and files.desktop; honors PREFIX, BINDIR, DATADIR and DESTDIR
 make default      # files opens folders for other applications (xdg-mime default ... inode/directory)
+```
+
+```sh
+make portal       # files as the file dialog of other applications (see File dialog)
 ```
 
 In dwl, Super+E starts files. Without `xdg-mime`, `make default` prints the line to put under `[Default Applications]` in `~/.config/mimeapps.list`: `inode/directory=files.desktop`.
@@ -23,6 +27,7 @@ In dwl, Super+E starts files. Without `xdg-mime`, `make default` prints the line
 | Section | Key | Default | Meaning |
 |---|---|---|---|
 | `[layout]` | `font_size` | `11` | Text size in points |
+| | `opacity` | `0.8` | The background's opacity, 0.1 to 1; text stays solid |
 | `[view]` | `view` | `list` | `list` or `icons`, for folders without a view of their own |
 | | `hidden` | `false` | Show hidden files from the start (Ctrl+H toggles) |
 | | `sort` | `name` | `name`, `type`, `size` or `modified`, until a heading is clicked |
@@ -41,20 +46,51 @@ Icons are glyphs from Symbols Nerd Font, found through fontconfig's fallback for
 
 ```text
 files [DIR | FILE]
+files --pick [--multiple] [--directory] [OPTION]... [DIR | FILE]
+files --save NAME [OPTION]... [DIR]
+files --portal
 ```
 
 | Option | Meaning |
 |---|---|
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show the version |
+| `--pick` | Be a file dialog: choose an existing file |
+| `--multiple` | ...or several |
+| `--directory` | ...or a directory |
+| `--save NAME` | Choose where to save NAME, asking before replacing a file |
+| `--filter NAME:PATTERNS` | File types: globs or MIME types separated by `;` (`Images:*.png;image/jpeg`). Repeatable; the first is chosen, and All files is added last |
+| `--title TEXT` | The window's title |
+| `--accept LABEL` | The Open or Save button's label |
+| `--app-id ID` | Remember the last folder for ID |
+| `-0` | End each chosen path with NUL instead of a newline |
+| `--portal` | Serve the file dialog portal (see File dialog) |
 
 With no argument files opens the home directory. A `FILE` opens its directory with the file selected.
 
 | Exit status | Meaning |
 |---|---|
-| 0 | Closed normally |
+| 0 | Closed normally, or a file was chosen |
 | 1 | Couldn't open the directory or the display |
 | 2 | Usage error |
+| 3 | The dialog was cancelled (nothing printed) |
+
+### File dialog
+
+With `--pick` or `--save` the window is a dialog, with the app ID `files-picker` (dwl floats it centered at about 60% of the screen). A bar along the bottom has the name field when saving, the file type filter, Cancel and Open or Save. Only New folder changes anything: rename, trash, cut, paste and dropping are off, and dragging out only copies. Enter or a double-click chooses, Escape cancels. Saving starts with the name's stem selected, a name with `/` in it is a path, a folder's name goes into it, and an existing file asks before it's replaced (files never writes it; the application does). Without a DIR it starts where the same `--app-id` last opened or saved, else saving starts in the download folder. Those are kept in `~/.local/state/files/picker`.
+
+```sh
+files --pick --multiple --filter 'Images:*.png;*.jpg;image/webp' ~/Pictures
+files --save report.pdf -0 --app-id my.script
+```
+
+`files --portal` serves `org.freedesktop.impl.portal.FileChooser` on the session bus (`OpenFile`, `SaveFile`, `SaveFiles`), so applications using xdg-desktop-portal, browsers among them, get files as their file dialog. Each dialog is a `files --pick` or `--save` child; the application closing its request closes the dialog, and the service leaves after a minute with none open. `make portal` installs the D-Bus service and `~/.config/xdg-desktop-portal/dwl-portals.conf`, and the portal description under `$(DATADIR)`. xdg-desktop-portal reads descriptions only from its own system directory, so that file needs root:
+
+```sh
+sudo make portal PREFIX=/usr/local PORTALDIR=/usr/share/xdg-desktop-portal/portals
+```
+
+The system also needs `xdg-desktop-portal` installed, `XDG_CURRENT_DESKTOP=dwl` exported before dwl starts, and that variable and `WAYLAND_DISPLAY` given to D-Bus activation (`dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP` in dwl's startup). Applications' extra choices (encoding boxes and the like) come back at their defaults, and the dialog doesn't yet float over the application that opened it, since dwl doesn't export xdg-foreign handles.
 
 ## Keys
 

@@ -5,7 +5,7 @@ WAYLAND_PROTOCOLS_DIR ?= $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-pro
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
-PACKAGES = wayland-client xkbcommon freetype2 fontconfig libpng libjpeg libwebp
+PACKAGES = wayland-client xkbcommon freetype2 fontconfig libpng libjpeg libwebp libsystemd
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PKG_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 CFLAGS ?= -O2
@@ -25,7 +25,7 @@ TABLET_XML = $(P)/stable/tablet/tablet-v2.xml
 NAMES = xdg-shell viewporter fractional-scale-v1 cursor-shape-v1 tablet-v2
 HEADERS = $(NAMES:%=$(BUILD)/%-client-protocol.h)
 PROTOCOLS = $(NAMES:%=$(BUILD)/%-protocol.c)
-OBJECTS = $(BUILD)/files.o $(BUILD)/desk.o $(PROTOCOLS:.c=.o)
+OBJECTS = $(BUILD)/files.o $(BUILD)/portal.o $(BUILD)/desk.o $(PROTOCOLS:.c=.o)
 
 all: files
 
@@ -34,6 +34,9 @@ files: $(OBJECTS)
 
 $(BUILD)/files.o: files.c files.h $(HEADERS) $(DESK)/desk.h $(BUILD)/default-config.h
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(FILES_CFLAGS) -c -o $@ files.c
+
+$(BUILD)/portal.o: portal.c files.h $(HEADERS) $(DESK)/desk.h
+	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(FILES_CFLAGS) -c -o $@ portal.c
 
 $(BUILD)/desk.o: $(DESK)/desk.c $(DESK)/desk.h $(HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(FILES_CFLAGS) -c -o $@ $(DESK)/desk.c
@@ -84,4 +87,20 @@ default:
 		echo "inode/directory=files.desktop"; \
 	fi
 
-.PHONY: all clean install uninstall default
+# The file dialog for other applications, through xdg-desktop-portal: the
+# D-Bus service (activated on demand), the portal description, and
+# dwl-portals.conf sending file dialogs to files. Portal descriptions are
+# only read from the system's data directory, so this needs root for that
+# part: make portal PREFIX=/usr/local PORTALDIR=/usr/share/xdg-desktop-portal/portals
+DBUSDIR ?= $(DATADIR)/dbus-1/services
+PORTALDIR ?= $(DATADIR)/xdg-desktop-portal/portals
+PORTALCONF ?= $(HOME)/.config/xdg-desktop-portal
+
+portal: install
+	mkdir -p "$(DESTDIR)$(DBUSDIR)"
+	sed 's|@BINDIR@|$(BINDIR)|' org.freedesktop.impl.portal.desktop.files.service.in \
+		> "$(DESTDIR)$(DBUSDIR)/org.freedesktop.impl.portal.desktop.files.service"
+	install -Dm644 files.portal "$(DESTDIR)$(PORTALDIR)/files.portal"
+	install -Dm644 dwl-portals.conf "$(PORTALCONF)/dwl-portals.conf"
+
+.PHONY: all clean install uninstall default portal

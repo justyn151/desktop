@@ -17,7 +17,7 @@ Ground rules that apply to every phase:
 
 **Next, in order:**
 
-1. `files`: 0.1 to 0.3 are done (0.3's "Other application…" dialog is put off). 0.4 from [docs/files-roadmap.md](docs/files-roadmap.md) is under way: selecting, thumbnails, rename, new folder, the trash, delete and undo, then copy, cut and paste with progress and the clipboard, drag and drop, and properties are in, and 0.5 (config, views per folder, tooltips, the desktop entry and Super+E) is done. Next is 0.6, the file picker. files is a mouse-first explorer, not a keyboard-first one.
+1. `files`: 0.1 to 0.3 are done (0.3's "Other application…" dialog is put off). 0.4 from [docs/files-roadmap.md](docs/files-roadmap.md) is under way: selecting, thumbnails, rename, new folder, the trash, delete and undo, then copy, cut and paste with progress and the clipboard, drag and drop, and properties are in, 0.5 (config, views per folder, tooltips, the desktop entry and Super+E) and 0.6 (`files --pick`/`--save` and the FileChooser portal backend) are done. Next is 1.0: live checks and daily use. files is a mouse-first explorer, not a keyboard-first one.
 2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
 3. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)

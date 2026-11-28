@@ -325,6 +325,8 @@ Progress: 0.5.0 adds the config file (with `click`, `directories_first`, `[thumb
 
 ## 0.6: File picker
 
+**Done in 0.6.0.** Not done: SaveFiles doesn't check which of its names already exist in the folder chosen (they're overwritten by the application), and the parent window handle is ignored until dwl has xdg-foreign. The portal was tested with busctl on a private bus, not yet through xdg-desktop-portal, which isn't installed.
+
 files becomes the file dialog for other applications: choosing files to upload in a browser, choosing where a download goes, and any "Open…" or "Save as…" dialog. There are two parts. `files --pick` is a picker usable from the command line and scripts. `files --portal` is the portal backend that opens that picker for applications.
 
 This comes after 0.5 because a picker needs the earlier milestones: MIME types and the search field from 0.3, multiple selection and New folder from 0.4, and thumbnails from 0.5, since choosing a photo to upload is easier when you can see it.
@@ -448,5 +450,5 @@ How applications pick up the portal (to confirm against the installed versions):
 | 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Done, but for the "Other application…" dialog (put off) |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Done, but for the slow second click to rename and the trash on other drives |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Done in 0.5.0 (thumbnails, drag and drop and hover came early in 0.4) |
-| 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |
+| 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Done (0.6.0) |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Final |

@@ -1190,7 +1190,8 @@ applyrules(Client *c)
 		c->geom.y = MAX(area->y, MIN(c->geom.y, area->y + area->height - c->geom.height));
 	}
 	if (mon && c->type == XDGShell && c->isfloating && !c->isfullscreen
-			&& client_surface(c)->mapped && (wallpaper_browser || strcmp(appid, net_app_id) == 0)) {
+			&& client_surface(c)->mapped && (wallpaper_browser || strcmp(appid, net_app_id) == 0
+				|| strcmp(appid, "files-picker") == 0)) {
 		if (wallpaper_browser) {
 			struct wlr_box min, max;
 			int border = 2 * (int)c->bw;
