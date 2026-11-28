@@ -9,6 +9,7 @@ On Linux, use a C11 compiler, Make, and the system C library. Run these commands
 ```sh
 make
 ./editor notes.txt
+./editor +12 notes.txt   # start at line 12, as mark's e does
 make install
 ```
 

@@ -1531,13 +1531,34 @@ int main(int argc, char **argv)
     EditorDocument document = { { NULL, 0, 0 }, NULL, 0, 0, 0 };
     char message[256];
     int result;
-    if (argc > 2) {
-        fputs("Usage: editor [filename]\n", stderr);
+    int first = 1;
+    unsigned long line = 0;
+    /* "+N" starts at line N, as other editors take it from viewers. */
+    if (argc > 1 && argv[1][0] == '+') {
+        char *end;
+        errno = 0;
+        line = strtoul(argv[1] + 1, &end, 10);
+        if (errno || *end || end == argv[1] + 1 || argv[1][1] == '-') {
+            fputs("Usage: editor [+line] [filename]\n", stderr);
+            return 1;
+        }
+        first = 2;
+    }
+    if (argc - first > 1) {
+        fputs("Usage: editor [+line] [filename]\n", stderr);
         return 1;
     }
-    if (argc == 2 && !document_load(&document, argv[1], message, sizeof message)) {
+    if (argc - first == 1 && !document_load(&document, argv[first], message, sizeof message)) {
         fprintf(stderr, "%s\n", message);
         return 1;
+    }
+    /* The start of the line, or of the last line when there are fewer. */
+    if (first == 2) document.cursor = 0;
+    for (size_t i = 0; line > 1 && i < document.text.length; ++i) {
+        if (document.text.data[i] == '\n' && i + 1 < document.text.length) {
+            document.cursor = i + 1;
+            --line;
+        }
     }
     if (!terminal_init()) {
         fputs("Unable to initialize an interactive terminal.\n", stderr);
