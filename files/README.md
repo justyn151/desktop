@@ -117,10 +117,13 @@ The sidebar is 180 pixels wide to begin with. Drag its edge (the pointer turns i
 
 ### The list
 
-Each row has an icon and the name. Where the list is wide enough, the size (or a directory's entry count) and the date and time (`2026-11-28 14:03`) are on the right.
+A header over the list names its columns: Name, Type, Size and Modified. Each row has an icon and the name; where the list is wide enough the type, size and the date and time (`2026-11-28 14:03`) follow. The header stays in the window's font when the list is zoomed, lined up with the columns. Clicking a heading to sort comes in 0.3.
+
+- **Type** comes from the extension: `Folder`, `PNG image`, `MP4 video`, `ZIP archive`, `C source`, `Markdown file`, `PDF document`, `Program` for executables, or `TXT file` and plain `File` for the rest. Symlinks to folders say `Folder link` and broken links `Broken link`.
+- **Size** is left blank for folders.
 
 - Directories come first, then files, in natural order (`file2` before `file10`) and case-insensitively. Letters fold by ASCII case only; other characters compare by code point.
-- Directories are in the palette's accent color and hidden entries are muted. Symlinks are in italic and broken links in the urgent color, marked `broken`. A directory that can't be read counts as `?`.
+- Directories are in the palette's accent color and hidden entries are muted. Symlinks are in italic and broken links in the urgent color.
 - A name that doesn't fit is cut in the middle for files, keeping the extension (`a-very-long-na…me.tar.gz`), and at the end for directories.
 - Names that aren't valid UTF-8 show `�` for the bad bytes, but are kept as they are on disk, so they can still be entered.
 - Colors come from wall's palette (`~/.cache/wall/colors.conf`) and change with the wallpaper. Without a palette files uses its own dark colors.
@@ -159,6 +162,7 @@ files will only change things inside your home directory: that's the rule every 
 - [ ] A mounted USB stick shows under Drives and goes when it's unmounted.
 - [ ] Narrowing the window hides the sidebar.
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
+- [x] The list has a Name, Type, Size, Modified header lined up with its columns; folders have no size.
 - [ ] Tabs open, close and switch by clicking, middle-click and keys, each keeping its place.
 - [ ] Typing in the search field filters as you type; its × clears it.
 - [ ] Ctrl+wheel zooms the list and the icons, crossing from one to the other at the ends, and the zoom comes back after a restart.

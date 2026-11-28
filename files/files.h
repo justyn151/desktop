@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.2.4"
+#define FILES_VERSION "0.2.5"
 
 /* Exit statuses. */
 enum {
@@ -25,11 +25,6 @@ struct colors {
     uint32_t selection_background, selection_foreground, urgent;
 };
 
-enum {
-    COUNT_UNKNOWN = -1,   /* Not counted yet. */
-    COUNT_UNREADABLE = -2,
-};
-
 /* One directory entry. Names are kept as the bytes on disk, valid UTF-8 or
    not, so they can always be opened again. */
 struct entry {
@@ -40,8 +35,6 @@ struct entry {
     gid_t group;
     off_t size;            /* Of the target, for links. */
     struct timespec modified;
-    long items;            /* Entries in a directory, or a COUNT_ value. */
-    long hidden_items;     /* How many of those are hidden. */
     bool directory;        /* A directory, or a link to one. */
     bool link, broken, hidden, executable;
 };
@@ -69,7 +62,8 @@ struct panes {
     int sidebar_left, sidebar_right;
     int list_left, list_right;
     int divider;            /* x of the sidebar|list divider, -1 when absent. */
-    int top, rows;          /* The first line's y, and how many lines fit. */
+    int top, rows;          /* Where the sidebar and the list's area start, and how many lines fit. */
+    int entries_top;        /* The first line of entries: under the column header in the list view. */
     int place_height;       /* A sidebar row. */
     int line_height;        /* A list row, or a row of icons. */
     int columns, tile_width; /* Icons per row and their width; 1 and the list's width in the list view. */

@@ -253,7 +253,7 @@ static int listing_read(struct listing *listing, const char *path)
             listing->capacity = capacity;
         }
         struct entry *entry = &listing->entries[listing->count];
-        *entry = (struct entry){.name = strdup(name), .items = COUNT_UNKNOWN, .hidden = name[0] == '.'};
+        *entry = (struct entry){.name = strdup(name), .hidden = name[0] == '.'};
         if (!entry->name) {
             errno = ENOMEM;
             break;
@@ -290,34 +290,6 @@ static void listing_filter(struct listing *listing, bool show_hidden, const char
         if ((show_hidden || !entry->hidden) && (!search || !*search || strcasestr(entry->name, search)))
             listing->shown[listing->shown_count++] = i;
     }
-}
-
-/* Count a directory's entries once it's on screen. */
-static void count_items(const struct files *files, struct entry *entry)
-{
-    if (entry->items != COUNT_UNKNOWN)
-        return;
-    char *path = join_path(files->path, entry->name);
-    int fd = path ? open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
-    free(path);
-    DIR *directory = fd >= 0 ? fdopendir(fd) : NULL;
-    if (!directory) {
-        if (fd >= 0)
-            close(fd);
-        entry->items = COUNT_UNREADABLE;
-        return;
-    }
-    long items = 0, hidden = 0;
-    struct dirent *item;
-    while ((item = readdir(directory))) {
-        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
-            continue;
-        ++items;
-        hidden += item->d_name[0] == '.';
-    }
-    closedir(directory);
-    entry->items = items;
-    entry->hidden_items = hidden;
 }
 
 static struct entry *cursor_entry(struct files *files)
@@ -1595,7 +1567,7 @@ struct layout {
     DeskFont *font, *italic, *mono;
     int row_height, baseline;   /* baseline: from the top of a row. */
     int padding, gap, icon_width;
-    int size_width, date_width;
+    int type_width, size_width, date_width;
 };
 
 static struct layout make_layout(DeskFont *font, DeskFont *italic, DeskFont *mono, double scale)
@@ -1609,6 +1581,7 @@ static struct layout make_layout(DeskFont *font, DeskFont *italic, DeskFont *mon
         .padding = (int)lround(PADDING * scale),
         .gap = (int)lround(GAP * scale),
         .icon_width = (int)lround(metrics.height * 1.4),
+        .type_width = desk_text_width(font, "Markdown file", 13),
         .size_width = desk_text_width(mono, "1023 K", 6),
         .date_width = desk_text_width(mono, "2026-11-28 14:03", 16),
     };
@@ -1693,9 +1666,103 @@ static uint32_t entry_color(const struct files *files, const struct entry *entry
     return entry->hidden ? colors->muted : entry->directory ? colors->directory : colors->foreground;
 }
 
-/* One row of the list between x0 and x1. details: size and date on the right. */
+/* What kind of file an entry is, for the Type column: "Folder", "PNG image",
+   "C source", "Text file" and so on, from the extension. */
+static void entry_type(const struct entry *entry, char *out, size_t length)
+{
+    if (entry->broken) {
+        snprintf(out, length, "Broken link");
+        return;
+    }
+    if (entry->directory) {
+        snprintf(out, length, entry->link ? "Folder link" : "Folder");
+        return;
+    }
+    const char *dot = strrchr(entry->name, '.');
+    char extension[9] = "";
+    if (dot && dot != entry->name && strlen(dot + 1) < sizeof extension) {
+        for (size_t i = 0; dot[1 + i]; ++i)
+            extension[i] = (char)toupper((unsigned char)dot[1 + i]);
+        extension[strlen(dot + 1)] = 0;
+    }
+    const char *kind;
+    switch (entry_icon(entry)) {
+    case ICON_IMAGE: kind = "image"; break;
+    case ICON_VIDEO: kind = "video"; break;
+    case ICON_AUDIO: kind = "audio"; break;
+    case ICON_ARCHIVE: kind = "archive"; break;
+    case ICON_PDF: snprintf(out, length, "PDF document"); return;
+    case ICON_MARKDOWN: snprintf(out, length, "Markdown file"); return;
+    case ICON_CODE: kind = extension[0] ? "source" : "Makefile"; break;
+    case ICON_TEXT: kind = "file"; break;
+    case ICON_EXECUTABLE: snprintf(out, length, "Program"); return;
+    default: kind = "file"; break;
+    }
+    if (!extension[0])
+        snprintf(out, length, "%c%s", toupper((unsigned char)kind[0]), kind + 1);
+    else
+        snprintf(out, length, "%s %s", extension, kind);
+}
+
+/* Where the list's columns go between x0 and x1: name, then type, size
+   and modified on the right when there's room for them. */
+struct columns {
+    bool details;
+    int name_x, name_right;
+    int type_x, type_right;
+    int size_right;
+    int date_x;
+};
+
+static struct columns list_columns(const struct layout *layout, int x0, int x1)
+{
+    int inner = layout->padding / 2, right = x1 - inner;
+    int details = layout->type_width + layout->size_width + layout->date_width + 3 * layout->gap;
+    struct columns columns = {.name_x = x0 + inner + layout->icon_width, .name_right = right};
+    columns.details = columns.name_right - columns.name_x > 2 * details;
+    if (columns.details) {
+        columns.date_x = right - layout->date_width;
+        columns.size_right = columns.date_x - layout->gap;
+        columns.type_right = columns.size_right - layout->size_width - layout->gap;
+        columns.type_x = columns.type_right - layout->type_width;
+        columns.name_right = columns.type_x - layout->gap;
+    }
+    return columns;
+}
+
+/* Text clipped to [left, right). */
+static void draw_clipped(DeskFont *font, DeskCanvas *canvas, int left, int right, int baseline, const char *text,
+                         uint32_t color)
+{
+    DeskCanvas clipped = *canvas;
+    desk_canvas_clip(&clipped, left > canvas->clip_left ? left : canvas->clip_left, canvas->clip_top,
+                     right < canvas->clip_right ? right : canvas->clip_right, canvas->clip_bottom);
+    draw_name(font, &clipped, left, baseline, right - left, text, false, color);
+}
+
+/* The column header over the list: Name, Type, Size, Modified, in the
+   window's font, lined up with the list's columns at its zoom. */
+static void paint_header(struct files *files, DeskCanvas *canvas, const struct layout *ui,
+                         const struct layout *list, int x0, int x1, int y)
+{
+    const struct colors *colors = &files->colors;
+    struct columns columns = list_columns(list, x0, x1);
+    int baseline = y + ui->baseline, inner = list->padding / 2;
+    uint32_t color = colors->muted;
+    draw_clipped(ui->font, canvas, x0 + inner, columns.name_right, baseline, "Name", color);
+    if (columns.details) {
+        draw_clipped(ui->font, canvas, columns.type_x, columns.type_right, baseline, "Type", color);
+        int size = desk_text_width(ui->font, "Size", 4);
+        desk_text_draw(ui->font, canvas, columns.size_right - size, baseline, "Size", 4, color);
+        draw_clipped(ui->font, canvas, columns.date_x, x1, baseline, "Modified", color);
+    }
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    desk_canvas_fill(canvas, x0, y + ui->row_height - line, x1 - x0, line, mix(colors->background, colors->muted, 70));
+}
+
+/* One row of the list between x0 and x1, in columns. */
 static void draw_row(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct entry *entry,
-                     int x0, int x1, int y, bool selected, bool details)
+                     int x0, int x1, int y, bool selected, const struct columns *columns)
 {
     const struct colors *colors = &files->colors;
     if (selected)
@@ -1705,37 +1772,25 @@ static void draw_row(struct files *files, DeskCanvas *canvas, const struct layou
     draw_icon(layout->font, canvas, x0 + inner / 2, x0 + inner / 2 + layout->icon_width, baseline,
               entry_icon(entry), color);
 
-    int name_x = x0 + inner + layout->icon_width;
-    int details_width = layout->size_width + layout->gap + layout->date_width;
-    int name_right = details ? x1 - details_width - layout->gap - inner : x1 - inner;
+    int name_x = columns->name_x, name_right = columns->name_right;
     DeskCanvas clipped = *canvas;
     desk_canvas_clip(&clipped, name_x > canvas->clip_left ? name_x : canvas->clip_left, canvas->clip_top,
                      name_right < canvas->clip_right ? name_right : canvas->clip_right, canvas->clip_bottom);
     draw_name(entry->link ? layout->italic : layout->font, &clipped, name_x, baseline, name_right - name_x,
               entry->name, entry->directory, color);
-    if (!details)
+    if (!columns->details)
         return;
 
     uint32_t detail_color = selected ? colors->selection_foreground : colors->muted;
-    char size[32], date[32];
-    if (entry->directory) {
-        count_items(files, entry);
-        long items = files->show_hidden ? entry->items : entry->items - entry->hidden_items;
-        if (entry->items == COUNT_UNREADABLE)
-            snprintf(size, sizeof size, "?");
-        else
-            snprintf(size, sizeof size, "%ld", items);
-    } else if (entry->broken) {
-        snprintf(size, sizeof size, "broken");
-    } else {
-        format_size(entry->size, size, sizeof size);
-    }
+    char type[48], size[32] = "", date[32];
+    entry_type(entry, type, sizeof type);
+    if (!entry->directory && !entry->broken)
+        format_size(entry->size, size, sizeof size); /* Folders have no size. */
     format_date(&entry->modified, date, sizeof date);
-    int right = x1 - inner;
-    int date_x = right - desk_text_width(layout->mono, date, strlen(date));
-    int size_x = right - layout->date_width - layout->gap - desk_text_width(layout->mono, size, strlen(size));
+    draw_clipped(layout->font, canvas, columns->type_x, columns->type_right, baseline, type, detail_color);
+    int size_x = columns->size_right - desk_text_width(layout->mono, size, strlen(size));
     desk_text_draw(layout->mono, canvas, size_x, baseline, size, strlen(size), detail_color);
-    desk_text_draw(layout->mono, canvas, date_x, baseline, date, strlen(date), detail_color);
+    desk_text_draw(layout->mono, canvas, columns->date_x, baseline, date, strlen(date), detail_color);
 }
 
 /* Why there's nothing to show, or NULL when there is. */
@@ -1757,12 +1812,11 @@ static void paint_list(struct files *files, DeskCanvas *canvas, const struct lay
                        int y, int rows)
 {
     struct listing *listing = &files->listing;
-    int name_room = x1 - x0 - layout->icon_width - layout->padding;
-    bool details = name_room > 2 * (layout->size_width + layout->gap + layout->date_width);
+    struct columns columns = list_columns(layout, x0, x1);
     for (int row = 0; row < rows && files->top + (size_t)row < listing->shown_count; ++row) {
         size_t index = files->top + (size_t)row;
         draw_row(files, canvas, layout, &listing->entries[listing->shown[index]], x0, x1,
-                 y + row * layout->row_height, index == files->cursor, details);
+                 y + row * layout->row_height, index == files->cursor, &columns);
     }
 }
 
@@ -2221,7 +2275,9 @@ static void paint(struct files *files, DeskCanvas *canvas)
         panes->tile_width = list_width;
         panes->line_height = list.row_height;
     }
-    int rows = (bottom - top) / panes->line_height;
+    /* The list view has a column header over the entries. */
+    panes->entries_top = files->view == VIEW_LIST ? top + ui.row_height + ui.padding / 4 : top;
+    int rows = (bottom - panes->entries_top) / panes->line_height;
     panes->rows = rows < 1 ? 1 : rows;
     files->page_rows = panes->rows;
     files->row_height = panes->line_height;
@@ -2240,6 +2296,12 @@ static void paint(struct files *files, DeskCanvas *canvas)
                       (bottom - top) / ui.row_height);
     }
 
+    if (files->view == VIEW_LIST) {
+        DeskCanvas header = *canvas;
+        desk_canvas_clip(&header, panes->list_left, top, panes->list_right, panes->entries_top);
+        paint_header(files, &header, &ui, &list, panes->list_left, panes->list_right, top);
+    }
+    top = panes->entries_top;
     DeskCanvas area = *canvas;
     desk_canvas_clip(&area, panes->list_left, top, panes->list_right, bottom);
     uint32_t message_color;
@@ -2445,7 +2507,9 @@ static struct target target_at(const struct files *files)
         if (row >= 0 && (size_t)row < files->place_count && files->places[row].path)
             return (struct target){TARGET_PLACE, (size_t)row};
     } else if (x >= panes->list_left && x < panes->list_right && panes->line_height > 0 && panes->tile_width > 0) {
-        size_t line = files->top + (size_t)((y - panes->top) / panes->line_height);
+        if (y < panes->entries_top)
+            return (struct target){TARGET_NONE, 0}; /* The column header. */
+        size_t line = files->top + (size_t)((y - panes->entries_top) / panes->line_height);
         size_t column = (size_t)((x - panes->list_left) / panes->tile_width);
         size_t index = line * columns(files) + column;
         if (column < columns(files) && index < files->listing.shown_count && !empty_message(files, &(uint32_t){0}))

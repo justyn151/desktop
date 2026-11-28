@@ -51,7 +51,7 @@ Moving view onto the keyboard and window pieces happens in the same milestone th
 
 ### Drawing
 
-- One list row per entry: icon glyph, name, and right-aligned details (size for files, entry count for directories, modified date), in the UI font (`sans-serif`, which is Noto Sans), sizes in `monospace` digits so they line up.
+- One list row per entry: icon glyph, name, and right-aligned details (size for files, modified date; directories counted their entries until 0.2.5), in the UI font (`sans-serif`, which is Noto Sans), sizes in `monospace` digits so they line up.
 - The selection is a full-width bar in the palette's selection colors. Directories in the accent color, hidden entries muted, symlinks in italic, broken links in the urgent color.
 - Every frame is drawn on the CPU into the shm buffer, like view. Scrolling a long directory redraws only the list; text is cached per glyph, so a full redraw at 4K stays well under a frame.
 - Names that don't fit are cut with `…` in the middle for files (`a-very-long-na…me.tar.gz` keeps the extension) and at the end for directories.
@@ -117,7 +117,7 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 - **Toolbar:** a sidebar button, back, forward and up, then the path as pieces to click, with `read-only` or `root` at its end. Back and forward keep the last 100 directories and skip any deleted since. A path too long for the box folds its start into `…`.
 - **Sidebar:** Home, then the user folders that exist (Desktop, Documents, Downloads, Music, Pictures, Videos, from `user-dirs.dirs` or the usual names), File system (`/`), and under a Drives heading whatever is mounted in `/run/media`, `/media` or `/mnt`. It follows `/proc/self/mountinfo`, so a drive shows up when it's mounted and goes when it's unmounted. The place you're in is highlighted. Bookmarks join it in 0.3.
 - The sidebar is 180 logical pixels wide to begin with. Its edge can be dragged (no narrower than 100, no wider than half the window), and the width and whether it's shown are kept in `~/.local/state/files/state`. Under 60 cells of width it hides itself.
-- **The list:** the current directory, with size and date on the right where there's room.
+- **The list:** the current directory under a column header, Name, Type, Size and Modified, the last three where there's room. Type comes from the extension (`PNG image`, `C source`, `Folder`); folders have no size. Added in 0.2.5; clicking a heading to sort by it stays in 0.3.
 - **Mouse** (brought forward from 0.5): click selects, double-click enters a directory, a place goes there, and the wheel scrolls the list without moving the selection. The mouse's side buttons go back and forward.
 - **Tabs** along the top, each with its own directory, selection, history and search: Ctrl+T, Ctrl+W (the last tab closes the window), Ctrl+Tab, Alt+1–9, a × on each and a `+`, and middle-click on a directory, place or path piece to open it in a background tab.
 - **Search** in a field beside the path (Ctrl+F): it filters the current directory as you type, ignoring ASCII case. Going elsewhere ends it. Brought forward from 0.3.
@@ -181,7 +181,7 @@ A popup menu (desk's new `xdg_popup` piece) at the pointer. Keyboard users reach
 
 ### Sorting and the details view
 
-- The list gets a header row: Name, Size, Modified, Type. Clicking a heading sorts by it, clicking again reverses, and an arrow marks the sorted column. Dragging between headings resizes the columns. Directories stay first either way.
+- The header row (Name, Type, Size, Modified, there since 0.2) becomes clickable: clicking a heading sorts by it, clicking again reverses, and an arrow marks the sorted column. Dragging between headings resizes the columns. Directories stay first either way.
 - The sort and column widths are kept in the state file.
 
 ### Keys
