@@ -1,7 +1,6 @@
 #ifndef FILES_H
 #define FILES_H
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -11,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.2.1"
+#define FILES_VERSION "0.2.2"
 
 /* Exit statuses. */
 enum {
@@ -56,70 +55,21 @@ struct listing {
     int error;         /* errno when the directory couldn't be read, else 0. */
 };
 
-enum preview_kind {
-    PREVIEW_DIRECTORY, /* listing */
-    PREVIEW_IMAGE,     /* pixels */
-    PREVIEW_TEXT,      /* text, possibly empty */
-    PREVIEW_BINARY,    /* Not text: the entry's details are shown. */
-    PREVIEW_ERROR,     /* message */
+/* An entry in the sidebar: a place to go, or a heading over a group. */
+struct place {
+    char *name;
+    char *path;             /* NULL for a heading. */
+    uint32_t icon;
 };
 
-/* A finished preview of one version of a file or directory, built by a
-   worker thread and then owned by the main thread's cache. */
-struct preview {
-    char *path;
-    struct timespec modified;
-    off_t size;
-    int box_width, box_height; /* Images: the box, in buffer pixels, it was scaled to fit. */
-    enum preview_kind kind;
-    struct listing listing;
-    uint32_t *pixels;          /* Premultiplied ARGB, width × height. */
-    int width, height;
-    int image_width, image_height; /* As decoded, before fitting. */
-    char *text;
-    size_t text_length;
-    char message[192];
-    unsigned long used;        /* For evicting the least recently used. */
-    struct preview *next;      /* In the list of finished previews. */
-};
-
-/* A request to a worker: what to preview and how big an image may be. */
-struct job {
-    char *path;
-    struct timespec modified;
-    off_t size;
-    bool directory;
-    int box_width, box_height;
-};
-
-#define PREVIEW_CACHE 16
-
-/* Worker 0 reads directories and text, worker 1 decodes images, so a large
-   image never holds up a directory preview. A new request replaces one the
-   worker hasn't started. */
-enum { WORKER_GENERAL, WORKER_IMAGE, WORKER_COUNT };
-
-struct worker {
-    pthread_t thread;
-    pthread_cond_t wake;
-    struct job *pending;   /* Guarded by files.lock. */
-    bool started;
-    struct files *files;
-    char *sent;            /* Main thread: the key of the last request, until its result arrives. */
-};
-
-/* Where the columns were drawn in the last frame, in buffer pixels, so the
-   dividers between them can be dragged and rows clicked. */
-struct columns {
-    bool shown[3];          /* Parent, current, preview. */
-    int left[3], right[3];
-    int divider[2];         /* x of parent|current and current|preview, -1 when absent. */
-    int inner;              /* The width the shown columns share. */
+/* Where the sidebar and the list were drawn in the last frame, in buffer
+   pixels, for the pointer. */
+struct panes {
+    bool sidebar;           /* Shown in this frame. */
+    int sidebar_left, sidebar_right;
+    int list_left, list_right;
+    int divider;            /* x of the sidebar|list divider, -1 when absent. */
     int top, rows;          /* The first row's y, and how many fit. */
-    size_t parent_top;      /* First row shown in the parent column. */
-    bool preview_listing;   /* The preview is a directory's listing... */
-    int preview_y;          /* ...drawn from this y... */
-    size_t preview_top;     /* ...starting at this row. */
 };
 
 /* One piece of the path in the toolbar: a directory to go to. */
@@ -128,7 +78,7 @@ struct crumb {
     size_t start, end;      /* Its name is path[start, end); its path the first end bytes. */
 };
 
-enum { BUTTON_BACK, BUTTON_FORWARD, BUTTON_UP, BUTTON_COUNT };
+enum { BUTTON_SIDEBAR, BUTTON_BACK, BUTTON_FORWARD, BUTTON_UP, BUTTON_COUNT };
 
 /* The toolbar as drawn: buttons, then the path box. */
 struct toolbar {
@@ -144,10 +94,9 @@ enum target_kind {
     TARGET_NONE,
     TARGET_BUTTON,          /* index: BUTTON_ */
     TARGET_CRUMB,           /* index into toolbar.crumbs */
-    TARGET_DIVIDER,         /* index: 0 or 1 */
-    TARGET_PARENT,          /* index: a row of the parent column */
-    TARGET_CURRENT,         /* index: a row of the current column */
-    TARGET_PREVIEW,         /* index: a row of the previewed listing, or SIZE_MAX elsewhere */
+    TARGET_DIVIDER,
+    TARGET_PLACE,           /* index into places */
+    TARGET_ROW,             /* index: a row of the list */
 };
 
 struct target {
@@ -179,16 +128,17 @@ struct files {
     size_t cursor;            /* Index into listing.shown. */
     size_t top;               /* First row on screen. */
     bool show_hidden;
-    struct listing parent;    /* The parent directory, for the left column. */
-    size_t parent_cursor;     /* The current directory in it, or SIZE_MAX. */
     bool free_scroll;         /* Scrolled with the wheel: the cursor may be off screen. */
     struct history back, forward;
 
-    bool show_preview;
-    double weights[3];        /* Column widths as parent : current : preview. */
-    struct columns columns;
+    struct place *places;     /* The sidebar: home, its folders, /, mounted drives. */
+    size_t place_count;
+    int mounts;               /* /proc/self/mountinfo, polled for drives coming and going. */
+    bool show_sidebar;
+    double sidebar_width;     /* Logical pixels. */
+    struct panes panes;
     struct toolbar toolbar;
-    char *state_path;         /* Remembers the column widths between runs. */
+    char *state_path;         /* Remembers the sidebar between runs. */
 
     /* Changing files is allowed only inside home (home_real, symlinks
        resolved), unless running as root. */
@@ -196,23 +146,12 @@ struct files {
     bool root;
     bool writable;            /* The current directory may be changed. */
 
-    long preview_scroll;      /* Lines or rows scrolled with J and K. */
-    char *preview_path;       /* What the scroll applies to. */
-    struct preview *cache[PREVIEW_CACHE];
-    unsigned long preview_clock;
-    pthread_mutex_t lock;     /* Guards the workers' pending jobs, done and stopping. */
-    struct worker workers[WORKER_COUNT];
-    struct preview *done;     /* Finished, waiting for the main thread. */
-    int done_fd;              /* eventfd, written when done grows. */
-    bool stopping;
-
     struct memory *memories;
     size_t memory_count, memory_capacity;
 
     /* The current directory, watched for changes. */
     int inotify;              /* -1 when unavailable. */
     int watch;                /* The directory's watch descriptor, or -1. */
-    int parent_watch;         /* The parent's, or -1. */
     int refresh;              /* timerfd that coalesces bursts of changes. */
     bool refresh_armed;
 
@@ -233,7 +172,7 @@ struct files {
     uint32_t pointer_serial;
     double pointer_x, pointer_y;  /* Logical surface coordinates. */
     struct target hover;      /* What the pointer is over. */
-    int drag;                 /* The divider being dragged, or -1. */
+    bool drag;                /* The divider is being dragged. */
     struct target press;      /* The last click, for telling a double-click... */
     uint32_t press_time;      /* ...by its time. */
     double scroll_pixels;     /* Touchpad scrolling not yet a whole row. */

@@ -96,6 +96,6 @@ This covers Phase 3 step 4 for toplevels; layer-shell setup is still in each app
 | shot | Atomic files and shared memory since 0.1; config, INI and shm buffers since 0.2 |
 | wall | Image decoding (its own decoders moved here for view) |
 | view | Image decoding and shm buffers since 0.1; key repeat since 0.2; file watch since 0.3; GIF, WebP and EXIF orientation since 0.4; palette, INI config and paths since 0.5; window and keyboard since files 0.1 |
-| files | Window, keyboard, fonts, canvas, key repeat, palette and file watch since 0.1; image decoding since 0.2 |
+| files | Window, keyboard, fonts, canvas, key repeat, palette and file watch since 0.1 (image decoding for previews in 0.2.0 and 0.2.1, back with thumbnails in 0.5) |
 
 net, dwl, bar, run and wall still have their own palette parsers. Moving them is Phase 3 step 1.

@@ -13,7 +13,7 @@ Ground rules that apply to every phase:
 
 ## Where things stand (2026-11-28)
 
-**Now:** `mark`'s features are all in (0.1 to 0.5: parser, GitHub extensions, pager, links and search, config and palette), and so are `view`'s. What's left for both is 1.0, mostly live checks and a week of daily use, so they run alongside the next app instead of blocking it. The app in progress is `files`, the graphical file manager, pulled forward from Phase 5 the way view and mark were: it's the last big piece of daily use still handled by something outside the desktop. 0.1 and 0.2 are in: Miller columns with previews, keyboard navigation and live refresh. Details for view and mark are in [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
+**Now:** `mark`'s features are all in (0.1 to 0.5: parser, GitHub extensions, pager, links and search, config and palette), and so are `view`'s. What's left for both is 1.0, mostly live checks and a week of daily use, so they run alongside the next app instead of blocking it. The app in progress is `files`, the graphical file manager, pulled forward from Phase 5 the way view and mark were: it's the last big piece of daily use still handled by something outside the desktop. 0.1 and 0.2 are in: an explorer layout (toolbar, sidebar of places, the list), keyboard and mouse navigation and live refresh. Details for view and mark are in [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
 
 **Next, in order:**
 
@@ -31,7 +31,7 @@ Ground rules that apply to every phase:
 
 | What | Result |
 |---|---|
-| files 0.2 | Miller columns (parent, current, preview), previews of directories, images and text made on worker threads and cached, details for everything else; date and time on every entry. A toolbar with back, forward and up and a clickable path replaced the status line, and the mouse works: click, double-click, wheel, side buttons. Columns resize by dragging or `<`/`>`, kept between runs. Outside home is read-only unless root (the rule 0.4's operations follow). desk gained `desk_canvas_blit` |
+| files 0.2 | An explorer layout: a toolbar (sidebar toggle, back, forward, up, clickable path) and a sidebar of places (home folders, `/`, mounted drives) beside the list; date and time on every entry. The mouse works: click, double-click, wheel, side buttons, dragging the sidebar's edge, kept between runs. Outside home is read-only unless root (the rule 0.4's operations follow). It began as Miller columns with previews on worker threads (`14b4e7f`), replaced in 0.2.2. desk gained `desk_canvas_blit` |
 | files 0.1 | One directory: keyboard navigation, selection remembered per directory, live refresh, Nerd Font icons, palette colors. desk gained fonts with fallback (`-DDESK_FONT`), the keyboard and an xdg-shell window; view moved onto the last two. Key checks pending |
 | shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
 | view 0.1 | One image fitted to the window, sharp at any scale |
@@ -232,12 +232,12 @@ The detailed plan is in [docs/view-roadmap.md](docs/view-roadmap.md). Built on d
 
 ### files
 
-A graphical file manager with Miller columns (parent, current, preview) and H/J/K/L navigation, pulled forward after view and mark. The detailed plan is in [docs/files-roadmap.md](docs/files-roadmap.md). Icons are Nerd Font glyphs in palette colors, so it needs no icon theme; opening files resolves `mimeapps.list` and desktop entries itself, so it doesn't need xdg-utils. It's also the file picker for other apps (choosing uploads, where downloads go, Open and Save dialogs) through its own FileChooser portal backend, which needs `xdg-desktop-portal` installed.
+A graphical file manager with an explorer layout (toolbar, sidebar of places, the list) and H/J/K/L navigation, pulled forward after view and mark. The detailed plan is in [docs/files-roadmap.md](docs/files-roadmap.md). Icons are Nerd Font glyphs in palette colors, so it needs no icon theme; opening files resolves `mimeapps.list` and desktop entries itself, so it doesn't need xdg-utils. It's also the file picker for other apps (choosing uploads, where downloads go, Open and Save dialogs) through its own FileChooser portal backend, which needs `xdg-desktop-portal` installed.
 
 | Version | Milestone | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Miller columns, previews of directories, images and text, toolbar with back, forward and the path, mouse | Done (live key and mouse checks pending) |
+| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse | Done (live key and mouse checks pending) |
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
 | 0.5 | Right-click, drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
@@ -314,7 +314,7 @@ These are the pieces a laptop daily driver needs that aren't one of the 27 proje
 | 14 | `power` | Session and power controls: logout, suspend, reboot, shutdown |
 | 15 | `mount` | Storage and removable-device manager (udisks2) |
 | 16 | `view` | Image viewer |
-| 17 | `files` | Graphical file manager with Miller columns and H/J/K/L navigation; roadmap in `docs/files-roadmap.md` |
+| 17 | `files` | Graphical file manager with an explorer layout and H/J/K/L navigation; roadmap in `docs/files-roadmap.md` |
 | 18 | `ctl` | Desktop configuration tool for fonts, theme and shared settings |
 | 19 | `music` | Local music player |
 | 20 | `video` | Video frontend, with mpv as the playback backend |

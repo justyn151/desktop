@@ -31,18 +31,12 @@
 #define SCROLL_MARGIN 3       /* Rows kept visible above and below the cursor. */
 #define REFRESH_DELAY_MS 100  /* Changes are gathered this long before rereading. */
 #define MAX_REPEATS 8         /* Repeats handled at once after a stall. */
-#define TEXT_LIMIT 32768      /* Bytes of a file read for a text preview. */
-#define SNIFF_LIMIT 4096      /* Bytes checked to tell text from binary. */
-#define IMAGE_LIMIT (64u << 20) /* Largest decoded image for a preview, in bytes. */
-#define TAB_WIDTH 4
-#define PARENT_CELLS 60       /* Narrower than this, the parent column goes. */
-#define PREVIEW_CELLS 40      /* Narrower than this, the preview goes too. */
-#define MIN_COLUMN_SHARE 0.1  /* No column narrower than this share of the shown width. */
-#define RESIZE_STEP 0.05      /* < and > move a divider by this share of the width. */
+#define SIDEBAR_CELLS 60      /* Narrower than this, the sidebar goes. */
+#define SIDEBAR_WIDTH 180     /* Logical pixels, to begin with. */
+#define SIDEBAR_MIN 100       /* No narrower than this, and no wider than half the window. */
+#define SIDEBAR_STEP 20       /* < and > change the width by this. */
 #define DIVIDER_GRAB 5        /* Logical pixels either side of a divider that grab it. */
 #define DOUBLE_CLICK_MS 400
-
-static const double default_weights[3] = {1, 2, 3};
 
 /* Nerd Font icons (Font Awesome and Octicons ranges of Symbols Nerd Font). */
 #define ICON_FOLDER 0xf07b
@@ -58,6 +52,9 @@ static const double default_weights[3] = {1, 2, 3};
 #define ICON_CODE 0xf1c9
 #define ICON_MARKDOWN 0xf48a
 #define ICON_EXECUTABLE 0xf489
+#define ICON_HOME 0xf015
+#define ICON_DISK 0xf0a0
+#define ICON_DRIVE 0xf287
 
 /* Colors without a palette. */
 static const struct colors default_colors = {
@@ -388,18 +385,6 @@ static void watch_directory(struct files *files)
     files->watch = inotify_add_watch(files->inotify, files->path,
                                      IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB |
                                          IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR);
-    /* The parent too, for its column. Its own removal shows up as the current one's. */
-    if (files->parent_watch >= 0 && files->parent_watch != files->watch)
-        inotify_rm_watch(files->inotify, files->parent_watch);
-    files->parent_watch = -1;
-    if (strcmp(files->path, "/") != 0) {
-        char *parent = parent_path(files->path);
-        if (parent)
-            files->parent_watch = inotify_add_watch(files->inotify, parent,
-                                                    IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
-                                                        IN_ATTRIB | IN_ONLYDIR);
-        free(parent);
-    }
 }
 
 static void arm_refresh(struct files *files)
@@ -447,38 +432,31 @@ static char *state_path(void)
     return length < 0 ? NULL : path;
 }
 
-static bool parse_weights(const char *text, double weights[3])
-{
-    double parsed[3];
-    char *end;
-    for (int i = 0; i < 3; ++i) {
-        parsed[i] = strtod(text, &end);
-        if (end == text || !(parsed[i] > 0) || parsed[i] > 100 || (i < 2 && *end != ':'))
-            return false;
-        text = end + (i < 2);
-    }
-    if (*end)
-        return false;
-    memcpy(weights, parsed, sizeof parsed);
-    return true;
-}
-
 static void state_entry(void *data, const char *section, const char *key, const char *value, int line)
 {
     (void)line;
     struct files *files = data;
-    if (key && strcmp(section, "layout") == 0 && strcmp(key, "columns") == 0)
-        parse_weights(value, files->weights);
+    if (!key || strcmp(section, "layout") != 0)
+        return;
+    if (strcmp(key, "sidebar") == 0) {
+        char *end;
+        double width = strtod(value, &end);
+        if (end != value && !*end && width >= SIDEBAR_MIN && width <= 4000)
+            files->sidebar_width = width;
+    } else if (strcmp(key, "show_sidebar") == 0) {
+        files->show_sidebar = strcmp(value, "no") != 0;
+    }
 }
 
 static void load_state(struct files *files)
 {
-    memcpy(files->weights, default_weights, sizeof files->weights);
+    files->sidebar_width = SIDEBAR_WIDTH;
+    files->show_sidebar = true;
     if (files->state_path)
         desk_ini_load(files->state_path, state_entry, files);
 }
 
-/* Write the state atomically. Failing only loses the widths, so it's quiet. */
+/* Write the state atomically. Failing only loses the layout, so it's quiet. */
 static void save_state(struct files *files)
 {
     if (!files->state_path)
@@ -492,11 +470,171 @@ static void save_state(struct files *files)
     DeskAtomic atomic;
     if (desk_atomic_open(&atomic, files->state_path, 0600) != 0)
         return;
-    fprintf(atomic.file, "# Written by files. Column widths as parent : current : preview.\n[layout]\n"
-                         "columns = %.3f:%.3f:%.3f\n",
-            files->weights[0], files->weights[1], files->weights[2]);
+    fprintf(atomic.file, "# Written by files. The sidebar's width in logical pixels.\n[layout]\n"
+                         "sidebar = %.0f\nshow_sidebar = %s\n",
+            files->sidebar_width, files->show_sidebar ? "yes" : "no");
     desk_atomic_commit(&atomic, true);
     desk_atomic_abort(&atomic); /* Frees what's left, after success or failure. */
+}
+
+/* Places */
+
+static bool is_directory(const char *path)
+{
+    struct stat info;
+    return stat(path, &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+static void places_free(struct place *places, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        free(places[i].name);
+        free(places[i].path);
+    }
+    free(places);
+}
+
+/* Append a place, copying name and path; a NULL path makes a heading. */
+static void add_place(struct place **places, size_t *count, const char *name, const char *path, uint32_t icon)
+{
+    struct place *grown = realloc(*places, (*count + 1) * sizeof *grown);
+    if (!grown)
+        return;
+    *places = grown;
+    char *name_copy = strdup(name), *path_copy = path ? strdup(path) : NULL;
+    if (!name_copy || (path && !path_copy)) {
+        free(name_copy);
+        free(path_copy);
+        return;
+    }
+    grown[(*count)++] = (struct place){name_copy, path_copy, icon};
+}
+
+/* A folder from user-dirs.dirs (XDG_key_DIR="$HOME/..."), else ~/fallback. */
+static char *user_dir(const struct files *files, const char *key, const char *fallback)
+{
+    const char *config = getenv("XDG_CONFIG_HOME");
+    char *file = NULL, *found = NULL;
+    if (config && config[0] == '/') {
+        if (asprintf(&file, "%s/user-dirs.dirs", config) < 0)
+            file = NULL;
+    } else if (asprintf(&file, "%s/.config/user-dirs.dirs", files->home) < 0) {
+        file = NULL;
+    }
+    FILE *stream = file ? fopen(file, "re") : NULL;
+    free(file);
+    if (stream) {
+        char line[PATH_MAX + 64], prefix[64];
+        snprintf(prefix, sizeof prefix, "XDG_%s_DIR=\"", key);
+        size_t prefix_length = strlen(prefix);
+        while (!found && fgets(line, sizeof line, stream)) {
+            if (strncmp(line, prefix, prefix_length) != 0)
+                continue;
+            char *value = line + prefix_length, *quote = strrchr(value, '"');
+            if (!quote)
+                continue;
+            *quote = 0;
+            if (strncmp(value, "$HOME", 5) == 0 && (value[5] == '/' || value[5] == 0)) {
+                if (asprintf(&found, "%s%s", files->home, value + 5) < 0)
+                    found = NULL;
+            } else if (value[0] == '/') {
+                found = strdup(value);
+            }
+        }
+        fclose(stream);
+    }
+    if (!found && asprintf(&found, "%s/%s", files->home, fallback) < 0)
+        found = NULL;
+    size_t length = found ? strlen(found) : 0;
+    while (length > 1 && found[length - 1] == '/')
+        found[--length] = 0;
+    return found;
+}
+
+/* Undo mountinfo's octal escapes (\040 for a space) in place. */
+static void unescape_mount(char *text)
+{
+    char *out = text;
+    for (const char *in = text; *in;) {
+        if (in[0] == '\\' && in[1] >= '0' && in[1] <= '3' && in[2] >= '0' && in[2] <= '7' && in[3] >= '0' &&
+            in[3] <= '7') {
+            *out++ = (char)((in[1] - '0') * 64 + (in[2] - '0') * 8 + (in[3] - '0'));
+            in += 4;
+        } else {
+            *out++ = *in++;
+        }
+    }
+    *out = 0;
+}
+
+/* Drives mounted where removable ones go: /run/media, /media and /mnt. */
+static void add_drives(struct place **places, size_t *count)
+{
+    FILE *stream = fopen("/proc/self/mountinfo", "re");
+    if (!stream)
+        return;
+    static const char *const roots[] = {"/run/media/", "/media/", "/mnt/"};
+    bool heading = false;
+    char line[PATH_MAX * 2 + 256];
+    while (fgets(line, sizeof line, stream)) {
+        /* The mount point is the fifth field. */
+        char *save, *field = strtok_r(line, " ", &save);
+        for (int i = 1; field && i < 5; ++i)
+            field = strtok_r(NULL, " ", &save);
+        if (!field)
+            continue;
+        unescape_mount(field);
+        bool removable = false;
+        for (size_t i = 0; i < sizeof roots / sizeof *roots; ++i)
+            removable |= strncmp(field, roots[i], strlen(roots[i])) == 0;
+        if (!removable)
+            continue;
+        /* /run/media/$USER itself can be a mount: only what's inside it counts. */
+        if (strncmp(field, "/run/media/", 11) == 0 && !strchr(field + 11, '/'))
+            continue;
+        bool seen = false;
+        for (size_t i = 0; i < *count && !seen; ++i)
+            seen = (*places)[i].path && strcmp((*places)[i].path, field) == 0;
+        if (seen)
+            continue;
+        if (!heading) {
+            add_place(places, count, "Drives", NULL, 0);
+            heading = true;
+        }
+        add_place(places, count, base_name(field), field, ICON_DRIVE);
+    }
+    fclose(stream);
+}
+
+/* The sidebar: home and the usual folders in it that exist, the whole file
+   system, then mounted drives. Made again on every load, so new folders
+   and drives show up. */
+static void build_places(struct files *files)
+{
+    struct place *places = NULL;
+    size_t count = 0;
+    if (files->home && is_directory(files->home)) {
+        add_place(&places, &count, "Home", files->home, ICON_HOME);
+        static const struct {
+            const char *key, *fallback;
+            uint32_t icon;
+        } folders[] = {
+            {"DESKTOP", "Desktop", 0xf108},  {"DOCUMENTS", "Documents", 0xf0f6},
+            {"DOWNLOAD", "Downloads", 0xf019}, {"MUSIC", "Music", 0xf001},
+            {"PICTURES", "Pictures", 0xf03e}, {"VIDEOS", "Videos", 0xf03d},
+        };
+        for (size_t i = 0; i < sizeof folders / sizeof *folders; ++i) {
+            char *path = user_dir(files, folders[i].key, folders[i].fallback);
+            if (path && strcmp(path, files->home) != 0 && is_directory(path))
+                add_place(&places, &count, base_name(path), path, folders[i].icon);
+            free(path);
+        }
+    }
+    add_place(&places, &count, "File system", "/", ICON_DISK);
+    add_drives(&places, &count);
+    places_free(files->places, files->place_count);
+    files->places = places;
+    files->place_count = count;
 }
 
 /* Navigation */
@@ -510,27 +648,12 @@ static void update_title(struct files *files)
 
 /* Replace the listing with path's, keeping the cursor on keep (a name) when
    it's still there, else near the old position. */
-static void load_parent(struct files *files)
-{
-    listing_free(&files->parent);
-    files->parent_cursor = SIZE_MAX;
-    if (strcmp(files->path, "/") == 0)
-        return;
-    char *parent = parent_path(files->path);
-    if (!parent)
-        return;
-    listing_read(&files->parent, parent);
-    listing_filter(&files->parent, files->show_hidden);
-    find_shown(&files->parent, base_name(files->path), &files->parent_cursor);
-    free(parent);
-}
-
 static void load(struct files *files, const char *keep, size_t near)
 {
     listing_free(&files->listing);
     listing_read(&files->listing, files->path);
     listing_filter(&files->listing, files->show_hidden);
-    load_parent(files);
+    build_places(files);
     files->writable = may_modify(files, files->path);
     if (!select_name(files, keep))
         files->cursor = near < files->listing.shown_count ? near
@@ -599,12 +722,6 @@ static void go_to(struct files *files, char *path, const char *select)
         history_clear(&files->forward);
     }
     enter(files, path, select);
-}
-
-static bool is_directory(const char *path)
-{
-    struct stat info;
-    return stat(path, &info) == 0 && S_ISDIR(info.st_mode);
 }
 
 /* Back (from back, onto forward) or forward (the other way), skipping
@@ -697,10 +814,6 @@ static void watch_events(struct files *files)
         for (char *at = buffer; at < buffer + length;) {
             const struct inotify_event *event = (const struct inotify_event *)at;
             at += sizeof *event + event->len;
-            if (event->wd == files->parent_watch && event->wd != files->watch) {
-                changed = true;
-                continue;
-            }
             if (event->wd != files->watch)
                 continue;
             if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT | IN_IGNORED))
@@ -750,17 +863,6 @@ static void scroll_rows(struct files *files, long rows)
     }
 }
 
-static void scroll_preview(struct files *files, long rows)
-{
-    long scroll = files->preview_scroll + rows;
-    if (scroll < 0)
-        scroll = 0;
-    if (scroll != files->preview_scroll) {
-        files->preview_scroll = scroll; /* Painting stops it at the end. */
-        desk_window_redraw(&files->window);
-    }
-}
-
 /* Half a page, moving the view with the cursor like a pager. */
 static void scroll_half(struct files *files, int direction)
 {
@@ -782,9 +884,6 @@ static void toggle_hidden(struct files *files)
     size_t old = files->cursor < listing->shown_count ? listing->shown[files->cursor] : 0;
     files->show_hidden = !files->show_hidden;
     listing_filter(listing, files->show_hidden);
-    listing_filter(&files->parent, files->show_hidden);
-    files->parent_cursor = SIZE_MAX;
-    find_shown(&files->parent, base_name(files->path), &files->parent_cursor);
     /* The same entry, or the next one still shown. */
     files->cursor = 0;
     for (size_t i = 0; i < listing->shown_count; ++i) {
@@ -795,49 +894,40 @@ static void toggle_hidden(struct files *files)
     desk_window_redraw(&files->window);
 }
 
-/* Resizing */
+/* The sidebar */
 
-/* Move divider (0: parent|current, 1: current|preview) to buffer x, keeping
-   the two columns' combined width. */
-static void move_divider(struct files *files, int divider, int x)
+/* Its width in logical pixels, kept between SIDEBAR_MIN and half the window. */
+static void set_sidebar_width(struct files *files, double width)
 {
-    const struct columns *columns = &files->columns;
-    int a = divider, b = divider + 1;
-    if (divider < 0 || divider > 1 || !columns->shown[a] || !columns->shown[b] || columns->inner <= 0)
-        return;
-    double sum = 0;
-    for (int i = 0; i < 3; ++i)
-        sum += columns->shown[i] ? files->weights[i] : 0;
-    double pair = files->weights[a] + files->weights[b], gap = columns->left[b] - columns->right[a];
-    double width = x - gap / 2 - columns->left[a];
-    double weight = width / columns->inner * sum, least = MIN_COLUMN_SHARE * sum;
-    if (weight < least)
-        weight = least;
-    if (weight > pair - least)
-        weight = pair - least;
-    if (pair - least < least)
-        return;
-    files->weights[a] = weight;
-    files->weights[b] = pair - weight;
-    desk_window_redraw(&files->window);
+    double most = files->window.width / 2.0;
+    if (width > most)
+        width = most;
+    if (width < SIDEBAR_MIN)
+        width = SIDEBAR_MIN;
+    if (width != files->sidebar_width) {
+        files->sidebar_width = width;
+        desk_window_redraw(&files->window);
+    }
 }
 
-/* < and >: the current column narrower or wider, against the preview, or
-   against the parent when there's no preview. */
-static void resize_current(struct files *files, int direction)
+/* < and >: narrower or wider by a step. */
+static void resize_sidebar(struct files *files, int direction)
 {
-    const struct columns *columns = &files->columns;
-    int step = (int)lround(columns->inner * RESIZE_STEP);
-    if (columns->divider[1] >= 0)
-        move_divider(files, 1, columns->divider[1] + direction * step);
-    else if (columns->divider[0] >= 0)
-        move_divider(files, 0, columns->divider[0] - direction * step);
+    if (!files->panes.sidebar)
+        return;
+    set_sidebar_width(files, files->sidebar_width + direction * SIDEBAR_STEP);
     save_state(files);
 }
 
-static void reset_columns(struct files *files)
+static void reset_sidebar(struct files *files)
 {
-    memcpy(files->weights, default_weights, sizeof files->weights);
+    set_sidebar_width(files, SIDEBAR_WIDTH);
+    save_state(files);
+}
+
+static void toggle_sidebar(struct files *files)
+{
+    files->show_sidebar = !files->show_sidebar;
     save_state(files);
     desk_window_redraw(&files->window);
 }
@@ -901,27 +991,21 @@ static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
     case XKB_KEY_Page_Up:
         move_cursor(files, -(files->page_rows > 1 ? files->page_rows - 1 : 1));
         return true;
-    case XKB_KEY_J:
-        scroll_preview(files, 1);
-        return true;
-    case XKB_KEY_K:
-        scroll_preview(files, -1);
-        return true;
     case XKB_KEY_minus:
         go_back(files);
         return false;
     case XKB_KEY_less:
-        resize_current(files, -1);
+        resize_sidebar(files, -1);
         return true;
     case XKB_KEY_greater:
-        resize_current(files, 1);
+        resize_sidebar(files, 1);
         return true;
     case XKB_KEY_equal:
-        reset_columns(files);
+        reset_sidebar(files);
         return false;
-    case XKB_KEY_z:
-        files->show_preview = !files->show_preview;
-        desk_window_redraw(&files->window);
+    case XKB_KEY_b:
+    case XKB_KEY_F9:
+        toggle_sidebar(files);
         return false;
     case XKB_KEY_period:
         toggle_hidden(files);
@@ -1070,395 +1154,6 @@ static void draw_name(struct files *files, DeskFont *font, DeskCanvas *canvas, i
     (void)files;
 }
 
-/* Previews */
-
-static void job_free(struct job *job)
-{
-    if (job) {
-        free(job->path);
-        free(job);
-    }
-}
-
-static void preview_free(struct preview *preview)
-{
-    if (!preview)
-        return;
-    free(preview->path);
-    listing_free(&preview->listing);
-    free(preview->pixels);
-    free(preview->text);
-    free(preview);
-}
-
-/* Fit width × height in a box without enlarging. */
-static void fit_box(int width, int height, int box_width, int box_height, int *out_width, int *out_height)
-{
-    double scale = fmin(1.0, fmin((double)box_width / width, (double)box_height / height));
-    *out_width = (int)lround(width * scale);
-    *out_height = (int)lround(height * scale);
-    if (*out_width < 1)
-        *out_width = 1;
-    if (*out_height < 1)
-        *out_height = 1;
-}
-
-/* Shrink an image to fit the box by averaging the area each pixel covers,
-   then turn it upright by its EXIF orientation. */
-static bool fit_image(struct preview *preview, const DeskImage *image)
-{
-    int orientation = image->orientation >= 1 && image->orientation <= 8 ? image->orientation : 1;
-    bool swap = orientation >= 5;
-    int width = (int)image->width, height = (int)image->height;
-    int upright_width = swap ? height : width, upright_height = swap ? width : height;
-    int out_width, out_height;
-    fit_box(upright_width, upright_height, preview->box_width, preview->box_height, &out_width, &out_height);
-    int small_width = swap ? out_height : out_width, small_height = swap ? out_width : out_height;
-
-    uint32_t *small = malloc((size_t)small_width * (size_t)small_height * 4);
-    uint32_t *out = malloc((size_t)out_width * (size_t)out_height * 4);
-    if (!small || !out) {
-        free(small);
-        free(out);
-        return false;
-    }
-    for (int y = 0; y < small_height; ++y) {
-        int y0 = (int)((long long)y * height / small_height), y1 = (int)((long long)(y + 1) * height / small_height);
-        if (y1 <= y0)
-            y1 = y0 + 1;
-        for (int x = 0; x < small_width; ++x) {
-            int x0 = (int)((long long)x * width / small_width), x1 = (int)((long long)(x + 1) * width / small_width);
-            if (x1 <= x0)
-                x1 = x0 + 1;
-            uint64_t sum[4] = {0};
-            for (int v = y0; v < y1; ++v) {
-                const unsigned char *pixel = image->pixels + ((size_t)v * (size_t)width + (size_t)x0) * 4;
-                for (int u = x0; u < x1; ++u, pixel += 4) {
-                    sum[0] += pixel[0];
-                    sum[1] += pixel[1];
-                    sum[2] += pixel[2];
-                    sum[3] += pixel[3];
-                }
-            }
-            uint64_t count = (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0), half = count / 2;
-            small[(size_t)y * (size_t)small_width + (size_t)x] =
-                (uint32_t)((sum[3] + half) / count) << 24 | (uint32_t)((sum[0] + half) / count) << 16 |
-                (uint32_t)((sum[1] + half) / count) << 8 | (uint32_t)((sum[2] + half) / count);
-        }
-    }
-    /* Each upright pixel (x, y) comes from (u, v) of the stored image. */
-    int w = small_width, h = small_height;
-    for (int y = 0; y < out_height; ++y) {
-        for (int x = 0; x < out_width; ++x) {
-            int u, v;
-            switch (orientation) {
-            case 2: u = w - 1 - x, v = y; break;
-            case 3: u = w - 1 - x, v = h - 1 - y; break;
-            case 4: u = x, v = h - 1 - y; break;
-            case 5: u = y, v = x; break;
-            case 6: u = y, v = h - 1 - x; break;
-            case 7: u = w - 1 - y, v = h - 1 - x; break;
-            case 8: u = w - 1 - y, v = x; break;
-            default: u = x, v = y; break;
-            }
-            out[(size_t)y * (size_t)out_width + (size_t)x] = small[(size_t)v * (size_t)w + (size_t)u];
-        }
-    }
-    free(small);
-    preview->pixels = out;
-    preview->width = out_width;
-    preview->height = out_height;
-    preview->image_width = upright_width;
-    preview->image_height = upright_height;
-    return true;
-}
-
-static bool looks_like_image(const unsigned char *head, size_t length)
-{
-    return (length >= 8 && memcmp(head, "\x89PNG\r\n\x1a\n", 8) == 0) ||
-           (length >= 3 && memcmp(head, "\xff\xd8\xff", 3) == 0) ||
-           (length >= 6 && (memcmp(head, "GIF87a", 6) == 0 || memcmp(head, "GIF89a", 6) == 0)) ||
-           (length >= 12 && memcmp(head, "RIFF", 4) == 0 && memcmp(head + 8, "WEBP", 4) == 0);
-}
-
-static void preview_image(struct preview *preview, int fd)
-{
-    FILE *file = fdopen(fd, "rb");
-    if (!file) {
-        close(fd);
-        preview->kind = PREVIEW_ERROR;
-        snprintf(preview->message, sizeof preview->message, "%s", strerror(errno));
-        return;
-    }
-    DeskImage image;
-    char error[160];
-    bool loaded = desk_image_load(file, &image, IMAGE_LIMIT, DESK_IMAGE_SHRINK, error, sizeof error);
-    fclose(file);
-    if (!loaded) {
-        preview->kind = PREVIEW_ERROR;
-        snprintf(preview->message, sizeof preview->message, "%s", error);
-        return;
-    }
-    if (fit_image(preview, &image)) {
-        preview->kind = PREVIEW_IMAGE;
-    } else {
-        preview->kind = PREVIEW_ERROR;
-        snprintf(preview->message, sizeof preview->message, "Out of memory");
-    }
-    free(image.pixels);
-}
-
-/* Text when the start has no NUL and hardly any invalid UTF-8. */
-static void preview_text(struct preview *preview, int fd)
-{
-    char *text = malloc(TEXT_LIMIT);
-    size_t length = 0;
-    ssize_t got = 0;
-    while (text && length < TEXT_LIMIT && (got = read(fd, text + length, TEXT_LIMIT - length)) > 0)
-        length += (size_t)got;
-    close(fd);
-    if (!text || got < 0) {
-        preview->kind = PREVIEW_ERROR;
-        snprintf(preview->message, sizeof preview->message, "%s", text ? strerror(errno) : "Out of memory");
-        free(text);
-        return;
-    }
-    size_t checked = length < SNIFF_LIMIT ? length : SNIFF_LIMIT, invalid = 0;
-    bool binary = memchr(text, 0, checked) != NULL;
-    const char *at = text, *end = text + checked;
-    /* A character cut at the end of the checked part isn't counted against it. */
-    while (!binary && at < end && (checked == length || end - at >= 4)) {
-        const char *start = at;
-        if (desk_utf8_next(&at, end) == 0xfffd && !(at - start == 3 && memcmp(start, "\xef\xbf\xbd", 3) == 0))
-            ++invalid;
-    }
-    if (binary || invalid * 100 > checked) {
-        free(text);
-        preview->kind = PREVIEW_BINARY;
-        return;
-    }
-    preview->kind = PREVIEW_TEXT;
-    preview->text = text;
-    preview->text_length = length;
-}
-
-/* Runs on a worker thread: only the job and the filesystem are touched. */
-static struct preview *build_preview(const struct job *job)
-{
-    struct preview *preview = calloc(1, sizeof *preview);
-    if (!preview || !(preview->path = strdup(job->path))) {
-        free(preview);
-        return NULL;
-    }
-    preview->modified = job->modified;
-    preview->size = job->size;
-    preview->box_width = job->box_width > 0 ? job->box_width : 1;
-    preview->box_height = job->box_height > 0 ? job->box_height : 1;
-    if (job->directory) {
-        if (listing_read(&preview->listing, job->path) != 0) {
-            preview->kind = PREVIEW_ERROR;
-            snprintf(preview->message, sizeof preview->message, "%s", strerror(preview->listing.error));
-        } else {
-            preview->kind = PREVIEW_DIRECTORY;
-        }
-        return preview;
-    }
-    int fd = open(job->path, O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) {
-        preview->kind = PREVIEW_ERROR;
-        snprintf(preview->message, sizeof preview->message, "%s", strerror(errno));
-        return preview;
-    }
-    unsigned char head[16];
-    ssize_t got = pread(fd, head, sizeof head, 0);
-    if (got > 0 && looks_like_image(head, (size_t)got))
-        preview_image(preview, fd);
-    else
-        preview_text(preview, fd);
-    return preview;
-}
-
-static void *worker_main(void *data)
-{
-    struct worker *worker = data;
-    struct files *files = worker->files;
-    pthread_mutex_lock(&files->lock);
-    for (;;) {
-        while (!files->stopping && !worker->pending)
-            pthread_cond_wait(&worker->wake, &files->lock);
-        if (files->stopping)
-            break;
-        struct job *job = worker->pending;
-        worker->pending = NULL;
-        pthread_mutex_unlock(&files->lock);
-        struct preview *preview = build_preview(job);
-        job_free(job);
-        pthread_mutex_lock(&files->lock);
-        if (preview) {
-            preview->next = files->done;
-            files->done = preview;
-            uint64_t one = 1;
-            (void)!write(files->done_fd, &one, sizeof one);
-        }
-    }
-    pthread_mutex_unlock(&files->lock);
-    return NULL;
-}
-
-static void workers_start(struct files *files)
-{
-    pthread_mutex_init(&files->lock, NULL);
-    files->done_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    for (int i = 0; i < WORKER_COUNT; ++i) {
-        struct worker *worker = &files->workers[i];
-        worker->files = files;
-        pthread_cond_init(&worker->wake, NULL);
-        worker->started = files->done_fd >= 0 && pthread_create(&worker->thread, NULL, worker_main, worker) == 0;
-    }
-}
-
-static void workers_stop(struct files *files)
-{
-    pthread_mutex_lock(&files->lock);
-    files->stopping = true;
-    for (int i = 0; i < WORKER_COUNT; ++i)
-        pthread_cond_signal(&files->workers[i].wake);
-    pthread_mutex_unlock(&files->lock);
-    for (int i = 0; i < WORKER_COUNT; ++i) {
-        struct worker *worker = &files->workers[i];
-        if (worker->started)
-            pthread_join(worker->thread, NULL);
-        job_free(worker->pending);
-        free(worker->sent);
-        pthread_cond_destroy(&worker->wake);
-    }
-    while (files->done) {
-        struct preview *next = files->done->next;
-        preview_free(files->done);
-        files->done = next;
-    }
-    for (int i = 0; i < PREVIEW_CACHE; ++i)
-        preview_free(files->cache[i]);
-    if (files->done_fd >= 0)
-        close(files->done_fd);
-    pthread_mutex_destroy(&files->lock);
-}
-
-static char *preview_key(const char *path, const struct timespec *modified, off_t size, int box_width,
-                         int box_height)
-{
-    char *key;
-    return asprintf(&key, "%s\n%lld.%09ld\n%lld\n%dx%d", path, (long long)modified->tv_sec, modified->tv_nsec,
-                    (long long)size, box_width, box_height) < 0
-               ? NULL
-               : key;
-}
-
-static uint32_t entry_icon(const struct entry *entry);
-
-/* Ask a worker for a preview, unless it was the last thing asked of it. */
-static void request_preview(struct files *files, const char *path, const struct entry *entry, int box_width,
-                            int box_height)
-{
-    struct worker *worker = &files->workers[entry->directory || entry_icon(entry) != ICON_IMAGE ? WORKER_GENERAL
-                                                                                                 : WORKER_IMAGE];
-    if (!worker->started)
-        return;
-    char *key = preview_key(path, &entry->modified, entry->size, box_width, box_height);
-    struct job *job = calloc(1, sizeof *job);
-    if (!key || !job || (worker->sent && strcmp(worker->sent, key) == 0) || !(job->path = strdup(path))) {
-        free(key);
-        job_free(job);
-        return;
-    }
-    job->modified = entry->modified;
-    job->size = entry->size;
-    job->directory = entry->directory;
-    job->box_width = box_width;
-    job->box_height = box_height;
-    pthread_mutex_lock(&files->lock);
-    job_free(worker->pending);
-    worker->pending = job;
-    pthread_cond_signal(&worker->wake);
-    pthread_mutex_unlock(&files->lock);
-    free(worker->sent);
-    worker->sent = key;
-}
-
-/* The cached preview of this version of path, asking for one (or for a
-   better fitting image) when needed. NULL while it's being made. */
-static struct preview *preview_get(struct files *files, const char *path, const struct entry *entry,
-                                   int box_width, int box_height)
-{
-    if (entry->directory)
-        box_width = box_height = 0;
-    for (int i = 0; i < PREVIEW_CACHE; ++i) {
-        struct preview *preview = files->cache[i];
-        if (!preview || strcmp(preview->path, path) != 0 || preview->size != entry->size ||
-            preview->modified.tv_sec != entry->modified.tv_sec ||
-            preview->modified.tv_nsec != entry->modified.tv_nsec)
-            continue;
-        preview->used = ++files->preview_clock;
-        if (preview->kind == PREVIEW_IMAGE) {
-            int width, height;
-            fit_box(preview->image_width, preview->image_height, box_width, box_height, &width, &height);
-            if (width != preview->width || height != preview->height)
-                request_preview(files, path, entry, box_width, box_height);
-        }
-        return preview;
-    }
-    request_preview(files, path, entry, box_width, box_height);
-    return NULL;
-}
-
-/* Take finished previews into the cache, replacing older versions of the
-   same path and then the least recently used. */
-static void collect_previews(struct files *files)
-{
-    uint64_t count;
-    (void)!read(files->done_fd, &count, sizeof count);
-    pthread_mutex_lock(&files->lock);
-    struct preview *list = files->done;
-    files->done = NULL;
-    pthread_mutex_unlock(&files->lock);
-    while (list) {
-        struct preview *preview = list;
-        list = list->next;
-        preview->next = NULL;
-        char *key = preview_key(preview->path, &preview->modified, preview->size,
-                                preview->kind == PREVIEW_DIRECTORY ? 0 : preview->box_width,
-                                preview->kind == PREVIEW_DIRECTORY ? 0 : preview->box_height);
-        for (int i = 0; key && i < WORKER_COUNT; ++i) {
-            struct worker *worker = &files->workers[i];
-            if (worker->sent && strcmp(worker->sent, key) == 0) {
-                free(worker->sent);
-                worker->sent = NULL;
-            }
-        }
-        free(key);
-        int slot = -1;
-        for (int i = 0; i < PREVIEW_CACHE && slot < 0; ++i) {
-            if (files->cache[i] && strcmp(files->cache[i]->path, preview->path) == 0)
-                slot = i;
-        }
-        for (int i = 0; i < PREVIEW_CACHE && slot < 0; ++i) {
-            if (!files->cache[i])
-                slot = i;
-        }
-        if (slot < 0) {
-            slot = 0;
-            for (int i = 1; i < PREVIEW_CACHE; ++i) {
-                if (files->cache[i]->used < files->cache[slot]->used)
-                    slot = i;
-            }
-        }
-        preview_free(files->cache[slot]);
-        preview->used = ++files->preview_clock;
-        files->cache[slot] = preview;
-    }
-    desk_window_redraw(&files->window);
-}
-
 /* Layout */
 
 /* Sizes in buffer pixels for one frame. */
@@ -1498,15 +1193,6 @@ static size_t clamp_top(size_t top, size_t count, int rows)
 {
     if (count <= (size_t)rows)
         return 0;
-    return top > count - (size_t)rows ? count - (size_t)rows : top;
-}
-
-/* The first row that puts the cursor in the middle, for side columns. */
-static size_t centered_top(size_t cursor, size_t count, int rows)
-{
-    if (cursor == SIZE_MAX || count <= (size_t)rows)
-        return 0;
-    size_t top = cursor > (size_t)rows / 2 ? cursor - (size_t)rows / 2 : 0;
     return top > count - (size_t)rows ? count - (size_t)rows : top;
 }
 
@@ -1614,214 +1300,18 @@ static void paint_list(struct files *files, DeskCanvas *canvas, const struct lay
     }
 }
 
-static const char *type_name(mode_t mode, enum preview_kind kind)
-{
-    switch (mode & S_IFMT) {
-    case S_IFDIR: return "Directory";
-    case S_IFLNK: return "Symbolic link";
-    case S_IFIFO: return "Named pipe";
-    case S_IFSOCK: return "Socket";
-    case S_IFCHR: return "Character device";
-    case S_IFBLK: return "Block device";
-    case S_IFREG: return kind == PREVIEW_BINARY ? "Binary file" : "File";
-    default: return "Unknown";
-    }
-}
-
-/* "drwxr-xr-x" with setuid, setgid and sticky bits, as ls shows them. */
-static void format_mode(mode_t mode, char out[11])
-{
-    static const char types[] = "?pc?d?b?-?l?s???";
-    out[0] = types[(mode & S_IFMT) >> 12 & 15];
-    const char *rwx = "rwxrwxrwx";
-    for (int i = 0; i < 9; ++i)
-        out[i + 1] = mode & (0400 >> i) ? rwx[i] : '-';
-    if (mode & S_ISUID) out[3] = mode & S_IXUSR ? 's' : 'S';
-    if (mode & S_ISGID) out[6] = mode & S_IXGRP ? 's' : 'S';
-    if (mode & S_ISVTX) out[9] = mode & S_IXOTH ? 't' : 'T';
-    out[10] = 0;
-}
-
-static void format_owner(uid_t owner, gid_t group, char *out, size_t length)
-{
-    struct passwd *user = getpwuid(owner);
-    char user_name[64];
-    snprintf(user_name, sizeof user_name, "%s", user ? user->pw_name : "");
-    if (!user)
-        snprintf(user_name, sizeof user_name, "%u", (unsigned)owner);
-    struct group *entry = getgrgid(group);
-    if (entry)
-        snprintf(out, length, "%s %s", user_name, entry->gr_name);
-    else
-        snprintf(out, length, "%s %u", user_name, (unsigned)group);
-}
-
-/* The entry's details as label and value lines. */
-static void paint_details(struct files *files, DeskCanvas *canvas, const struct layout *layout,
-                          const struct entry *entry, enum preview_kind kind, int x, int y)
-{
-    char size[64], mode[11], owner[160], date[32];
-    if (S_ISREG(entry->target_mode)) {
-        char short_size[32];
-        format_size(entry->size, short_size, sizeof short_size);
-        if (entry->size >= 1024)
-            snprintf(size, sizeof size, "%s (%lld bytes)", short_size, (long long)entry->size);
-        else
-            snprintf(size, sizeof size, "%s", short_size);
-    } else {
-        snprintf(size, sizeof size, "-");
-    }
-    format_mode(entry->target_mode ? entry->target_mode : entry->mode, mode);
-    format_owner(entry->owner, entry->group, owner, sizeof owner);
-    format_date(&entry->modified, date, sizeof date);
-    const char *labels[] = {"Type", "Size", "Permissions", "Owner", "Modified"};
-    const char *values[] = {type_name(entry->target_mode ? entry->target_mode : entry->mode, kind), size, mode,
-                            owner, date};
-    int label_width = desk_text_width(files->font, "Permissions", 11) + layout->gap;
-    for (int i = 0; i < 5; ++i) {
-        int baseline = y + layout->padding / 2 + i * layout->row_height + layout->baseline;
-        desk_text_draw(files->font, canvas, x + layout->padding, baseline, labels[i], strlen(labels[i]),
-                       files->colors.muted);
-        desk_text_draw(files->font, canvas, x + layout->padding + label_width, baseline, values[i],
-                       strlen(values[i]), files->colors.foreground);
-    }
-}
-
-/* The start of a text file in monospace, tabs expanded, from line scroll. */
-static void paint_text(struct files *files, DeskCanvas *canvas, const struct preview *preview, int x0, int y0,
-                       int y1)
-{
-    DeskFontMetrics metrics = desk_font_metrics(files->mono);
-    int line_height = (int)lround(metrics.height * 1.2), cell = desk_char_width(files->mono, '0');
-    const char *text = preview->text, *end = text + preview->text_length;
-    long lines = 0;
-    for (const char *at = text; at < end; ++lines) {
-        const char *newline = memchr(at, '\n', (size_t)(end - at));
-        at = newline ? newline + 1 : end;
-    }
-    long visible = (y1 - y0) / line_height;
-    long last = lines > visible ? lines - visible : 0;
-    if (files->preview_scroll > last)
-        files->preview_scroll = last;
-    const char *at = text;
-    for (long skip = files->preview_scroll; skip > 0 && at < end; --skip) {
-        const char *newline = memchr(at, '\n', (size_t)(end - at));
-        at = newline ? newline + 1 : end;
-    }
-    for (int y = y0; at < end && y + line_height <= y1; y += line_height) {
-        const char *newline = memchr(at, '\n', (size_t)(end - at));
-        const char *line_end = newline ? newline : end;
-        if (line_end > at && line_end[-1] == '\r')
-            --line_end;
-        int column = 0, baseline = y + (line_height - metrics.height) / 2 + metrics.ascent;
-        /* Tab-separated segments, each at its column. */
-        const char *segment = at;
-        while (segment < line_end && x0 + column * cell < canvas->clip_right) {
-            const char *tab = memchr(segment, '\t', (size_t)(line_end - segment));
-            const char *segment_end = tab ? tab : line_end;
-            desk_text_draw(files->mono, canvas, x0 + column * cell, baseline, segment,
-                           (size_t)(segment_end - segment), files->colors.foreground);
-            for (const char *c = segment; c < segment_end;) {
-                desk_utf8_next(&c, segment_end);
-                ++column;
-            }
-            if (!tab)
-                break;
-            column = (column / TAB_WIDTH + 1) * TAB_WIDTH;
-            segment = tab + 1;
-        }
-        at = newline ? newline + 1 : end;
-    }
-}
-
-/* The selected entry's preview in the right column. */
-static void paint_preview(struct files *files, DeskCanvas *canvas, const struct layout *layout,
-                          struct entry *entry, int x0, int x1, int y0, int y1)
-{
-    if (!entry)
-        return;
-    char *path = join_path(files->path, entry->name);
-    if (!path)
-        return;
-    if (!files->preview_path || strcmp(files->preview_path, path) != 0) {
-        free(files->preview_path);
-        files->preview_path = strdup(path);
-        files->preview_scroll = 0;
-    }
-    const struct colors *colors = &files->colors;
-    DeskCanvas clipped = *canvas;
-    desk_canvas_clip(&clipped, x0, y0, x1, y1);
-    int y = y0;
-    if (entry->link) {
-        char target[PATH_MAX + 8] = "→ ";
-        ssize_t length = readlink(path, target + strlen(target), sizeof target - strlen(target) - 1);
-        if (length >= 0) {
-            target[strlen("→ ") + (size_t)length] = 0;
-            draw_message(files, &clipped, layout, x0, y, target, colors->muted);
-            y += layout->row_height;
-        }
-    }
-    int rows = (y1 - y) / layout->row_height;
-    if (entry->broken) {
-        draw_message(files, &clipped, layout, x0, y, "Broken link", colors->urgent);
-    } else if (entry->directory) {
-        struct preview *preview = preview_get(files, path, entry, 0, 0);
-        if (preview && preview->kind == PREVIEW_ERROR) {
-            draw_message(files, &clipped, layout, x0, y, preview->message, colors->urgent);
-        } else if (preview && rows > 0) {
-            struct listing *listing = &preview->listing;
-            listing_filter(listing, files->show_hidden);
-            struct memory *memory = find_memory(files, path);
-            size_t cursor = 0;
-            if (memory)
-                find_shown(listing, memory->name, &cursor);
-            long base = (long)centered_top(cursor, listing->shown_count, rows);
-            long last = listing->shown_count > (size_t)rows ? (long)listing->shown_count - rows : 0;
-            if (base + files->preview_scroll > last)
-                files->preview_scroll = last > base ? last - base : 0;
-            files->columns.preview_listing = true;
-            files->columns.preview_y = y;
-            files->columns.preview_top = (size_t)(base + files->preview_scroll);
-            paint_list(files, &clipped, layout, listing, cursor, files->columns.preview_top, x0, x1, y, rows,
-                       false, false, true);
-        }
-    } else if (S_ISREG(entry->target_mode)) {
-        struct preview *preview = preview_get(files, path, entry, x1 - x0, y1 - y);
-        if (!preview) {
-            /* Still being made. */
-        } else if (preview->kind == PREVIEW_IMAGE) {
-            int width = preview->width < x1 - x0 ? preview->width : x1 - x0;
-            desk_canvas_blit(&clipped, x0 + (x1 - x0 - width) / 2, y, preview->pixels, preview->width,
-                             preview->height);
-        } else if (preview->kind == PREVIEW_TEXT && preview->text_length) {
-            paint_text(files, &clipped, preview, x0 + layout->padding / 2, y, y1);
-        } else if (preview->kind == PREVIEW_TEXT) {
-            draw_message(files, &clipped, layout, x0, y, "Empty file", colors->muted);
-        } else {
-            if (preview->kind == PREVIEW_ERROR) {
-                draw_message(files, &clipped, layout, x0, y, preview->message, colors->urgent);
-                y += layout->row_height;
-            }
-            paint_details(files, &clipped, layout, entry, preview->kind, x0, y);
-        }
-    } else {
-        paint_details(files, &clipped, layout, entry, PREVIEW_BINARY, x0, y);
-    }
-    free(path);
-}
-
 /* Toolbar */
 
+#define ICON_SIDEBAR 0xf0c9
 #define ICON_BACK 0xf060
 #define ICON_FORWARD 0xf061
 #define ICON_UP 0xf062
-#define ICON_HOME 0xf015
 #define CRUMB_SEPARATOR "\xe2\x80\xba" /* › */
 #define ELLIPSIS "\xe2\x80\xa6"
 
 static bool hovering(const struct files *files, enum target_kind kind, size_t index)
 {
-    return files->drag < 0 && files->hover.kind == kind && files->hover.index == index;
+    return !files->drag && files->hover.kind == kind && files->hover.index == index;
 }
 
 static bool button_enabled(const struct files *files, int button)
@@ -1829,7 +1319,8 @@ static bool button_enabled(const struct files *files, int button)
     switch (button) {
     case BUTTON_BACK: return files->back.count > 0;
     case BUTTON_FORWARD: return files->forward.count > 0;
-    default: return strcmp(files->path, "/") != 0;
+    case BUTTON_UP: return strcmp(files->path, "/") != 0;
+    default: return true;
     }
 }
 
@@ -1881,7 +1372,7 @@ static void draw_icon(struct files *files, DeskCanvas *canvas, int left, int rig
     desk_text_draw(files->font, canvas, left + (right - left - width) / 2, baseline, text, length, color);
 }
 
-/* Back, forward and up buttons, then the path as crumbs to click, with a
+/* Sidebar, back, forward and up buttons, then the path as crumbs to click, with a
    lock at the end where nothing may be changed. */
 static void paint_toolbar(struct files *files, DeskCanvas *canvas, const struct layout *layout, int top)
 {
@@ -1892,7 +1383,7 @@ static void paint_toolbar(struct files *files, DeskCanvas *canvas, const struct 
     bar->top = top;
     bar->bottom = top + height;
 
-    static const uint32_t icons[BUTTON_COUNT] = {ICON_BACK, ICON_FORWARD, ICON_UP};
+    static const uint32_t icons[BUTTON_COUNT] = {ICON_SIDEBAR, ICON_BACK, ICON_FORWARD, ICON_UP};
     int x = layout->padding;
     for (int i = 0; i < BUTTON_COUNT; ++i) {
         bool enabled = button_enabled(files, i);
@@ -1972,6 +1463,38 @@ static void paint_toolbar(struct files *files, DeskCanvas *canvas, const struct 
     }
 }
 
+/* Places, one a row, the one we're in highlighted, headings muted. */
+static void paint_sidebar(struct files *files, DeskCanvas *canvas, const struct layout *layout, int x0, int x1,
+                          int top, int rows)
+{
+    const struct colors *colors = &files->colors;
+    int inner = layout->padding / 2;
+    for (size_t i = 0; i < files->place_count && (int)i < rows; ++i) {
+        const struct place *place = &files->places[i];
+        int y = top + (int)i * layout->row_height, baseline = y + layout->baseline;
+        if (!place->path) {
+            desk_text_draw(files->font, canvas, x0 + inner, baseline, place->name, strlen(place->name),
+                           colors->muted);
+            continue;
+        }
+        if (strcmp(place->path, files->path) == 0)
+            desk_canvas_fill(canvas, x0, y, x1 - x0, layout->row_height,
+                             mix(colors->background, colors->selection_background, 150));
+        else if (hovering(files, TARGET_PLACE, i))
+            desk_canvas_fill(canvas, x0, y, x1 - x0, layout->row_height,
+                             mix(colors->background, colors->muted, 80));
+        draw_icon(files, canvas, x0 + inner, x0 + inner + layout->icon_width - inner, baseline, place->icon,
+                  colors->directory);
+        int name_x = x0 + inner + layout->icon_width;
+        DeskCanvas clipped = *canvas;
+        desk_canvas_clip(&clipped, name_x, canvas->clip_top, x1 - inner < canvas->clip_right ? x1 - inner
+                                                                                             : canvas->clip_right,
+                         canvas->clip_bottom);
+        draw_name(files, files->font, &clipped, name_x, baseline, x1 - inner - name_x, place->name, true,
+                  colors->foreground);
+    }
+}
+
 static void paint(struct files *files, DeskCanvas *canvas)
 {
     const struct colors *colors = &files->colors;
@@ -1989,7 +1512,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
     layout.baseline = (layout.row_height - (metrics.ascent + metrics.descent)) / 2 + metrics.ascent;
     desk_canvas_fill(canvas, 0, 0, canvas->width, canvas->height, colors->background);
 
-    /* The toolbar at the top, the columns below it. */
+    /* The toolbar at the top; the sidebar and the list below it. */
     paint_toolbar(files, canvas, &layout, layout.padding / 2);
     int top = files->toolbar.bottom + layout.padding, bottom = canvas->height - layout.padding / 2;
     int rows = (bottom - top) / layout.row_height;
@@ -2000,72 +1523,43 @@ static void paint(struct files *files, DeskCanvas *canvas)
 
     int cell = desk_char_width(files->mono, '0');
     int cells = canvas->width / (cell > 0 ? cell : 1);
-    bool parent_shown = cells >= PARENT_CELLS, preview_shown = files->show_preview && cells >= PREVIEW_CELLS;
-    double weights[3] = {parent_shown ? files->weights[0] : 0, files->weights[1],
-                         preview_shown ? files->weights[2] : 0};
-    double total = weights[0] + weights[1] + weights[2];
-    int gaps = parent_shown + preview_shown;
-    int inner = canvas->width - 2 * layout.padding - gaps * layout.padding;
-    int edges[3][2], x = layout.padding;
-    for (int i = 0; i < 3; ++i) {
-        int width = (int)lround(inner * weights[i] / total);
-        edges[i][0] = x;
-        edges[i][1] = x + width;
-        if (weights[i])
-            x += width + layout.padding;
-    }
-    if (preview_shown)
-        edges[2][1] = canvas->width - layout.padding;
-    else
-        edges[1][1] = canvas->width - layout.padding;
-
-    struct columns *columns = &files->columns;
-    *columns = (struct columns){
-        .shown = {parent_shown, true, preview_shown},
-        .divider = {parent_shown ? edges[0][1] + layout.padding / 2 : -1,
-                    preview_shown ? edges[1][1] + layout.padding / 2 : -1},
-        .inner = inner,
+    bool sidebar = files->show_sidebar && cells >= SIDEBAR_CELLS;
+    int sidebar_width = (int)lround(fmin(files->sidebar_width, canvas->width / scale / 2) * scale);
+    struct panes *panes = &files->panes;
+    *panes = (struct panes){
+        .sidebar = sidebar,
+        .sidebar_left = layout.padding,
+        .sidebar_right = layout.padding + sidebar_width,
+        .divider = sidebar ? layout.padding + sidebar_width + layout.padding / 2 : -1,
+        .list_left = sidebar ? 2 * layout.padding + sidebar_width : layout.padding,
+        .list_right = canvas->width - layout.padding,
         .top = top,
         .rows = rows,
-        .parent_top = centered_top(files->parent_cursor, files->parent.shown_count, rows),
     };
-    for (int i = 0; i < 3; ++i) {
-        columns->left[i] = edges[i][0];
-        columns->right[i] = edges[i][1];
-    }
 
-    uint32_t rule = mix(colors->background, colors->muted, 70);
-    int rule_width = scale >= 2 ? (int)scale : 1;
-    for (int i = 0; i < 2; ++i) {
-        if (columns->divider[i] < 0)
-            continue;
+    if (sidebar) {
+        uint32_t rule = mix(colors->background, colors->muted, 70);
+        int rule_width = scale >= 2 ? (int)scale : 1;
         /* The divider under the pointer or being dragged stands out. */
-        bool active = files->drag == i || hovering(files, TARGET_DIVIDER, (size_t)i);
+        bool active = files->drag || hovering(files, TARGET_DIVIDER, 0);
         int width = active ? rule_width * 3 : rule_width;
-        desk_canvas_fill(canvas, columns->divider[i] - (width - rule_width) / 2, top, width, bottom - top,
+        desk_canvas_fill(canvas, panes->divider - (width - rule_width) / 2, top, width, bottom - top,
                          active ? colors->directory : rule);
-    }
-
-    if (parent_shown) {
         DeskCanvas clipped = *canvas;
-        desk_canvas_clip(&clipped, edges[0][0], top, edges[0][1], bottom);
-        paint_list(files, &clipped, &layout, &files->parent, files->parent_cursor, columns->parent_top,
-                   edges[0][0], edges[0][1], top, rows, false, false, false);
+        desk_canvas_clip(&clipped, panes->sidebar_left, top, panes->sidebar_right, bottom);
+        paint_sidebar(files, &clipped, &layout, panes->sidebar_left, panes->sidebar_right, top, rows);
     }
 
-    DeskCanvas current = *canvas;
-    desk_canvas_clip(&current, edges[1][0], top, edges[1][1], bottom);
+    DeskCanvas list = *canvas;
+    desk_canvas_clip(&list, panes->list_left, top, panes->list_right, bottom);
     if (files->free_scroll)
         files->top = clamp_top(files->top, files->listing.shown_count, rows);
     else
         files->top = keep_visible(files->top, files->cursor, files->listing.shown_count, rows);
-    int name_room = edges[1][1] - edges[1][0] - layout.icon_width - layout.padding;
+    int name_room = panes->list_right - panes->list_left - layout.icon_width - layout.padding;
     bool details = name_room > 2 * (layout.size_width + layout.gap + layout.date_width);
-    paint_list(files, &current, &layout, &files->listing, files->cursor, files->top, edges[1][0], edges[1][1], top,
-               rows, true, details, true);
-
-    if (preview_shown)
-        paint_preview(files, canvas, &layout, cursor_entry(files), edges[2][0], edges[2][1], top, bottom);
+    paint_list(files, &list, &layout, &files->listing, files->cursor, files->top, panes->list_left,
+               panes->list_right, top, rows, true, details, true);
 }
 
 static void draw(void *data, DeskWindow *window)
@@ -2172,7 +1666,7 @@ static void set_cursor(struct files *files)
 {
     if (files->cursor_shape)
         wp_cursor_shape_device_v1_set_shape(files->cursor_shape, files->pointer_serial,
-                                            files->drag >= 0 || files->hover.kind == TARGET_DIVIDER
+                                            files->drag || files->hover.kind == TARGET_DIVIDER
                                                 ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE
                                                 : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
 }
@@ -2188,37 +1682,25 @@ static int pointer_buffer_y(const struct files *files)
     return (int)lround(files->pointer_y * desk_window_scale(&files->window));
 }
 
-static int divider_at(const struct files *files)
+static bool divider_at(const struct files *files)
 {
+    const struct panes *panes = &files->panes;
     int x = pointer_buffer_x(files), reach = (int)lround(DIVIDER_GRAB * desk_window_scale(&files->window));
-    if (pointer_buffer_y(files) < files->columns.top)
-        return -1;
-    for (int i = 0; i < 2; ++i) {
-        int divider = files->columns.divider[i];
-        if (divider >= 0 && abs(x - divider) <= reach)
-            return i;
-    }
-    return -1;
+    return panes->divider >= 0 && pointer_buffer_y(files) >= panes->top && abs(x - panes->divider) <= reach;
 }
 
-/* The column under the pointer (0 parent, 1 current, 2 preview), or -1. */
-static int column_at(const struct files *files)
+/* Whether the pointer is over the list, for the wheel. */
+static bool in_list(const struct files *files)
 {
-    const struct columns *columns = &files->columns;
-    int x = pointer_buffer_x(files), y = pointer_buffer_y(files);
-    if (y < columns->top)
-        return -1;
-    for (int i = 0; i < 3; ++i) {
-        if (columns->shown[i] && x >= columns->left[i] && x < columns->right[i])
-            return i;
-    }
-    return -1;
+    const struct panes *panes = &files->panes;
+    int x = pointer_buffer_x(files);
+    return pointer_buffer_y(files) >= panes->top && x >= panes->list_left && x < panes->list_right;
 }
 
 static struct target target_at(const struct files *files)
 {
     const struct toolbar *bar = &files->toolbar;
-    const struct columns *columns = &files->columns;
+    const struct panes *panes = &files->panes;
     int x = pointer_buffer_x(files), y = pointer_buffer_y(files);
     if (y >= bar->top && y < bar->bottom) {
         for (int i = 0; i < BUTTON_COUNT; ++i) {
@@ -2232,34 +1714,28 @@ static struct target target_at(const struct files *files)
         }
         return (struct target){TARGET_NONE, 0};
     }
-    int divider = divider_at(files);
-    if (divider >= 0)
-        return (struct target){TARGET_DIVIDER, (size_t)divider};
-    int column = column_at(files);
-    if (column < 0 || files->row_height <= 0)
+    if (divider_at(files))
+        return (struct target){TARGET_DIVIDER, 0};
+    if (y < panes->top || files->row_height <= 0)
         return (struct target){TARGET_NONE, 0};
-    long row = (y - columns->top) / files->row_height;
-    if (row >= columns->rows)
+    long row = (y - panes->top) / files->row_height;
+    if (row >= panes->rows)
         return (struct target){TARGET_NONE, 0};
-    if (column == 0) {
-        size_t index = columns->parent_top + (size_t)row;
-        if (index < files->parent.shown_count)
-            return (struct target){TARGET_PARENT, index};
-    } else if (column == 1) {
+    if (panes->sidebar && x >= panes->sidebar_left && x < panes->sidebar_right) {
+        if ((size_t)row < files->place_count && files->places[row].path)
+            return (struct target){TARGET_PLACE, (size_t)row};
+    } else if (x >= panes->list_left && x < panes->list_right) {
         size_t index = files->top + (size_t)row;
         if (index < files->listing.shown_count)
-            return (struct target){TARGET_CURRENT, index};
-    } else if (columns->preview_listing && y >= columns->preview_y) {
-        return (struct target){TARGET_PREVIEW,
-                               columns->preview_top + (size_t)((y - columns->preview_y) / files->row_height)};
+            return (struct target){TARGET_ROW, index};
     }
     return (struct target){TARGET_NONE, 0};
 }
 
-/* Toolbar pieces and dividers light up under the pointer; rows don't. */
+/* Toolbar pieces, places and the divider light up under the pointer; rows don't. */
 static bool shows_hover(enum target_kind kind)
 {
-    return kind == TARGET_BUTTON || kind == TARGET_CRUMB || kind == TARGET_DIVIDER;
+    return kind == TARGET_BUTTON || kind == TARGET_CRUMB || kind == TARGET_DIVIDER || kind == TARGET_PLACE;
 }
 
 static void update_hover(struct files *files, bool force)
@@ -2291,49 +1767,15 @@ static void go_to_crumb(struct files *files, size_t index)
     free(select);
 }
 
-/* A row of the parent column: a directory beside this one goes there; a
-   file goes up with it selected. */
-static void click_parent(struct files *files, size_t index)
+/* A place in the sidebar. */
+static void go_to_place(struct files *files, size_t index)
 {
-    if (index >= files->parent.shown_count || index == files->parent_cursor)
+    const struct place *place = index < files->place_count ? &files->places[index] : NULL;
+    if (!place || !place->path || strcmp(place->path, files->path) == 0)
         return;
-    const struct entry *entry = &files->parent.entries[files->parent.shown[index]];
-    char *parent = parent_path(files->path);
-    if (!parent)
-        return;
-    if (entry->directory) {
-        char *path = join_path(parent, entry->name);
-        free(parent);
-        if (path)
-            go_to(files, path, NULL);
-    } else {
-        char *name = strdup(entry->name);
-        if (name)
-            go_to(files, parent, name);
-        else
-            free(parent);
-        free(name);
-    }
-}
-
-/* A row of a previewed directory: go in with it selected. */
-static void click_preview(struct files *files, size_t index)
-{
-    struct entry *entry = cursor_entry(files);
-    if (!entry || !entry->directory || entry->broken)
-        return;
-    char *path = join_path(files->path, entry->name);
-    if (!path)
-        return;
-    struct preview *preview = preview_get(files, path, entry, 0, 0);
-    char *name = NULL;
-    if (preview && preview->kind == PREVIEW_DIRECTORY && index < preview->listing.shown_count)
-        name = strdup(preview->listing.entries[preview->listing.shown[index]].name);
-    if (name)
-        go_to(files, path, name);
-    else
-        free(path);
-    free(name);
+    char *path = strdup(place->path);
+    if (path)
+        go_to(files, path, NULL);
 }
 
 static void click(struct files *files, uint32_t time)
@@ -2345,7 +1787,9 @@ static void click(struct files *files, uint32_t time)
     files->press_time = time;
     switch (target.kind) {
     case TARGET_BUTTON:
-        if (target.index == BUTTON_BACK)
+        if (target.index == BUTTON_SIDEBAR)
+            toggle_sidebar(files);
+        else if (target.index == BUTTON_BACK)
             go_back(files);
         else if (target.index == BUTTON_FORWARD)
             go_forward(files);
@@ -2358,15 +1802,15 @@ static void click(struct files *files, uint32_t time)
     case TARGET_DIVIDER:
         if (twice) {
             files->press.kind = TARGET_NONE;
-            reset_columns(files);
+            reset_sidebar(files);
         } else {
-            files->drag = (int)target.index;
+            files->drag = true;
         }
         break;
-    case TARGET_PARENT:
-        click_parent(files, target.index);
+    case TARGET_PLACE:
+        go_to_place(files, target.index);
         break;
-    case TARGET_CURRENT:
+    case TARGET_ROW:
         if (twice) {
             go_in(files);
         } else {
@@ -2374,9 +1818,6 @@ static void click(struct files *files, uint32_t time)
             files->free_scroll = false;
             desk_window_redraw(&files->window);
         }
-        break;
-    case TARGET_PREVIEW:
-        click_preview(files, target.index);
         break;
     case TARGET_NONE:
         break;
@@ -2403,9 +1844,9 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     (void)serial;
     (void)surface;
     struct files *files = data;
-    if (files->drag >= 0)
+    if (files->drag)
         save_state(files);
-    files->drag = -1;
+    files->drag = false;
     files->hover = (struct target){TARGET_NONE, 0};
     files->scroll_pixels = 0;
     desk_window_redraw(&files->window);
@@ -2418,8 +1859,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     struct files *files = data;
     files->pointer_x = wl_fixed_to_double(x);
     files->pointer_y = wl_fixed_to_double(y);
-    if (files->drag >= 0)
-        move_divider(files, files->drag, pointer_buffer_x(files));
+    if (files->drag)
+        set_sidebar_width(files, files->pointer_x - PADDING * 1.5);
     else
         update_hover(files, false);
 }
@@ -2441,8 +1882,8 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
         /* Right-click opens "Open with" in 0.5. */
     } else if (pressed) {
         click(files, time);
-    } else if (files->drag >= 0) {
-        files->drag = -1;
+    } else if (files->drag) {
+        files->drag = false;
         save_state(files);
         update_hover(files, true);
         desk_window_redraw(&files->window);
@@ -2458,7 +1899,7 @@ static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, 
         files->scroll_pixels += wl_fixed_to_double(value);
 }
 
-/* Apply the frame's scrolling to the column under the pointer: notches
+/* Apply the frame's scrolling to the list under the pointer: notches
    by WHEEL_ROWS, touchpads by distance. */
 static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
@@ -2476,11 +1917,8 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
     files->scroll_steps = 0;
     if (!rows)
         return;
-    int column = column_at(files);
-    if (column == 1)
+    if (in_list(files))
         scroll_rows(files, rows);
-    else if (column == 2)
-        scroll_preview(files, rows);
     update_hover(files, false);
 }
 
@@ -2546,7 +1984,7 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
         files->cursor_shape = NULL;
         wl_pointer_release(files->pointer);
         files->pointer = NULL;
-        files->drag = -1;
+        files->drag = false;
         files->hover = (struct target){TARGET_NONE, 0};
     }
 }
@@ -2674,7 +2112,7 @@ static bool run(struct files *files)
             {.fd = files->inotify, .events = POLLIN},
             {.fd = files->refresh, .events = POLLIN},
             {.fd = files->palette_watch.fd, .events = POLLIN},
-            {.fd = files->done_fd, .events = POLLIN},
+            {.fd = files->mounts, .events = POLLPRI},
         };
         if (poll(fds, 6, -1) < 0) {
             wl_display_cancel_read(display);
@@ -2714,8 +2152,10 @@ static bool run(struct files *files)
             update_colors(files);
             desk_window_redraw(&files->window);
         }
-        if (files->done_fd >= 0 && fds[5].revents & POLLIN)
-            collect_previews(files);
+        if (files->mounts >= 0 && fds[5].revents & (POLLPRI | POLLERR)) {
+            build_places(files); /* A drive came or went. */
+            desk_window_redraw(&files->window);
+        }
         desk_window_update(&files->window);
     }
     return true;
@@ -2734,9 +2174,9 @@ static void usage(FILE *stream)
           "  -v, --version  Show the version\n"
           "\n"
           "Keys: j/k move, l enters, h goes up, g/G first/last, Ctrl+D/U half a page,\n"
-          "Alt+Left/Right or - back and forward, J/K scroll the preview, z hides it,\n"
-          "< and > resize the columns (= resets), . hidden files, ~ home, q quits.\n"
-          "The mouse clicks, double-clicks, scrolls and drags the column dividers.\n",
+          "Alt+Left/Right or - back and forward, b or F9 shows or hides the sidebar,\n"
+          "< and > resize it (= resets), . hidden files, ~ home, q quits.\n"
+          "The mouse clicks, double-clicks, scrolls and drags the sidebar's edge.\n",
           stream);
 }
 
@@ -2791,8 +2231,7 @@ int main(int argc, char **argv)
     }
 
     struct files files = {
-        .inotify = -1, .watch = -1, .parent_watch = -1, .refresh = -1, .done_fd = -1, .running = true,
-        .show_preview = true, .parent_cursor = SIZE_MAX, .drag = -1, .root = geteuid() == 0,
+        .inotify = -1, .watch = -1, .refresh = -1, .mounts = -1, .running = true, .root = geteuid() == 0,
         .palette_watch = {.fd = -1}, .repeat = {.fd = -1},
     };
     const char *home = getenv("HOME");
@@ -2825,7 +2264,7 @@ int main(int argc, char **argv)
     if (error)
         fprintf(stderr, "files: no key repeat: %s\n", strerror(error));
 
-    workers_start(&files);
+    files.mounts = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
     go_to(&files, directory, select);
     free(select);
     if (!open_window(&files)) {
@@ -2835,7 +2274,8 @@ int main(int argc, char **argv)
         status = EXIT_FAILED;
     }
     close_window(&files);
-    workers_stop(&files);
+    if (files.mounts >= 0)
+        close(files.mounts);
 
     desk_repeat_close(&files.repeat);
     desk_watch_close(&files.palette_watch);
@@ -2844,8 +2284,7 @@ int main(int argc, char **argv)
     if (files.refresh >= 0)
         close(files.refresh);
     listing_free(&files.listing);
-    listing_free(&files.parent);
-    free(files.preview_path);
+    places_free(files.places, files.place_count);
     free(files.toolbar.crumbs);
     history_free(&files.back);
     history_free(&files.forward);

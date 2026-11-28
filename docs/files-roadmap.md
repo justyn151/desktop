@@ -6,7 +6,7 @@ Implementation plan for files, the graphical file manager, from 0.1 to 1.0. It e
 
 files is one `files.c` and one `files.h`, built on `desk/` from its first commit, the same way view and shot were. It's a normal xdg-shell window (app ID `files`), so dwl tiles it like any other client.
 
-The model is Miller columns, as in ranger or lf but drawn as a real window: the parent directory on the left, the current one in the middle, a preview of the selected entry on the right. `h` goes up, `l` goes in (or opens a file), `j` and `k` move. Everything works from the keyboard first; the mouse works too since 0.2, and right-click and drag and drop come in 0.5.
+The layout is a file explorer's: a toolbar with back, forward, up and the path, a sidebar of places on the left, and the current directory filling the rest (0.2). Moving is ranger's: `h` goes up, `l` goes in (or opens a file), `j` and `k` move. Everything works from the keyboard first; the mouse works too since 0.2, and right-click and drag and drop come in 0.5.
 
 files has two jobs. It's the file manager, and it's also the file picker for every other application: the dialog a browser opens to upload a file or ask where a download goes, and any "Open…" or "Save as…" dialog. The picker is the same window and keys with a choose bar added (0.6). Applications reach it through the `org.freedesktop.impl.portal.FileChooser` portal backend, so there's one way to move around the filesystem instead of a GTK dialog with keys of its own.
 
@@ -18,9 +18,8 @@ files has two jobs. It's the file manager, and it's also the file picker for eve
 | xkbcommon keymap and modifiers | view, run, deal (each its own copy) | Keys (0.1) |
 | Key repeat | `DeskRepeat` | Holding `j` (0.1) |
 | Fontconfig matching and FreeType rendering into ARGB | bar, run, wall (each its own copy) | Every line of text (0.1) |
-| Image decoding | `desk_image_load` (`-DDESK_IMAGE`) | Image previews (0.2), thumbnails (0.5) |
+| Image decoding | `desk_image_load` (`-DDESK_IMAGE`) | Thumbnails (0.5) |
 | Desktop entry parsing (`Exec`, `TryExec`, `MimeType`, field codes) | run | Opening files with the right application (0.3) |
-| Markdown layout | mark | A markdown preview, if it's worth sharing (0.2, optional) |
 | INI config, palette, file watch | desk | Config, colors, refreshing a directory that changes (0.1 onward) |
 | Atomic files | `desk_atomic_*` | Writing `mimeapps.list` and bookmarks (0.3) |
 
@@ -32,7 +31,7 @@ dwl already supports everything files needs: xdg-shell, viewporter, fractional s
 - **MIME data.** Neither `shared-mime-info` nor `xdg-utils` is installed. files needs a MIME type to pick an application. Plan: read `/usr/share/mime/globs2` (from `shared-mime-info`, a small package worth installing) when it exists, with a built-in table of common extensions as the fallback, plus content sniffing for files without an extension (the image signatures desk already knows, `#!` scripts, UTF-8 text).
 - **`xdg-open`.** files doesn't need it: it resolves `mimeapps.list` and desktop entries itself (0.3). Installing `xdg-utils` is still worth it for mark's and other apps' links.
 - **The portal frontend.** `xdg-desktop-portal` isn't installed. Applications talk to it, and it forwards file dialogs to files (0.6). It's needed for 0.6 and later for screen sharing (`xdg-desktop-portal-wlr`, PLAN Phase 6). `XDG_CURRENT_DESKTOP` isn't set either, and the portal needs it to pick its config.
-- **`~/.config/user-dirs.dirs`.** Doesn't exist, so there's no configured download directory. The picker falls back to `~/Downloads` (0.6). `xdg-user-dirs-update` would write the file.
+- **`~/.config/user-dirs.dirs`.** Doesn't exist, so there's no configured download directory. The sidebar uses the usual names (`~/Downloads` and so on, 0.2) and the picker falls back to `~/Downloads` (0.6). `xdg-user-dirs-update` would write the file.
 
 ### What desk gains
 
@@ -49,8 +48,8 @@ Moving view onto the keyboard and window pieces happens in the same milestone th
 ### Drawing
 
 - One list row per entry: icon glyph, name, and right-aligned details (size for files, entry count for directories, modified date), in the UI font (`sans-serif`, which is Noto Sans), sizes in `monospace` digits so they line up.
-- The selection is a full-width bar in the palette's selection colors. Directories in the accent color, hidden entries muted, symlinks in italic with their target in the preview, broken links in the urgent color.
-- Every frame is drawn on the CPU into the shm buffer, like view. Scrolling a long directory redraws only the list columns; text is cached per glyph, so a full redraw at 4K stays well under a frame.
+- The selection is a full-width bar in the palette's selection colors. Directories in the accent color, hidden entries muted, symlinks in italic, broken links in the urgent color.
+- Every frame is drawn on the CPU into the shm buffer, like view. Scrolling a long directory redraws only the list; text is cached per glyph, so a full redraw at 4K stays well under a frame.
 - Names that don't fit are cut with `…` in the middle for files (`a-very-long-na…me.tar.gz` keeps the extension) and at the end for directories.
 
 ---
@@ -105,32 +104,35 @@ files [DIR]
 
 ---
 
-## 0.2: Miller columns and previews
+## 0.2: Sidebar, toolbar and mouse
 
 ### Layout
 
-- Three columns: parent, current, preview, at roughly 1 : 2 : 3 of the width. With a narrow window (under 60 cells), the parent column drops first, then the preview.
-- The preview shows:
-  - A directory: its listing, as the column it would become.
-  - An image: the image fitted to the column, through `desk_image_load`, decoded on a worker thread so `j` never waits. Large images are decoded at reduced size where the format allows (JPEG scaling), and the last few previews are cached.
-  - Text (UTF-8, by sniffing the first 4 KiB): the first screenful in `monospace`, tabs expanded, no highlighting.
-  - Markdown: as text in 0.2. Rendering it through mark's layout is a later, optional step, only if mark's code can be shared without copying it.
-  - Anything else: its type, size, permissions, owner and modified time.
-- A toolbar at the top (replacing the status line 0.2 first had): back, forward and up buttons, and the path as pieces to click, with `read-only` or `root` at its end. Back and forward keep the last 100 directories (Alt+Left, Alt+Right, `-`, the mouse's side buttons).
-- The mouse came forward from 0.5: click selects, double-click enters a directory, a click in the parent or preview column goes there, and the wheel scrolls the column under the pointer without moving the selection.
+Like a file explorer: a toolbar along the top, a sidebar of places on the left, and the current directory filling the rest.
+
+- **Toolbar:** a sidebar button, back, forward and up, then the path as pieces to click, with `read-only` or `root` at its end. Back and forward keep the last 100 directories and skip any deleted since. A path too long for the box folds its start into `…`.
+- **Sidebar:** Home, then the user folders that exist (Desktop, Documents, Downloads, Music, Pictures, Videos, from `user-dirs.dirs` or the usual names), File system (`/`), and under a Drives heading whatever is mounted in `/run/media`, `/media` or `/mnt`. It follows `/proc/self/mountinfo`, so a drive shows up when it's mounted and goes when it's unmounted. The place you're in is highlighted. Bookmarks join it in 0.3.
+- The sidebar is 180 logical pixels wide to begin with. Its edge can be dragged (no narrower than 100, no wider than half the window), and the width and whether it's shown are kept in `~/.local/state/files/state`. Under 60 cells of width it hides itself.
+- **The list:** the current directory, with size and date on the right where there's room.
+- **Mouse** (brought forward from 0.5): click selects, double-click enters a directory, a place goes there, and the wheel scrolls the list without moving the selection. The mouse's side buttons go back and forward.
+- No preview. 0.2 first had Miller columns (parent, current, preview) with image and text previews made on worker threads; they were replaced by this layout in 0.2.2. That code is in git history (`14b4e7f`) if a preview pane comes back, and the image decoding and worker thread will return with 0.5's thumbnail grid.
+- The status line 0.2 first had is gone too. The details it showed are the list's size and date columns; permissions and owner come back in a properties view if they're missed.
 
 ### Controls
 
 | Key | Action |
 |---|---|
-| `J`, `K` | Scroll the preview |
-| `z` | Toggle the preview column |
+| Alt+Left or `-`, Alt+Right | Back, forward |
+| Alt+Up | Up, like `h` |
+| `b`, F9 | Show or hide the sidebar |
+| `<`, `>`, `=` | Sidebar narrower, wider, back to 180 |
 
 ### Manual checks
 
-- Moving through a directory of photos keeps up with key repeat; previews appear as they're decoded and never block movement.
-- A text file's preview shows its start; a binary file shows its details.
-- Narrowing the window drops the parent column, then the preview.
+- The sidebar button, back, forward, up and the path pieces work by clicking; the side buttons go back and forward.
+- Clicking selects, double-clicking enters, and the wheel scrolls the list.
+- Plugging in a USB stick (once mounted) adds it under Drives; unmounting removes it.
+- Dragging the sidebar's edge resizes it, and the width and visibility come back after a restart.
 
 ---
 
@@ -209,15 +211,15 @@ So a slip can't delete the system, files only changes things inside the user's o
 
 ## 0.5: Mouse, thumbnails, config and desktop integration
 
-- Mouse: since 0.2 the dividers drag, clicks select, double-clicks enter directories, the wheel scrolls, and the toolbar's buttons and path work. Left for 0.5: double-click opens files (through 0.3's opener), right-click opens the "Open with" list. Drag and drop out of files (`text/uri-list`) and into it.
+- Mouse: since 0.2 the sidebar's edge drags, clicks select, double-clicks enter directories, the wheel scrolls, and the toolbar's buttons and path work. Left for 0.5: double-click opens files (through 0.3's opener), right-click opens the "Open with" list. Drag and drop out of files (`text/uri-list`) and into it.
 - A grid view (`t`) of thumbnails for image directories. Thumbnails follow the freedesktop thumbnail spec (`~/.cache/thumbnails/normal` and `large`, PNG with `Thumb::URI` and `Thumb::MTime`), so other applications can share them. wall's browser keeps a private cache of its own (`~/.cache/wall/thumbnails`); moving it onto the standard one is optional and would let the two share.
 - Config through desk at `~/.config/files/files.conf`, written from a sample on first run:
 
   ```ini
   [layout]
-  # Column widths as parent : current : preview, until they're dragged.
+  # The sidebar's starting width in logical pixels, until it's dragged.
   # Dragged widths are kept in ~/.local/state/files/state.
-  columns = 1:2:3
+  sidebar = 180
   font_size = 11
 
   [view]
@@ -225,9 +227,9 @@ So a slip can't delete the system, files only changes things inside the user's o
   sort = name
   directories_first = true
 
-  [preview]
+  [thumbnails]
   enable = true
-  # Largest file decoded for an image preview, in MiB.
+  # Largest image decoded for a thumbnail, in MiB.
   image_limit = 64
 
   [safety]
@@ -273,7 +275,7 @@ files --portal
 
 ### The picker window
 
-- It's the normal Miller columns, previews, filter (`/`), path entry (`:`), bookmarks (`'`), sorting and hidden files. The only change is a choose bar at the bottom with the title, the active filter, the accept button and, when saving, the name field.
+- It's the normal toolbar, sidebar and list, filter (`/`), path entry (`:`), bookmarks (`'`), sorting and hidden files. The only change is a choose bar at the bottom with the title, the active filter, the accept button and, when saving, the name field.
 - App ID `files-picker`, floating, with a dwl rule like view's, at about 60% of the output.
 - Entries that don't match the active filter are hidden. Directories always show. `Ctrl+F` cycles the filters.
 - Only `a` (new file or directory) is available from 0.4's operations, because saving into a new folder is a common need. Cut, paste, rename and trash are off, so a stray key in a dialog can't move anything.
@@ -368,10 +370,10 @@ How applications pick up the portal (to confirm against the installed versions):
 ## After 1.0 (unscheduled)
 
 - The portal's `choices` (extra combo boxes and checkboxes) drawn in the choose bar, if an application needs them.
-- Removable drives in a sidebar, through `mount` (#15) once it exists.
+- Drives that aren't mounted yet in the sidebar, mounted with a click through `mount` (#15) once it exists. Mounted ones are listed since 0.2.
 - Archives: browse `.zip` and `.tar.*` as directories through libarchive, which is installed.
-- Tabs or split panes, if Miller columns turn out not to be enough.
-- PDF and video previews, once `read` and `video` exist to borrow from.
+- Tabs or split panes, if one list turns out not to be enough.
+- A preview pane, if it's missed: images and text from 0.2's first version (`14b4e7f`), PDF and video once `read` and `video` exist to borrow from.
 - Bulk rename in `editor`: the names as lines of a file, renamed to whatever they are when it's saved.
 
 ## Milestone summary
@@ -379,7 +381,7 @@ How applications pick up the portal (to confirm against the installed versions):
 | Version | Theme | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Miller columns, previews of directories, images and text, toolbar with back, forward and the path, mouse | Done (live key and mouse checks pending) |
+| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse | Done (live key and mouse checks pending) |
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
 | 0.5 | Right-click, drag and drop, thumbnail grid, config, palette, desktop entry | Not started |
