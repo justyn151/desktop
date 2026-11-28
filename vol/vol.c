@@ -1,6 +1,6 @@
 /* vol: audio and volume control. The command line reads and changes the
-   default output or input and follows it for bar; without a command in a
-   terminal, vol is a mixer for every output, input, stream and card. It talks
+   default output or input and follows it for bar; vol mixer is a window with
+   every output, input, stream and card. It talks
    to PipeWire through pipewire-pulse with libpulse, which keeps the device's
    route volume that WirePlumber saves and restores. */
 #define _GNU_SOURCE
@@ -9,8 +9,11 @@
 
 #include "desk.h"
 
+#include "cursor-shape-v1-client-protocol.h"
+
 #include <errno.h>
 #include <getopt.h>
+#include <linux/input-event-codes.h>
 #include <locale.h>
 #include <math.h>
 #include <poll.h>
@@ -22,11 +25,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <termios.h>
 #include <unistd.h>
-#include <wchar.h>
-#include <wctype.h>
+#include <wayland-client.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 enum action { ACTION_GET, ACTION_UP, ACTION_DOWN, ACTION_SET, ACTION_MUTE, ACTION_FOLLOW, ACTION_MIXER };
 enum mute_change { MUTE_TOGGLE, MUTE_ON, MUTE_OFF };
@@ -462,30 +463,40 @@ static void connect_server(struct app *app)
         lost(app);
 }
 
-/* The mixer: a terminal view of every output, input, playing stream and sound
-   card, kept live from the server's events. It runs on libpulse's main loop,
-   with the keyboard, signals and the palette file hooked into it. */
+/* The mixer: a window with every output, input, playing stream and sound card,
+   kept live from the server's events. Wayland and the sound server share
+   libpulse's main loop: the display, key repeat and palette file are its io
+   events, so there is one loop and no threads. */
 
 enum view { VIEW_OUTPUT, VIEW_INPUT, VIEW_PLAYBACK, VIEW_DEVICES, VIEW_COUNT };
 
 static const char *const view_names[VIEW_COUNT] = {"Output", "Input", "Playback", "Devices"};
 
-enum color { BACKGROUND, FOREGROUND, HIGHLIGHT, MUTED, SELECTION_BACKGROUND, SELECTION_FOREGROUND,
-             COLOR_COUNT };
+#define FONT_POINTS 11.0     /* At 96 dpi, like files. */
+#define PADDING 12           /* Logical pixels. */
+#define WINDOW_WIDTH 560
+#define WINDOW_HEIGHT 480
+#define WHEEL_PIXELS 15.0    /* Touchpad distance per level step. */
+#define MAX_REPEATS 8        /* Repeats handled at once after a stall. */
 
-static const enum desk_role color_roles[COLOR_COUNT] = {
-    [BACKGROUND] = DESK_BACKGROUND, [FOREGROUND] = DESK_FOREGROUND,
-    [HIGHLIGHT] = DESK_HIGHLIGHT, [MUTED] = DESK_MUTED,
-    [SELECTION_BACKGROUND] = DESK_SELECTION_BACKGROUND,
-    [SELECTION_FOREGROUND] = DESK_SELECTION_FOREGROUND,
+/* Symbols Nerd Font (Font Awesome range). */
+#define ICON_SPEAKER 0xf028
+#define ICON_SPEAKER_OFF 0xf026
+#define ICON_MIC 0xf130
+#define ICON_MIC_OFF 0xf131
+
+struct colors {
+    uint32_t background, foreground, accent, highlight, muted, urgent;
 };
 
-static const uint32_t color_defaults[COLOR_COUNT] = {
-    0x353535, 0xc5ad81, 0xead4aa, 0x887d69, 0xc5ad81, 0x353535,
-};
-
-struct theme {
-    char normal[48], highlight[48], muted[48], selection[48], selection_peak[48];
+/* Without a palette, the same colors as files. */
+static const struct colors default_colors = {
+    .background = 0xff1a1b26,
+    .foreground = 0xffc0caf5,
+    .accent = 0xff7aa2f7,
+    .highlight = 0xffbb9af7,
+    .muted = 0xff565f89,
+    .urgent = 0xfff7768e,
 };
 
 /* A sink, a source or a sink input: anything with a level. */
@@ -535,20 +546,20 @@ struct meter {
 
 enum pick { PICK_NONE, PICK_SINK, PICK_PROFILE };
 
-enum key {
-    KEY_NONE, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_TAB, KEY_BACKTAB,
-    KEY_ENTER, KEY_DEFAULT, KEY_MUTE, KEY_QUIT, KEY_ESCAPE, KEY_VIEW,
+/* What's under the pointer. */
+enum target_kind {
+    TARGET_NONE, TARGET_TAB, TARGET_ROW, TARGET_DEFAULT, TARGET_MUTE, TARGET_SLIDER, TARGET_DROPDOWN,
+    TARGET_CHOICE, TARGET_PANEL, TARGET_OUTSIDE,
 };
 
-struct input {
-    enum { INPUT_TEXT, INPUT_ESCAPE, INPUT_CSI } state;
-    int params[3];
-    int count;
-    bool mouse;
+struct target {
+    enum target_kind kind;
+    size_t index;
 };
 
-struct line {
-    char text[1024];
+struct hit {
+    struct target target;
+    int left, top, right, bottom;   /* Buffer pixels. */
 };
 
 struct mixer {
@@ -556,9 +567,9 @@ struct mixer {
     pa_mainloop *loop;
     pa_mainloop_api *api;
     pa_context *context;
-    pa_time_event *reconnect_timer, *tick, *escape_timer;
-    pa_io_event *keyboard, *palette_event;
-    bool ready, listed, quit;
+    pa_time_event *reconnect_timer, *tick;
+    pa_io_event *wayland_event, *repeat_event, *palette_event;
+    bool ready, listed, running;
     int status, signal;
 
     /* Lists are read into next, then swapped in whole. One refresh at a time,
@@ -571,29 +582,48 @@ struct mixer {
     size_t meter_count;
 
     enum view view;
-    size_t cursor[VIEW_COUNT], top;
+    size_t cursor[VIEW_COUNT];
     uint32_t cursor_id[VIEW_COUNT];
+    int scroll;                     /* Buffer pixels the list is scrolled by. */
+    bool reveal;                    /* Scroll the cursor's row into view on the next paint. */
     enum pick pick;
     uint32_t pick_target;
     size_t pick_cursor;
+    int pick_scroll;
 
-    struct input input;
-    struct theme theme;
+    /* Wayland */
+    struct wl_display *display;
+    struct wl_registry *registry;
+    DeskGlobals globals;
+    struct wl_seat *seat;
+    struct wl_pointer *pointer;
+    struct wl_keyboard *wl_keyboard;
+    struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+    struct wp_cursor_shape_device_v1 *cursor_shape;
+    DeskWindow window;
+    DeskKeyboard keyboard;
+    DeskRepeat repeat;
+    bool read_prepared;
+
+    DeskFont *font;
+    struct colors colors;
     char *palette_path;
     DeskWatch palette_watch;
     char notice[192];
 
-    /* Where things were drawn, for the mouse. */
-    struct line *lines;
-    int *row_items;
-    unsigned width, height;
-    int tab_start[VIEW_COUNT], tab_end[VIEW_COUNT];
-    int bar_x, bar_width;
-    bool dirty, clear;
+    /* The pointer, in logical pixels, and what the last paint put where. */
+    double pointer_x, pointer_y;
+    bool pointer_inside;
+    struct target hover;
+    struct hit *hits;
+    size_t hit_count, hit_capacity;
+    int row_height, list_top, list_bottom, pick_row_height, pick_rows;
+    int scroll_steps;
+    double scroll_pixels;
+    bool dragging;                  /* A slider follows the pointer. */
+    uint32_t drag_id;
+    int drag_left, drag_right;
 };
-
-static struct termios saved_termios;
-static bool terminal_active;
 
 static void *grow(void *old, size_t count, size_t size)
 {
@@ -610,133 +640,35 @@ static void copy_text(char *dest, size_t size, const char *text)
     snprintf(dest, size, "%s", text ? text : "");
 }
 
+static void redraw(struct mixer *mixer)
+{
+    desk_window_redraw(&mixer->window);
+}
+
 static void notice(struct mixer *mixer, const char *format, ...)
 {
     va_list args;
     va_start(args, format);
     vsnprintf(mixer->notice, sizeof mixer->notice, format, args);
     va_end(args);
-    mixer->dirty = true;
+    redraw(mixer);
 }
 
-/* Theme */
-
-static void format_style(char *text, size_t size, uint32_t background, uint32_t foreground)
+static void update_colors(struct mixer *mixer)
 {
-    snprintf(text, size, "\033[48;2;%u;%u;%u;38;2;%u;%u;%um",
-             (unsigned)(background >> 16 & 255), (unsigned)(background >> 8 & 255),
-             (unsigned)(background & 255), (unsigned)(foreground >> 16 & 255),
-             (unsigned)(foreground >> 8 & 255), (unsigned)(foreground & 255));
-}
-
-/* The wallpaper's palette when there is one, the defaults otherwise. */
-static void apply_theme(struct mixer *mixer)
-{
-    uint32_t rgb[COLOR_COUNT];
-    memcpy(rgb, color_defaults, sizeof rgb);
     DeskPalette palette;
-    if (mixer->palette_path && desk_palette_load(mixer->palette_path, &palette) == 0)
-        for (size_t i = 0; i < COLOR_COUNT; i++)
-            rgb[i] = palette.rgb[color_roles[i]];
-    struct theme *theme = &mixer->theme;
-    format_style(theme->normal, sizeof theme->normal, rgb[BACKGROUND], rgb[FOREGROUND]);
-    format_style(theme->highlight, sizeof theme->highlight, rgb[BACKGROUND], rgb[HIGHLIGHT]);
-    format_style(theme->muted, sizeof theme->muted, rgb[BACKGROUND], rgb[MUTED]);
-    format_style(theme->selection, sizeof theme->selection, rgb[SELECTION_BACKGROUND],
-                 rgb[SELECTION_FOREGROUND]);
-    format_style(theme->selection_peak, sizeof theme->selection_peak, rgb[SELECTION_BACKGROUND],
-                 rgb[HIGHLIGHT]);
-    mixer->clear = mixer->dirty = true;
-    if (mixer->lines)
-        memset(mixer->lines, 0, mixer->height * sizeof *mixer->lines);
-}
-
-/* Terminal */
-
-static void terminal_restore(void)
-{
-    if (!terminal_active)
+    if (!mixer->palette_path || desk_palette_load(mixer->palette_path, &palette) != 0) {
+        mixer->colors = default_colors;
         return;
-    fputs("\033[0m\033[?1006l\033[?1000l\033[?1049l\033[?25h", stdout);
-    fflush(stdout);
-    while (tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios) < 0 && errno == EINTR)
-        continue;
-    terminal_active = false;
-}
-
-static int terminal_enter(void)
-{
-    if (tcgetattr(STDIN_FILENO, &saved_termios) < 0)
-        return -1;
-    struct termios raw = saved_termios;
-    cfmakeraw(&raw);
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0)
-        return -1;
-    terminal_active = true;
-    /* The alternate screen, no cursor, and clicks and the wheel as SGR reports. */
-    fputs("\033[?1049h\033[?25l\033[?1000h\033[?1006h", stdout);
-    return fflush(stdout);
-}
-
-static void terminal_size(struct mixer *mixer)
-{
-    struct winsize size = {0};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) < 0)
-        size = (struct winsize){0};
-    unsigned width = size.ws_col ? size.ws_col : 80;
-    unsigned height = size.ws_row ? size.ws_row : 24;
-    if (width == mixer->width && height == mixer->height)
-        return;
-    mixer->lines = grow(mixer->lines, height, sizeof *mixer->lines);
-    memset(mixer->lines, 0, height * sizeof *mixer->lines);
-    mixer->row_items = grow(mixer->row_items, height + 1, sizeof *mixer->row_items);
-    mixer->width = width;
-    mixer->height = height;
-    mixer->clear = mixer->dirty = true;
-}
-
-/* Copy at most limit columns of input into out, with '?' for what can't be shown.
-   Returns the columns used. */
-static unsigned fit_text(char *out, const char *input, unsigned limit)
-{
-    unsigned columns = 0;
-    size_t length = strlen(input);
-    mbstate_t state = {0};
-    while (length && columns < limit) {
-        wchar_t character;
-        size_t consumed = mbrtowc(&character, input, length, &state);
-        if (consumed == (size_t)-1 || consumed == (size_t)-2 || consumed == 0) {
-            state = (mbstate_t){0};
-            consumed = 1;
-            character = L'\0';
-        }
-        int width = iswprint((wint_t)character) ? wcwidth(character) : -1;
-        if (width <= 0) {
-            *out++ = '?';
-            columns++;
-        } else {
-            if ((unsigned)width > limit - columns)
-                break;
-            memcpy(out, input, consumed);
-            out += consumed;
-            columns += (unsigned)width;
-        }
-        input += consumed;
-        length -= consumed;
     }
-    *out = '\0';
-    return columns;
-}
-
-/* Fit text into exactly width columns, padding with spaces. */
-static char *pad_text(char *out, const char *input, unsigned width)
-{
-    unsigned columns = fit_text(out, input, width);
-    char *end = out + strlen(out);
-    while (columns++ < width)
-        *end++ = ' ';
-    *end = '\0';
-    return end;
+    mixer->colors = (struct colors){
+        .background = 0xff000000u | palette.rgb[DESK_BACKGROUND],
+        .foreground = 0xff000000u | palette.rgb[DESK_FOREGROUND],
+        .accent = 0xff000000u | palette.rgb[DESK_ACCENT],
+        .highlight = 0xff000000u | palette.rgb[DESK_HIGHLIGHT],
+        .muted = 0xff000000u | palette.rgb[DESK_MUTED],
+        .urgent = 0xff000000u | palette.rgb[DESK_URGENT],
+    };
 }
 
 /* The model */
@@ -802,17 +734,15 @@ static uint32_t view_id(struct mixer *mixer, enum view view, size_t row)
     return nodes ? nodes->items[row].index : mixer->now.cards[row].index;
 }
 
-static struct node *selected_node(struct mixer *mixer)
+static struct node *node_at(struct mixer *mixer, size_t row)
 {
     struct nodes *nodes = view_nodes(mixer, mixer->view);
-    size_t row = mixer->cursor[mixer->view];
     return nodes && row < nodes->count ? &nodes->items[row] : NULL;
 }
 
-static struct card *selected_card(struct mixer *mixer)
+static struct node *selected_node(struct mixer *mixer)
 {
-    size_t row = mixer->cursor[VIEW_DEVICES];
-    return mixer->view == VIEW_DEVICES && row < mixer->now.card_count ? &mixer->now.cards[row] : NULL;
+    return node_at(mixer, mixer->cursor[mixer->view]);
 }
 
 static size_t pick_count(struct mixer *mixer)
@@ -834,7 +764,7 @@ static void select_row(struct mixer *mixer, size_t row)
         mixer->notice[0] = '\0';
     mixer->cursor[mixer->view] = row;
     mixer->cursor_id[mixer->view] = view_id(mixer, mixer->view, row);
-    mixer->dirty = true;
+    redraw(mixer);
 }
 
 /* Meters */
@@ -852,7 +782,7 @@ static void meter_read(pa_stream *stream, size_t length, void *data)
             float peak = ((const float *)samples)[size / sizeof(float) - 1];
             meter->peak = peak < 0 ? 0 : peak > 1 ? 1 : peak;
             meter->at = pa_rtclock_now();
-            meter->mixer->dirty = true;
+            redraw(meter->mixer);
         }
         pa_stream_drop(stream);
     }
@@ -907,7 +837,7 @@ static struct meter *find_meter(struct mixer *mixer, uint32_t source)
     return NULL;
 }
 
-/* Meters for the rows on screen: each output's monitor, or each input. */
+/* Meters for the view on screen: each output's monitor, or each input. */
 static void sync_meters(struct mixer *mixer)
 {
     struct nodes *nodes = !mixer->ready ? NULL : mixer->view == VIEW_OUTPUT ? &mixer->now.sinks :
@@ -977,7 +907,7 @@ static void list_done(struct mixer *mixer)
         }
     }
     sync_meters(mixer);
-    mixer->dirty = true;
+    redraw(mixer);
     if (mixer->again) {
         mixer->again = false;
         refresh(mixer);
@@ -1140,12 +1070,14 @@ static void set_level(struct mixer *mixer, struct node *node, int percent)
         notice(mixer, "This stream's level can't be changed");
         return;
     }
-    if (!node->volume.channels)
+    if (!node->volume.channels || !mixer->ready)
         return;
     if (percent < 0)
         percent = 0;
     if (percent > VOL_MAX_LIMIT)
         percent = VOL_MAX_LIMIT;
+    if (percent == percent_of(pa_cvolume_max(&node->volume)))
+        return;
     /* Scaling keeps the balance between channels. Kept locally too, so held keys add up. */
     pa_cvolume_scale(&node->volume, volume_of(percent));
     pa_context *context = mixer->context;
@@ -1162,7 +1094,7 @@ static void set_level(struct mixer *mixer, struct node *node, int percent)
     default:
         break;
     }
-    mixer->dirty = true;
+    redraw(mixer);
 }
 
 /* Up stops at [volume] max, but never lowers a level already above it. */
@@ -1172,12 +1104,13 @@ static void step_level(struct mixer *mixer, struct node *node, bool up)
     int next = up ? now + step : now - step;
     if (up && next > mixer->config.max)
         next = now > mixer->config.max ? now : mixer->config.max;
-    if (next != now)
-        set_level(mixer, node, next);
+    set_level(mixer, node, next);
 }
 
 static void toggle_mute(struct mixer *mixer, struct node *node)
 {
+    if (!mixer->ready)
+        return;
     node->muted = !node->muted;
     pa_context *context = mixer->context;
     if (mixer->view == VIEW_OUTPUT)
@@ -1186,11 +1119,13 @@ static void toggle_mute(struct mixer *mixer, struct node *node)
         send(mixer, pa_context_set_source_mute_by_index(context, node->index, node->muted, changed_reply, mixer));
     else
         send(mixer, pa_context_set_sink_input_mute(context, node->index, node->muted, changed_reply, mixer));
-    mixer->dirty = true;
+    redraw(mixer);
 }
 
 static void make_default(struct mixer *mixer, struct node *node)
 {
+    if (!mixer->ready || (mixer->view != VIEW_OUTPUT && mixer->view != VIEW_INPUT))
+        return;
     if (mixer->view == VIEW_OUTPUT) {
         copy_text(mixer->now.default_sink, sizeof mixer->now.default_sink, node->name);
         send(mixer, pa_context_set_default_sink(mixer->context, node->name, changed_reply, mixer));
@@ -1198,13 +1133,16 @@ static void make_default(struct mixer *mixer, struct node *node)
         copy_text(mixer->now.default_source, sizeof mixer->now.default_source, node->name);
         send(mixer, pa_context_set_default_source(mixer->context, node->name, changed_reply, mixer));
     }
-    mixer->dirty = true;
+    redraw(mixer);
 }
 
-static void open_picker(struct mixer *mixer)
+/* The chooser: another output for a stream, or a profile for a card. */
+static void open_picker(struct mixer *mixer, size_t row)
 {
+    if (!mixer->ready)
+        return;
     if (mixer->view == VIEW_PLAYBACK) {
-        struct node *node = selected_node(mixer);
+        struct node *node = node_at(mixer, row);
         if (!node || !mixer->now.sinks.count)
             return;
         mixer->pick = PICK_SINK;
@@ -1213,9 +1151,9 @@ static void open_picker(struct mixer *mixer)
         for (size_t i = 0; i < mixer->now.sinks.count; i++)
             if (mixer->now.sinks.items[i].index == node->sink)
                 mixer->pick_cursor = i;
-    } else {
-        struct card *card = selected_card(mixer);
-        if (!card || !card->profile_count)
+    } else if (mixer->view == VIEW_DEVICES && row < mixer->now.card_count) {
+        struct card *card = &mixer->now.cards[row];
+        if (!card->profile_count)
             return;
         mixer->pick = PICK_PROFILE;
         mixer->pick_target = card->index;
@@ -1223,9 +1161,18 @@ static void open_picker(struct mixer *mixer)
         for (size_t i = 0; i < card->profile_count; i++)
             if (!strcmp(card->profiles[i].name, card->active))
                 mixer->pick_cursor = i;
+    } else {
+        return;
     }
+    mixer->pick_scroll = -1;    /* Centre the current choice on the first paint. */
     mixer->notice[0] = '\0';
-    mixer->dirty = true;
+    redraw(mixer);
+}
+
+static void close_picker(struct mixer *mixer)
+{
+    mixer->pick = PICK_NONE;
+    redraw(mixer);
 }
 
 static void choose(struct mixer *mixer)
@@ -1246,8 +1193,7 @@ static void choose(struct mixer *mixer)
         send(mixer, pa_context_set_card_profile_by_index(mixer->context, card->index, profile->name,
                                                          changed_reply, mixer));
     }
-    mixer->pick = PICK_NONE;
-    mixer->dirty = true;
+    close_picker(mixer);
 }
 
 /* Connection */
@@ -1265,14 +1211,14 @@ static void mixer_reconnect(pa_mainloop_api *api, pa_time_event *timer, const st
 
 static void mixer_lost(struct mixer *mixer)
 {
-    mixer->ready = mixer->listed = false;
+    mixer->ready = mixer->listed = mixer->dragging = false;
     mixer->pending = 0;
     mixer->again = false;
     mixer->pick = PICK_NONE;
     close_meters(mixer);
     free_model(&mixer->now);
     free_model(&mixer->next);
-    mixer->dirty = true;
+    redraw(mixer);
     if (mixer->reconnect_timer)
         return;
     struct timeval when;
@@ -1286,7 +1232,7 @@ static void mixer_subscribed(pa_context *context, int success, void *data)
     (void)context;
     struct mixer *mixer = data;
     if (!success)
-        notice(mixer, "Can't follow the sound server; changes won't show until restarted");
+        notice(mixer, "Can't follow the sound server; changes won't show until reopened");
 }
 
 static void mixer_state(pa_context *context, void *data)
@@ -1333,7 +1279,7 @@ static void mixer_connect(struct mixer *mixer)
     mixer->context = pa_context_new_with_proplist(mixer->api, "vol", properties);
     pa_proplist_free(properties);
     if (!mixer->context) {
-        mixer->quit = true;
+        mixer->running = false;
         mixer->status = EXIT_FAILED;
         return;
     }
@@ -1344,192 +1290,261 @@ static void mixer_connect(struct mixer *mixer)
 
 /* Drawing */
 
-static void paint_line(struct mixer *mixer, unsigned row, const char *style, const char *value)
+static uint32_t mix(uint32_t a, uint32_t b, unsigned amount)
 {
-    char line[sizeof mixer->lines[0].text];
-    const char *margin = mixer->width >= 40 ? "  " : "";
-    snprintf(line, sizeof line, "%s\033[K%s%s", style, margin, value);
-    char *previous = mixer->lines[row - 1].text;
-    if (strcmp(previous, line)) {
-        printf("\033[%u;1H%s", row, line);
-        strcpy(previous, line);
-    }
-}
-
-struct columns {
-    unsigned name, bar, level, output;
-};
-
-static struct columns node_columns(const struct mixer *mixer, unsigned width)
-{
-    struct columns columns = {
-        .bar = width >= 64 ? 24 : width >= 48 ? 14 : 0,
-        .level = 5,
-        .output = mixer->view == VIEW_PLAYBACK && width >= 72 ? 18 : 0,
-    };
-    unsigned used = 2 + (columns.bar ? columns.bar + 2 : 0) + columns.level +
-                    (columns.output ? columns.output + 2 : 0);
-    columns.name = width > used + 2 ? width - used - 2 : 1;
-    return columns;
-}
-
-/* A level bar: the level as a line, the meter's peak as blocks over it in the highlight color. */
-static char *level_bar(char *out, unsigned width, int level, int peak, const char *peak_style,
-                       const char *line_style, const char *rest_style)
-{
-    unsigned filled = (unsigned)(level >= 100 ? (int)width : (level * (int)width + 50) / 100);
-    unsigned peaked = peak < 0 ? 0 : (unsigned)(peak >= 100 ? (int)width : (peak * (int)width + 50) / 100);
-    if (peaked > filled)
-        peaked = filled;
-    const char *current = NULL;
-    for (unsigned i = 0; i < width; i++) {
-        const char *style = i < peaked ? peak_style : i < filled ? line_style : rest_style;
-        if (style != current) {
-            out += sprintf(out, "%s", style);
-            current = style;
-        }
-        out += sprintf(out, "%s", i < peaked ? "█" : i < filled ? "━" : "─");
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        unsigned x = (a >> shift) & 0xff, y = (b >> shift) & 0xff;
+        out |= ((x * (255 - amount) + y * amount + 127) / 255) << shift;
     }
     return out;
 }
 
-static void node_line(struct mixer *mixer, char *out, unsigned width, const struct node *node,
-                      bool selected)
+static int scaled(const struct mixer *mixer, double logical)
 {
-    const struct theme *theme = &mixer->theme;
-    struct columns columns = node_columns(mixer, width);
-    const char *base = selected ? theme->selection : node->muted ? theme->muted : theme->normal;
-    bool is_default = (mixer->view == VIEW_OUTPUT && !strcmp(node->name, mixer->now.default_sink)) ||
-                      (mixer->view == VIEW_INPUT && !strcmp(node->name, mixer->now.default_source));
-    char label[sizeof node->label + sizeof node->detail + 8];
-    if (node->detail[0])
-        snprintf(label, sizeof label, "%s: %s", node->label, node->detail);
-    else
-        snprintf(label, sizeof label, "%s", node->label);
-    out += sprintf(out, "%s%s", base, is_default ? "* " : "  ");
-    out = pad_text(out, label, columns.name);
-    int level = percent_of(pa_cvolume_max(&node->volume));
-    if (columns.bar) {
-        out += sprintf(out, "  ");
-        uint32_t source = mixer->view == VIEW_OUTPUT ? node->monitor :
-                          mixer->view == VIEW_INPUT ? node->index : PA_INVALID_INDEX;
-        int peak = node->muted ? -1 : meter_percent(mixer, source);
-        const char *peak_style = selected ? theme->selection_peak : theme->highlight;
-        const char *rest = selected ? theme->selection : theme->muted;
-        out = level_bar(out, columns.bar, node->muted ? 0 : level, peak, peak_style, base, rest);
-        out += sprintf(out, "%s", base);
+    return (int)lround(logical * desk_window_scale(&mixer->window));
+}
+
+/* A disc, smoothed by sampling each pixel 4×4. */
+static void fill_circle(DeskCanvas *canvas, double cx, double cy, double radius, uint32_t color)
+{
+    int left = (int)floor(cx - radius), right = (int)ceil(cx + radius);
+    int top = (int)floor(cy - radius), bottom = (int)ceil(cy + radius);
+    for (int y = top; y < bottom; y++)
+        for (int x = left; x < right; x++) {
+            unsigned inside = 0;
+            for (int sy = 0; sy < 4; sy++)
+                for (int sx = 0; sx < 4; sx++) {
+                    double dx = x + (sx + 0.5) / 4 - cx, dy = y + (sy + 0.5) / 4 - cy;
+                    inside += dx * dx + dy * dy <= radius * radius;
+                }
+            if (inside) {
+                uint32_t alpha = (color >> 24) * inside / 16;
+                desk_canvas_fill(canvas, x, y, 1, 1, alpha << 24 | (color & 0xffffff));
+            }
+        }
+}
+
+/* A small downward triangle with its top edge at x, y. */
+static void draw_arrow(DeskCanvas *canvas, int x, int y, int width, uint32_t color)
+{
+    for (int row = 0; row * 2 < width; row++)
+        desk_canvas_fill(canvas, x + row, y + row, width - 2 * row, 1, color);
+}
+
+/* Text cut to fit between left and right, with an ellipsis when it doesn't. */
+static int draw_text(DeskFont *font, DeskCanvas *canvas, int left, int right, int baseline, const char *text,
+                     uint32_t color)
+{
+    size_t length = strlen(text);
+    if (right <= left)
+        return left;
+    if (desk_text_width(font, text, length) <= right - left)
+        return desk_text_draw(font, canvas, left, baseline, text, length, color);
+    static const char ellipsis[] = "…";
+    int room = right - left - desk_text_width(font, ellipsis, strlen(ellipsis));
+    size_t fit = room > 0 ? desk_text_fit(font, text, length, room) : 0;
+    int x = desk_text_draw(font, canvas, left, baseline, text, fit, color);
+    return desk_text_draw(font, canvas, x, baseline, ellipsis, strlen(ellipsis), color);
+}
+
+static void draw_icon(DeskFont *font, DeskCanvas *canvas, int left, int width, int baseline, uint32_t code,
+                      uint32_t color)
+{
+    char utf8[4] = {(char)(0xe0 | code >> 12), (char)(0x80 | (code >> 6 & 0x3f)), (char)(0x80 | (code & 0x3f)), 0};
+    int advance = desk_text_width(font, utf8, 3);
+    desk_text_draw(font, canvas, left + (width - advance) / 2, baseline, utf8, 3, color);
+}
+
+static void add_hit(struct mixer *mixer, enum target_kind kind, size_t index, int left, int top, int right,
+                    int bottom)
+{
+    if (mixer->hit_count == mixer->hit_capacity) {
+        mixer->hit_capacity = mixer->hit_capacity ? 2 * mixer->hit_capacity : 64;
+        mixer->hits = grow(mixer->hits, mixer->hit_capacity, sizeof *mixer->hits);
     }
-    out += sprintf(out, "  ");
-    if (node->muted)
-        out += sprintf(out, "muted");
-    else
-        out += sprintf(out, "%4d%%", level);
-    if (columns.output) {
-        struct node *sink = find_node(&mixer->now.sinks, node->sink);
-        out += sprintf(out, "  ");
-        pad_text(out, sink ? sink->label : "", columns.output);
+    mixer->hits[mixer->hit_count++] = (struct hit){{kind, index}, left, top, right, bottom};
+}
+
+/* The last thing painted under the pointer wins. */
+static struct target target_at(const struct mixer *mixer)
+{
+    if (!mixer->pointer_inside)
+        return (struct target){TARGET_NONE, 0};
+    double scale = desk_window_scale(&mixer->window);
+    int x = (int)lround(mixer->pointer_x * scale), y = (int)lround(mixer->pointer_y * scale);
+    for (size_t i = mixer->hit_count; i-- > 0;) {
+        const struct hit *hit = &mixer->hits[i];
+        if (x >= hit->left && x < hit->right && y >= hit->top && y < hit->bottom)
+            return hit->target;
+    }
+    return (struct target){TARGET_NONE, 0};
+}
+
+static bool hovering(const struct mixer *mixer, enum target_kind kind, size_t index)
+{
+    return mixer->hover.kind == kind && mixer->hover.index == index;
+}
+
+/* The metrics of one paint, in buffer pixels. */
+struct layout {
+    int padding, line, ascent, width, height;
+};
+
+static void paint_tabs(struct mixer *mixer, DeskCanvas *canvas, const struct layout *ui)
+{
+    const struct colors *colors = &mixer->colors;
+    int top = ui->padding / 2, height = ui->line + ui->padding;
+    int left = ui->padding, width = (ui->width - 2 * ui->padding) / VIEW_COUNT;
+    int underline = scaled(mixer, 2) > 1 ? scaled(mixer, 2) : 1;
+    for (enum view view = 0; view < VIEW_COUNT; view++) {
+        int x = left + (int)view * width;
+        bool current = view == mixer->view;
+        if (current)
+            desk_canvas_fill(canvas, x, top, width - ui->padding / 4, height, mix(colors->background, colors->muted, 35));
+        else if (hovering(mixer, TARGET_TAB, view))
+            desk_canvas_fill(canvas, x, top, width - ui->padding / 4, height, mix(colors->background, colors->muted, 20));
+        if (current)
+            desk_canvas_fill(canvas, x, top + height - underline, width - ui->padding / 4, underline, colors->accent);
+        const char *name = view_names[view];
+        int text = desk_text_width(mixer->font, name, strlen(name));
+        desk_text_draw(mixer->font, canvas, x + (width - text) / 2, top + ui->padding / 2 + ui->ascent, name,
+                       strlen(name), current ? colors->foreground : colors->muted);
+        add_hit(mixer, TARGET_TAB, view, x, top, x + width, top + height);
     }
 }
 
-static void card_line(struct mixer *mixer, char *out, unsigned width, const struct card *card, bool selected)
+/* A slider from left to right centred on y: the level as a filled track
+   with a knob, the meter as a thin line under it. */
+static void paint_slider(struct mixer *mixer, DeskCanvas *canvas, const struct layout *ui, int left, int right,
+                         int y, int level, int peak, bool muted, bool lit)
 {
+    const struct colors *colors = &mixer->colors;
+    int track = scaled(mixer, 4) > 2 ? scaled(mixer, 4) : 2;
+    int span = right - left;
+    int filled = (int)lround(span * (level > 100 ? 1.0 : level / 100.0));
+    uint32_t fill = muted ? colors->muted : colors->accent;
+    desk_canvas_fill(canvas, left, y - track / 2, span, track, mix(colors->background, colors->muted, 45));
+    desk_canvas_fill(canvas, left, y - track / 2, filled, track, fill);
+    if (peak >= 0 && !muted) {
+        int meter = scaled(mixer, 3) > 2 ? scaled(mixer, 3) : 2;
+        int width = (int)lround(span * (peak > 100 ? 1.0 : peak / 100.0));
+        desk_canvas_fill(canvas, left, y + track / 2 + meter, width, meter, colors->highlight);
+    }
+    double radius = ui->line * (lit ? 0.36 : 0.3);
+    fill_circle(canvas, left + filled, y, radius, muted ? colors->muted : colors->foreground);
+}
+
+static void paint_node(struct mixer *mixer, DeskCanvas *canvas, const struct layout *ui, size_t row, int top)
+{
+    const struct colors *colors = &mixer->colors;
+    struct node *node = node_at(mixer, row);
+    int left = ui->padding, right = ui->width - ui->padding, inset = ui->padding * 3 / 4;
+    int icon = ui->line + ui->padding / 2, text_left = left + icon + ui->padding / 2;
+    int baseline = top + inset + ui->ascent;
+    int line2 = top + inset + ui->line + ui->padding / 2, middle = line2 + ui->line / 2;
+
+    /* The default: a dot to click, filled for the one in use. */
+    int name_right = right;
+    if (mixer->view != VIEW_PLAYBACK) {
+        bool is_default = !strcmp(node->name, mixer->view == VIEW_OUTPUT ? mixer->now.default_sink :
+                                                                           mixer->now.default_source);
+        double cx = left + icon / 2.0, cy = top + inset + ui->line / 2.0, radius = ui->line * 0.3;
+        uint32_t ring = hovering(mixer, TARGET_DEFAULT, row) ? colors->foreground : colors->muted;
+        if (is_default) {
+            fill_circle(canvas, cx, cy, radius, colors->accent);
+        } else {
+            fill_circle(canvas, cx, cy, radius, ring);
+            fill_circle(canvas, cx, cy, radius - (scaled(mixer, 1.5) > 1 ? scaled(mixer, 1.5) : 1),
+                        mix(colors->background, colors->muted, row == mixer->cursor[mixer->view] ? 25 : 0));
+        }
+        add_hit(mixer, TARGET_DEFAULT, row, left, top, left + icon, top + inset + ui->line + ui->padding / 4);
+    } else {
+        /* Where it plays, as a dropdown on the right. */
+        struct node *sink = find_node(&mixer->now.sinks, node->sink);
+        const char *label = sink ? sink->label : "Unknown output";
+        int arrow = ui->line / 2, text = desk_text_width(mixer->font, label, strlen(label));
+        int room = (right - text_left) / 2;
+        int width = text + arrow + ui->padding * 3 / 2;
+        if (width > room)
+            width = room;
+        int box_left = right - width;
+        if (hovering(mixer, TARGET_DROPDOWN, row))
+            desk_canvas_fill(canvas, box_left, top + inset - ui->padding / 4, width, ui->line + ui->padding / 2,
+                             mix(colors->background, colors->muted, 40));
+        draw_text(mixer->font, canvas, box_left + ui->padding / 2, right - arrow - ui->padding, baseline, label,
+                  colors->muted);
+        draw_arrow(canvas, right - arrow - ui->padding / 2, top + inset + ui->line / 2 - arrow / 4, arrow,
+                   colors->muted);
+        add_hit(mixer, TARGET_DROPDOWN, row, box_left, top + inset - ui->padding / 4, right,
+                top + inset + ui->line + ui->padding / 4);
+        name_right = box_left - ui->padding;
+    }
+    int x = draw_text(mixer->font, canvas, text_left, name_right, baseline, node->label, colors->foreground);
+    if (node->detail[0] || node->corked) {
+        char detail[sizeof node->detail + 16];
+        snprintf(detail, sizeof detail, "%s%s%s", node->detail, node->detail[0] && node->corked ? " · " : "",
+                 node->corked ? "paused" : "");
+        x = desk_text_draw(mixer->font, canvas, x, baseline, "  ", 2, colors->muted);
+        draw_text(mixer->font, canvas, x, name_right, baseline, detail, colors->muted);
+    }
+
+    /* Mute, the slider and the percentage. */
+    uint32_t code = mixer->view == VIEW_INPUT ? (node->muted ? ICON_MIC_OFF : ICON_MIC) :
+                    (node->muted ? ICON_SPEAKER_OFF : ICON_SPEAKER);
+    if (hovering(mixer, TARGET_MUTE, row))
+        desk_canvas_fill(canvas, left, line2 - ui->padding / 4, icon, ui->line + ui->padding / 2,
+                         mix(colors->background, colors->muted, 40));
+    draw_icon(mixer->font, canvas, left, icon, line2 + ui->ascent, code, node->muted ? colors->urgent : colors->foreground);
+    add_hit(mixer, TARGET_MUTE, row, left, line2 - ui->padding / 4, left + icon, line2 + ui->line + ui->padding / 4);
+
+    int level = percent_of(pa_cvolume_max(&node->volume));
+    char percent[16];
+    snprintf(percent, sizeof percent, "%d%%", level);
+    int percent_width = desk_text_width(mixer->font, "150%", 4);
+    int text = desk_text_width(mixer->font, percent, strlen(percent));
+    desk_text_draw(mixer->font, canvas, right - text, line2 + ui->ascent, percent, strlen(percent),
+                   node->muted ? colors->muted : colors->foreground);
+    int slider_left = text_left + ui->line / 3, slider_right = right - percent_width - ui->padding - ui->line / 3;
+    uint32_t source = mixer->view == VIEW_OUTPUT ? node->monitor :
+                      mixer->view == VIEW_INPUT ? node->index : PA_INVALID_INDEX;
+    bool lit = hovering(mixer, TARGET_SLIDER, row) || (mixer->dragging && mixer->drag_id == node->index);
+    if (node->has_volume)
+        paint_slider(mixer, canvas, ui, slider_left, slider_right, middle, level, meter_percent(mixer, source),
+                     node->muted, lit);
+    else
+        draw_text(mixer->font, canvas, slider_left, slider_right, line2 + ui->ascent, "Fixed level", colors->muted);
+    add_hit(mixer, TARGET_SLIDER, row, slider_left - ui->line / 2, line2 - ui->padding / 4,
+            slider_right + ui->line / 2, line2 + ui->line + ui->padding / 4);
+}
+
+static void paint_card(struct mixer *mixer, DeskCanvas *canvas, const struct layout *ui, size_t row, int top)
+{
+    const struct colors *colors = &mixer->colors;
+    struct card *card = &mixer->now.cards[row];
+    int left = ui->padding, right = ui->width - ui->padding, inset = ui->padding * 3 / 4;
+    int icon = ui->line + ui->padding / 2, text_left = left + icon + ui->padding / 2;
+    draw_icon(mixer->font, canvas, left, icon, top + inset + ui->ascent, ICON_SPEAKER, colors->muted);
+    draw_text(mixer->font, canvas, text_left, right, top + inset + ui->ascent, card->label, colors->foreground);
+
     const char *active = "Off";
     for (size_t i = 0; i < card->profile_count; i++)
         if (!strcmp(card->profiles[i].name, card->active))
             active = card->profiles[i].label;
-    unsigned name_width = width >= 60 ? width / 2 - 2 : width - 2;
-    out += sprintf(out, "%s  ", selected ? mixer->theme.selection : mixer->theme.normal);
-    out = pad_text(out, card->label, name_width);
-    if (width >= 60) {
-        out += sprintf(out, "  ");
-        fit_text(out, active, width - name_width - 4);
-    }
-}
-
-static void pick_line(struct mixer *mixer, char *out, unsigned width, size_t row, bool selected)
-{
-    const struct theme *theme = &mixer->theme;
-    const char *label = "";
-    bool current = false, available = true;
-    if (mixer->pick == PICK_SINK) {
-        struct node *input = find_node(&mixer->now.inputs, mixer->pick_target);
-        struct node *sink = &mixer->now.sinks.items[row];
-        label = sink->label;
-        current = input && input->sink == sink->index;
-    } else {
-        struct card *card = find_card(&mixer->now, mixer->pick_target);
-        struct profile *profile = &card->profiles[row];
-        label = profile->label;
-        current = !strcmp(profile->name, card->active);
-        available = profile->available;
-    }
-    const char *style = selected ? theme->selection : !available ? theme->muted : theme->normal;
-    out += sprintf(out, "%s%s", style, current ? "* " : "  ");
-    out = pad_text(out, label, width - 2 - (available ? 0 : 14));
-    if (!available)
-        sprintf(out, "  unavailable");
-}
-
-static void tab_line(struct mixer *mixer, char *out)
-{
-    int column = mixer->width >= 40 ? 3 : 1;
-    for (enum view view = 0; view < VIEW_COUNT; view++) {
-        bool current = view == mixer->view;
-        const char *style = current ? mixer->theme.highlight : mixer->theme.muted;
-        out += sprintf(out, "%s%s%s%s", style, current ? "[" : " ", view_names[view], current ? "]" : " ");
-        mixer->tab_start[view] = column;
-        column += (int)strlen(view_names[view]) + 2;
-        mixer->tab_end[view] = column;
-        out += sprintf(out, "  ");
-        column += 2;
-    }
-}
-
-static const char *status_text(struct mixer *mixer, char *text, size_t size)
-{
-    if (!mixer->ready)
-        return mixer->reconnect_timer ? "Sound server not running | trying again" : "Connecting...";
-    if (!mixer->listed)
-        return "Reading...";
-    if (mixer->pick == PICK_SINK) {
-        struct node *input = find_node(&mixer->now.inputs, mixer->pick_target);
-        snprintf(text, size, "Play %s on:", input ? input->label : "this stream");
-        return text;
-    }
-    if (mixer->pick == PICK_PROFILE) {
-        struct card *card = find_card(&mixer->now, mixer->pick_target);
-        snprintf(text, size, "Profile for %s:", card ? card->label : "this card");
-        return text;
-    }
-    switch (mixer->view) {
-    case VIEW_OUTPUT:
-    case VIEW_INPUT: {
-        bool output = mixer->view == VIEW_OUTPUT;
-        struct nodes *nodes = view_nodes(mixer, mixer->view);
-        const char *name = output ? mixer->now.default_sink : mixer->now.default_source;
-        for (size_t i = 0; i < nodes->count; i++)
-            if (!strcmp(nodes->items[i].name, name)) {
-                snprintf(text, size, "Default %s: %s", output ? "output" : "input", nodes->items[i].label);
-                return text;
-            }
-        return output ? "No default output" : "No default input";
-    }
-    case VIEW_PLAYBACK: {
-        size_t playing = 0;
-        for (size_t i = 0; i < mixer->now.inputs.count; i++)
-            playing += !mixer->now.inputs.items[i].corked;
-        snprintf(text, size, "%zu stream%s, %zu playing", mixer->now.inputs.count,
-                 mixer->now.inputs.count == 1 ? "" : "s", playing);
-        return text;
-    }
-    default:
-        snprintf(text, size, "%zu card%s", mixer->now.card_count, mixer->now.card_count == 1 ? "" : "s");
-        return text;
-    }
+    int line2 = top + inset + ui->line + ui->padding / 2, arrow = ui->line / 2;
+    int box_top = line2 - ui->padding / 4, box_height = ui->line + ui->padding / 2;
+    desk_canvas_fill(canvas, text_left, box_top, right - text_left, box_height,
+                     mix(colors->background, colors->muted, hovering(mixer, TARGET_DROPDOWN, row) ? 70 : 50));
+    draw_text(mixer->font, canvas, text_left + ui->padding / 2, right - arrow - ui->padding, line2 + ui->ascent,
+              active, colors->foreground);
+    draw_arrow(canvas, right - arrow - ui->padding / 2, line2 + ui->line / 2 - arrow / 4, arrow, colors->foreground);
+    add_hit(mixer, TARGET_DROPDOWN, row, text_left, box_top, right, box_top + box_height);
 }
 
 static const char *empty_text(const struct mixer *mixer)
 {
+    if (!mixer->ready)
+        return mixer->reconnect_timer ? "The sound server isn't running. Trying again..." : "Connecting...";
     if (!mixer->listed)
         return "";
     static const char *const texts[VIEW_COUNT] = {"No outputs", "No inputs", "Nothing is playing",
@@ -1537,122 +1552,218 @@ static const char *empty_text(const struct mixer *mixer)
     return texts[mixer->view];
 }
 
-static const char *hint_text(const struct mixer *mixer, unsigned width)
+static void paint_list(struct mixer *mixer, DeskCanvas *canvas, const struct layout *ui)
 {
-    if (mixer->pick != PICK_NONE)
-        return "j/k  Enter Choose  Esc Back";
-    if (width < 56)
-        return "Tab  j/k  h/l  m  Enter  q";
-    switch (mixer->view) {
-    case VIEW_OUTPUT:
-    case VIEW_INPUT: return "Tab View  j/k  h/l Level  m Mute  Enter Default  q Quit";
-    case VIEW_PLAYBACK: return "Tab View  j/k  h/l Level  m Mute  Enter Move  q Quit";
-    default: return "Tab View  j/k  Enter Profile  q Quit";
-    }
-}
-
-static void heading_line(struct mixer *mixer, char *out, unsigned width)
-{
-    if (mixer->pick != PICK_NONE) {
-        snprintf(out, 64, "  %s", mixer->pick == PICK_SINK ? "Output" : "Profile");
+    const struct colors *colors = &mixer->colors;
+    size_t count = mixer->ready ? view_count(mixer, mixer->view) : 0;
+    int top = mixer->list_top, bottom = mixer->list_bottom, height = mixer->row_height;
+    if (!count) {
+        const char *text = empty_text(mixer);
+        int width = desk_text_width(mixer->font, text, strlen(text));
+        desk_text_draw(mixer->font, canvas, (ui->width - width) / 2, top + (bottom - top) / 2, text, strlen(text),
+                       colors->muted);
         return;
     }
-    if (mixer->view == VIEW_DEVICES) {
-        out += sprintf(out, "  ");
-        out = pad_text(out, "Card", width >= 60 ? width / 2 - 2 : width - 2);
-        if (width >= 60)
-            sprintf(out, "  Profile");
-        return;
+    int content = (int)count * height, visible = bottom - top;
+    if (mixer->reveal) {
+        int row_top = (int)mixer->cursor[mixer->view] * height;
+        if (row_top < mixer->scroll)
+            mixer->scroll = row_top;
+        if (row_top + height > mixer->scroll + visible)
+            mixer->scroll = row_top + height - visible;
+        mixer->reveal = false;
     }
-    struct columns columns = node_columns(mixer, width);
-    out += sprintf(out, "  ");
-    out = pad_text(out, "Name", columns.name);
-    if (columns.bar) {
-        out += sprintf(out, "  ");
-        out = pad_text(out, "Level", columns.bar);
-    }
-    out += sprintf(out, "       ");
-    if (columns.output)
-        sprintf(out, "Output");
-}
-
-static int render(struct mixer *mixer)
-{
-    if (mixer->clear) {
-        fputs(mixer->theme.normal, stdout);
-        fputs("\033[2J", stdout);
-        mixer->clear = false;
-    }
-    unsigned width = mixer->width >= 40 ? mixer->width - 2 : mixer->width;
-    if (width > 90)
-        width = 90;
-    unsigned footer = mixer->height >= 5 ? mixer->height - 1 : mixer->height;
-    unsigned first = 4;
-    size_t count = mixer->pick != PICK_NONE ? pick_count(mixer) : view_count(mixer, mixer->view);
-    size_t selected = mixer->pick != PICK_NONE ? mixer->pick_cursor : mixer->cursor[mixer->view];
-    size_t visible = footer > first ? footer - first : 0;
-    if (count <= visible) {
-        mixer->top = 0;
-    } else if (visible) {
-        if (mixer->top > count - visible)
-            mixer->top = count - visible;
-        if (selected < mixer->top)
-            mixer->top = selected;
-        if (selected - mixer->top >= visible)
-            mixer->top = selected - visible + 1;
-    }
-    struct columns columns = node_columns(mixer, width);
-    mixer->bar_width = mixer->pick == PICK_NONE && mixer->view != VIEW_DEVICES ? (int)columns.bar : 0;
-    mixer->bar_x = (mixer->width >= 40 ? 2 : 0) + 2 + (int)columns.name + 2 + 1;
-
-    char text[sizeof mixer->lines[0].text - 64], fitted[sizeof text];
-    for (unsigned row = 1; row <= mixer->height; row++) {
-        mixer->row_items[row] = -1;
-        const char *style = mixer->theme.muted, *value = "";
-        if (row == 1 && mixer->height > 1) {
-            tab_line(mixer, text);
-            paint_line(mixer, row, mixer->theme.muted, text);
+    if (mixer->scroll > content - visible)
+        mixer->scroll = content - visible;
+    if (mixer->scroll < 0)
+        mixer->scroll = 0;
+    DeskCanvas clipped = *canvas;
+    desk_canvas_clip(&clipped, 0, top, ui->width, bottom);
+    size_t hits_before = mixer->hit_count;
+    for (size_t row = 0; row < count; row++) {
+        int y = top + (int)row * height - mixer->scroll;
+        if (y + height <= top || y >= bottom)
             continue;
-        } else if (row >= footer) {
-            if (row == footer && mixer->notice[0]) {
-                style = mixer->theme.highlight;
-                value = mixer->notice;
-            }
-            if (row == mixer->height && (footer < row || !*value)) {
-                style = mixer->theme.muted;
-                value = hint_text(mixer, width);
-            }
-        } else if (row == 2) {
-            style = mixer->theme.normal;
-            value = status_text(mixer, fitted, sizeof fitted);
-        } else if (row == 3) {
-            if (count) {
-                heading_line(mixer, text, width);
-                value = text;
-            }
-        } else if (count) {
-            size_t index = mixer->top + row - first;
-            if (index < count) {
-                bool is_selected = index == selected;
-                if (mixer->pick != PICK_NONE)
-                    pick_line(mixer, text, width, index, is_selected);
-                else if (mixer->view == VIEW_DEVICES)
-                    card_line(mixer, text, width, &mixer->now.cards[index], is_selected);
-                else
-                    node_line(mixer, text, width, &view_nodes(mixer, mixer->view)->items[index], is_selected);
-                mixer->row_items[row] = (int)index;
-                paint_line(mixer, row, mixer->theme.normal, text);
-                continue;
-            }
-        } else if (row == first) {
-            value = empty_text(mixer);
-        }
-        fit_text(fitted, value, width);
-        paint_line(mixer, row, style, fitted);
+        bool selected = row == mixer->cursor[mixer->view];
+        if (selected || hovering(mixer, TARGET_ROW, row))
+            desk_canvas_fill(&clipped, ui->padding / 2, y, ui->width - ui->padding, height - ui->padding / 4,
+                             mix(colors->background, colors->muted, selected ? 25 : 12));
+        add_hit(mixer, TARGET_ROW, row, 0, y, ui->width, y + height);
+        if (mixer->view == VIEW_DEVICES)
+            paint_card(mixer, &clipped, ui, row, y);
+        else
+            paint_node(mixer, &clipped, ui, row, y);
     }
-    mixer->dirty = false;
-    return fflush(stdout) == EOF || ferror(stdout) ? -1 : 0;
+    /* Nothing outside the list's area is clickable. */
+    for (size_t i = hits_before; i < mixer->hit_count; i++) {
+        struct hit *hit = &mixer->hits[i];
+        if (hit->top < top)
+            hit->top = top;
+        if (hit->bottom > bottom)
+            hit->bottom = bottom;
+    }
 }
+
+/* The chooser over everything, the rest dimmed. */
+static void paint_picker(struct mixer *mixer, DeskCanvas *canvas, const struct layout *ui)
+{
+    const struct colors *colors = &mixer->colors;
+    desk_canvas_fill(canvas, 0, 0, ui->width, ui->height, 0xa0000000u | (colors->background & 0xffffff));
+    add_hit(mixer, TARGET_OUTSIDE, 0, 0, 0, ui->width, ui->height);
+
+    char title[256];
+    if (mixer->pick == PICK_SINK) {
+        struct node *input = find_node(&mixer->now.inputs, mixer->pick_target);
+        snprintf(title, sizeof title, "Play %s on", input ? input->label : "this stream");
+    } else {
+        struct card *card = find_card(&mixer->now, mixer->pick_target);
+        snprintf(title, sizeof title, "Profile for %s", card ? card->label : "this card");
+    }
+    size_t count = pick_count(mixer);
+    int row = ui->line + ui->padding, header = ui->line + ui->padding * 3 / 2;
+    int width = scaled(mixer, 420) < ui->width - 2 * ui->padding ? scaled(mixer, 420) : ui->width - 2 * ui->padding;
+    int room = ui->height - 4 * ui->padding - header - ui->padding / 2;
+    int rows = room / row < (int)count ? room / row : (int)count;
+    if (rows < 1)
+        rows = 1;
+    int height = header + rows * row + ui->padding / 2;
+    int left = (ui->width - width) / 2, top = (ui->height - height) / 2;
+    mixer->pick_row_height = row;
+    mixer->pick_rows = rows;
+    if (mixer->pick_scroll < 0)
+        mixer->pick_scroll = (int)mixer->pick_cursor - rows / 2;
+    if ((int)mixer->pick_cursor < mixer->pick_scroll)
+        mixer->pick_scroll = (int)mixer->pick_cursor;
+    if ((int)mixer->pick_cursor >= mixer->pick_scroll + rows)
+        mixer->pick_scroll = (int)mixer->pick_cursor - rows + 1;
+    if (mixer->pick_scroll > (int)count - rows)
+        mixer->pick_scroll = (int)count - rows;
+    if (mixer->pick_scroll < 0)
+        mixer->pick_scroll = 0;
+
+    uint32_t panel = mix(colors->background, colors->muted, 18) | 0xff000000u;
+    desk_canvas_fill(canvas, left, top, width, height, panel);
+    int line = scaled(mixer, 1) > 1 ? scaled(mixer, 1) : 1;
+    desk_canvas_fill(canvas, left, top, width, line, colors->muted);
+    desk_canvas_fill(canvas, left, top + height - line, width, line, colors->muted);
+    desk_canvas_fill(canvas, left, top, line, height, colors->muted);
+    desk_canvas_fill(canvas, left + width - line, top, line, height, colors->muted);
+    add_hit(mixer, TARGET_PANEL, 0, left, top, left + width, top + height);
+    draw_text(mixer->font, canvas, left + ui->padding, left + width - ui->padding, top + ui->padding + ui->ascent,
+              title, colors->foreground);
+
+    struct node *input = mixer->pick == PICK_SINK ? find_node(&mixer->now.inputs, mixer->pick_target) : NULL;
+    struct card *card = mixer->pick == PICK_PROFILE ? find_card(&mixer->now, mixer->pick_target) : NULL;
+    for (int i = 0; i < rows; i++) {
+        size_t index = (size_t)(mixer->pick_scroll + i);
+        if (index >= count)
+            break;
+        int y = top + header + i * row;
+        const char *label;
+        bool current, available = true;
+        if (input) {
+            struct node *sink = &mixer->now.sinks.items[index];
+            label = sink->label;
+            current = input->sink == sink->index;
+        } else {
+            struct profile *profile = &card->profiles[index];
+            label = profile->label;
+            current = !strcmp(profile->name, card->active);
+            available = profile->available;
+        }
+        if (index == mixer->pick_cursor || hovering(mixer, TARGET_CHOICE, index))
+            desk_canvas_fill(canvas, left + line, y, width - 2 * line, row,
+                             mix(panel, colors->muted, index == mixer->pick_cursor ? 70 : 40));
+        int dot = ui->line;
+        if (current)
+            fill_circle(canvas, left + ui->padding + dot / 2.0, y + row / 2.0, ui->line * 0.22, colors->accent);
+        int right = left + width - ui->padding;
+        if (!available) {
+            static const char note[] = "unavailable";
+            int note_width = desk_text_width(mixer->font, note, strlen(note));
+            desk_text_draw(mixer->font, canvas, right - note_width, y + ui->padding / 2 + ui->ascent, note,
+                           strlen(note), colors->muted);
+            right -= note_width + ui->padding;
+        }
+        draw_text(mixer->font, canvas, left + ui->padding + dot, right, y + ui->padding / 2 + ui->ascent, label,
+                  available ? colors->foreground : colors->muted);
+        add_hit(mixer, TARGET_CHOICE, index, left, y, left + width, y + row);
+    }
+}
+
+static void paint(struct mixer *mixer, DeskCanvas *canvas)
+{
+    const struct colors *colors = &mixer->colors;
+    double scale = desk_window_scale(&mixer->window);
+    double size = FONT_POINTS * 96.0 / 72.0 * scale;
+    if (fabs(desk_font_size(mixer->font) - size) > 0.01)
+        desk_font_resize(mixer->font, size);
+    DeskFontMetrics metrics = desk_font_metrics(mixer->font);
+    struct layout ui = {
+        .padding = (int)lround(PADDING * scale),
+        .line = metrics.height,
+        .ascent = metrics.ascent,
+        .width = canvas->width,
+        .height = canvas->height,
+    };
+    mixer->hit_count = 0;
+    for (int y = 0; y < canvas->height; ++y)
+        for (int x = 0; x < canvas->width; ++x)
+            canvas->pixels[(size_t)y * (size_t)canvas->stride + x] = colors->background;
+
+    paint_tabs(mixer, canvas, &ui);
+    mixer->row_height = 2 * ui.line + ui.padding / 2 + 2 * (ui.padding * 3 / 4) + ui.padding / 4;
+    mixer->list_top = ui.padding / 2 + ui.line + ui.padding + ui.padding / 2;
+    mixer->list_bottom = ui.height - ui.padding / 2;
+    if (mixer->notice[0]) {
+        int strip = ui.line + ui.padding;
+        mixer->list_bottom -= strip;
+        desk_canvas_fill(canvas, 0, ui.height - strip, ui.width, strip, mix(colors->background, colors->muted, 25));
+        draw_text(mixer->font, canvas, ui.padding, ui.width - ui.padding, ui.height - strip + ui.padding / 2 + ui.ascent,
+                  mixer->notice, colors->foreground);
+    }
+    paint_list(mixer, canvas, &ui);
+    if (mixer->pick != PICK_NONE)
+        paint_picker(mixer, canvas, &ui);
+}
+
+static void window_draw(void *data, DeskWindow *window)
+{
+    struct mixer *mixer = data;
+    DeskBuffer *buffer = desk_window_buffer(window, WL_SHM_FORMAT_XRGB8888);
+    if (!buffer)
+        return; /* Both busy: retried after a release. */
+    DeskCanvas canvas = desk_canvas(buffer->pixels, buffer->width, buffer->height);
+    paint(mixer, &canvas);
+    desk_window_commit(window, buffer);
+    /* The layout may have moved under a still pointer. */
+    struct target hover = target_at(mixer);
+    if (hover.kind != mixer->hover.kind || hover.index != mixer->hover.index) {
+        mixer->hover = hover;
+        window->dirty = true;
+    }
+}
+
+static void window_close(void *data, DeskWindow *window)
+{
+    (void)window;
+    struct mixer *mixer = data;
+    mixer->running = false;
+}
+
+static void window_initial_size(void *data, DeskWindow *window, int *width, int *height)
+{
+    (void)data;
+    (void)window;
+    *width = WINDOW_WIDTH;
+    *height = WINDOW_HEIGHT;
+}
+
+static const DeskWindowListener window_listener = {
+    .draw = window_draw,
+    .close = window_close,
+    .initial_size = window_initial_size,
+};
 
 /* Input */
 
@@ -1662,229 +1773,580 @@ static void switch_view(struct mixer *mixer, enum view view)
         return;
     mixer->view = view;
     mixer->pick = PICK_NONE;
-    mixer->top = 0;
+    mixer->dragging = false;
+    mixer->scroll = 0;
+    mixer->reveal = true;
     mixer->notice[0] = '\0';
     sync_meters(mixer);
-    mixer->dirty = true;
+    redraw(mixer);
 }
 
-static void move_cursor(struct mixer *mixer, enum key key)
+static void move_cursor(struct mixer *mixer, int delta, bool absolute)
 {
-    size_t count = mixer->pick != PICK_NONE ? pick_count(mixer) : view_count(mixer, mixer->view);
+    if (mixer->pick != PICK_NONE) {
+        size_t count = pick_count(mixer);
+        if (!count)
+            return;
+        long row = absolute ? (delta < 0 ? 0 : (long)count - 1) : (long)mixer->pick_cursor + delta;
+        mixer->pick_cursor = row < 0 ? 0 : row >= (long)count ? count - 1 : (size_t)row;
+        redraw(mixer);
+        return;
+    }
+    size_t count = view_count(mixer, mixer->view);
     if (!count)
         return;
-    size_t row = mixer->pick != PICK_NONE ? mixer->pick_cursor : mixer->cursor[mixer->view];
-    if (key == KEY_UP && row > 0)
-        row--;
-    else if (key == KEY_DOWN && row + 1 < count)
-        row++;
-    else if (key == KEY_HOME)
-        row = 0;
-    else if (key == KEY_END)
-        row = count - 1;
-    if (mixer->pick != PICK_NONE) {
-        mixer->pick_cursor = row;
-        mixer->dirty = true;
-    } else {
-        select_row(mixer, row);
-    }
+    long row = absolute ? (delta < 0 ? 0 : (long)count - 1) : (long)mixer->cursor[mixer->view] + delta;
+    select_row(mixer, row < 0 ? 0 : (size_t)row);
+    mixer->reveal = true;
 }
 
-static void handle_key(struct mixer *mixer, enum key key, int view)
+/* Return whether the key may repeat. */
+static bool handle_key(struct mixer *mixer, uint32_t key)
 {
-    if (mixer->pick != PICK_NONE) {
-        if (key == KEY_ESCAPE)
-            mixer->pick = PICK_NONE, mixer->dirty = true;
-        else if (key == KEY_ENTER || key == KEY_DEFAULT)
-            choose(mixer);
-        else if (key == KEY_QUIT)
-            mixer->quit = true;
+    xkb_keysym_t sym = desk_keyboard_sym(&mixer->keyboard, key);
+    unsigned mods = desk_keyboard_mods(&mixer->keyboard);
+    bool ctrl = mods & DESK_MOD_CTRL;
+    if (ctrl && (sym == XKB_KEY_q || sym == XKB_KEY_w)) {
+        mixer->running = false;
+        return false;
+    }
+    if (sym == XKB_KEY_Tab || sym == XKB_KEY_ISO_Left_Tab || (ctrl && (sym == XKB_KEY_Page_Down || sym == XKB_KEY_Page_Up))) {
+        bool back = sym == XKB_KEY_ISO_Left_Tab || (mods & DESK_MOD_SHIFT) || sym == XKB_KEY_Page_Up;
+        switch_view(mixer, (mixer->view + (back ? VIEW_COUNT - 1 : 1)) % VIEW_COUNT);
+        return false;
+    }
+    if (sym >= XKB_KEY_1 && sym < XKB_KEY_1 + VIEW_COUNT) {
+        switch_view(mixer, (enum view)(sym - XKB_KEY_1));
+        return false;
+    }
+    switch (sym) {
+    case XKB_KEY_Escape:
+        if (mixer->pick != PICK_NONE)
+            close_picker(mixer);
         else
-            move_cursor(mixer, key);
-        return;
-    }
-    struct node *node = selected_node(mixer);
-    switch (key) {
-    case KEY_QUIT:
-    case KEY_ESCAPE:
-        mixer->quit = true;
-        return;
-    case KEY_TAB:
-        switch_view(mixer, (mixer->view + 1) % VIEW_COUNT);
-        return;
-    case KEY_BACKTAB:
-        switch_view(mixer, (mixer->view + VIEW_COUNT - 1) % VIEW_COUNT);
-        return;
-    case KEY_VIEW:
-        switch_view(mixer, (enum view)view);
-        return;
-    case KEY_LEFT:
-    case KEY_RIGHT:
-        if (node && mixer->ready)
-            step_level(mixer, node, key == KEY_RIGHT);
-        return;
-    case KEY_MUTE:
-        if (node && mixer->ready)
-            toggle_mute(mixer, node);
-        return;
-    case KEY_ENTER:
-    case KEY_DEFAULT:
-        if (!mixer->ready)
-            return;
-        if ((mixer->view == VIEW_OUTPUT || mixer->view == VIEW_INPUT) && node)
-            make_default(mixer, node);
-        else if (mixer->view == VIEW_PLAYBACK || mixer->view == VIEW_DEVICES)
-            open_picker(mixer);
-        return;
-    default:
-        move_cursor(mixer, key);
-        return;
-    }
-}
-
-/* SGR mouse report: button, column and row, all 1-based. */
-static void handle_mouse(struct mixer *mixer, int button, int x, int y)
-{
-    if (y == 1) {
-        for (enum view view = 0; view < VIEW_COUNT; view++)
-            if (button == 0 && x >= mixer->tab_start[view] && x < mixer->tab_end[view])
-                switch_view(mixer, view);
-        return;
-    }
-    if (y < 1 || (unsigned)y > mixer->height || mixer->row_items[y] < 0)
-        return;
-    size_t row = (size_t)mixer->row_items[y];
-    if (mixer->pick != PICK_NONE) {
-        if (button == 0) {
-            mixer->pick_cursor = row;
+            mixer->running = false;
+        return false;
+    case XKB_KEY_q:
+        mixer->running = false;
+        return false;
+    case XKB_KEY_Up:
+    case XKB_KEY_k:
+        move_cursor(mixer, -1, false);
+        return true;
+    case XKB_KEY_Down:
+    case XKB_KEY_j:
+        move_cursor(mixer, 1, false);
+        return true;
+    case XKB_KEY_Home:
+    case XKB_KEY_g:
+        move_cursor(mixer, -1, true);
+        return false;
+    case XKB_KEY_End:
+    case XKB_KEY_G:
+        move_cursor(mixer, 1, true);
+        return false;
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+    case XKB_KEY_d:
+        if (mixer->pick != PICK_NONE)
             choose(mixer);
-        }
-        return;
+        else if (mixer->view == VIEW_PLAYBACK || mixer->view == VIEW_DEVICES)
+            open_picker(mixer, mixer->cursor[mixer->view]);
+        else if (selected_node(mixer))
+            make_default(mixer, selected_node(mixer));
+        return false;
+    default:
+        break;
     }
-    select_row(mixer, row);
-    struct node *node = selected_node(mixer);
-    if (!node || !mixer->ready)
-        return;
-    if (button == 64 || button == 65) {
-        step_level(mixer, node, button == 64);
-    } else if (button == 0 && mixer->bar_width && x >= mixer->bar_x && x < mixer->bar_x + mixer->bar_width) {
-        /* The cell clicked, as a level: the last cell is 100%. */
-        set_level(mixer, node, (x - mixer->bar_x + 1) * 100 / mixer->bar_width);
+    struct node *node = mixer->pick == PICK_NONE ? selected_node(mixer) : NULL;
+    if (!node)
+        return false;
+    switch (sym) {
+    case XKB_KEY_Left:
+    case XKB_KEY_h:
+    case XKB_KEY_minus:
+    case XKB_KEY_KP_Subtract:
+        step_level(mixer, node, false);
+        return true;
+    case XKB_KEY_Right:
+    case XKB_KEY_l:
+    case XKB_KEY_plus:
+    case XKB_KEY_equal:
+    case XKB_KEY_KP_Add:
+        step_level(mixer, node, true);
+        return true;
+    case XKB_KEY_m:
+        toggle_mute(mixer, node);
+        return false;
+    default:
+        return false;
     }
 }
 
-static void escape_expired(pa_mainloop_api *api, pa_time_event *timer, const struct timeval *when, void *data)
+static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int32_t fd, uint32_t size)
 {
-    (void)when;
+    (void)keyboard;
     struct mixer *mixer = data;
-    api->time_free(timer);
-    mixer->escape_timer = NULL;
-    if (mixer->input.state == INPUT_ESCAPE) {
-        mixer->input.state = INPUT_TEXT;
-        handle_key(mixer, KEY_ESCAPE, 0);
-    } else {
-        mixer->input.state = INPUT_TEXT;
+    desk_keyboard_keymap(&mixer->keyboard, format, fd, size);
+}
+
+static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface,
+                           struct wl_array *keys)
+{
+    (void)data;
+    (void)keyboard;
+    (void)serial;
+    (void)surface;
+    (void)keys;
+}
+
+static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface)
+{
+    (void)keyboard;
+    (void)serial;
+    (void)surface;
+    struct mixer *mixer = data;
+    desk_repeat_cancel(&mixer->repeat);
+}
+
+static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key,
+                         uint32_t state)
+{
+    (void)keyboard;
+    (void)serial;
+    (void)time;
+    struct mixer *mixer = data;
+    if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
+        desk_repeat_release(&mixer->repeat, key);
+        return;
+    }
+    if (!mixer->keyboard.state)
+        return;
+    if (handle_key(mixer, key) && desk_keyboard_repeats(&mixer->keyboard, key))
+        desk_repeat_start(&mixer->repeat, key);
+    else
+        desk_repeat_cancel(&mixer->repeat);
+}
+
+static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t depressed,
+                               uint32_t latched, uint32_t locked, uint32_t group)
+{
+    (void)keyboard;
+    (void)serial;
+    struct mixer *mixer = data;
+    desk_keyboard_modifiers(&mixer->keyboard, depressed, latched, locked, group);
+}
+
+static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay)
+{
+    (void)keyboard;
+    struct mixer *mixer = data;
+    desk_repeat_info(&mixer->repeat, rate, delay);
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap = keyboard_keymap,
+    .enter = keyboard_enter,
+    .leave = keyboard_leave,
+    .key = keyboard_key,
+    .modifiers = keyboard_modifiers,
+    .repeat_info = keyboard_repeat_info,
+};
+
+/* The level for the pointer's place on the slider being dragged. */
+static void drag_to_pointer(struct mixer *mixer)
+{
+    struct node *node = find_node(view_nodes(mixer, mixer->view) ? view_nodes(mixer, mixer->view) : &mixer->now.sinks,
+                                  mixer->drag_id);
+    if (!node || mixer->drag_right <= mixer->drag_left) {
+        mixer->dragging = false;
+        return;
+    }
+    double x = mixer->pointer_x * desk_window_scale(&mixer->window);
+    double fraction = (x - mixer->drag_left) / (mixer->drag_right - mixer->drag_left);
+    set_level(mixer, node, (int)lround((fraction < 0 ? 0 : fraction > 1 ? 1 : fraction) * 100));
+}
+
+static void update_hover(struct mixer *mixer)
+{
+    struct target hover = target_at(mixer);
+    if (hover.kind != mixer->hover.kind || hover.index != mixer->hover.index) {
+        mixer->hover = hover;
+        redraw(mixer);
     }
 }
 
-static void input_byte(struct mixer *mixer, unsigned char byte)
+static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface,
+                          wl_fixed_t x, wl_fixed_t y)
 {
-    struct input *input = &mixer->input;
-    if (input->state == INPUT_TEXT) {
-        static const struct { unsigned char byte; enum key key; } keys[] = {
-            {'k', KEY_UP}, {'j', KEY_DOWN}, {'h', KEY_LEFT}, {'l', KEY_RIGHT}, {'-', KEY_LEFT},
-            {'+', KEY_RIGHT}, {'=', KEY_RIGHT}, {'g', KEY_HOME}, {'G', KEY_END}, {'\t', KEY_TAB},
-            {'\r', KEY_ENTER}, {'\n', KEY_ENTER}, {'d', KEY_DEFAULT}, {'m', KEY_MUTE}, {'q', KEY_QUIT},
-            {'\003', KEY_QUIT},
-        };
-        if (byte == '\033') {
-            input->state = INPUT_ESCAPE;
-            if (!mixer->escape_timer) {
-                struct timeval when;
-                pa_gettimeofday(&when);
-                pa_timeval_add(&when, (pa_usec_t)MIXER_ESCAPE_MS * PA_USEC_PER_MSEC);
-                mixer->escape_timer = mixer->api->time_new(mixer->api, &when, escape_expired, mixer);
-            }
-            return;
+    (void)pointer;
+    (void)surface;
+    struct mixer *mixer = data;
+    mixer->pointer_inside = true;
+    mixer->pointer_x = wl_fixed_to_double(x);
+    mixer->pointer_y = wl_fixed_to_double(y);
+    if (mixer->cursor_shape)
+        wp_cursor_shape_device_v1_set_shape(mixer->cursor_shape, serial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+    update_hover(mixer);
+}
+
+static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
+{
+    (void)pointer;
+    (void)serial;
+    (void)surface;
+    struct mixer *mixer = data;
+    mixer->pointer_inside = mixer->dragging = false;
+    mixer->scroll_pixels = 0;
+    update_hover(mixer);
+}
+
+static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y)
+{
+    (void)pointer;
+    (void)time;
+    struct mixer *mixer = data;
+    mixer->pointer_x = wl_fixed_to_double(x);
+    mixer->pointer_y = wl_fixed_to_double(y);
+    if (mixer->dragging)
+        drag_to_pointer(mixer);
+    else
+        update_hover(mixer);
+}
+
+static void click(struct mixer *mixer)
+{
+    struct target target = target_at(mixer);
+    if (mixer->pick != PICK_NONE) {
+        if (target.kind == TARGET_CHOICE) {
+            mixer->pick_cursor = target.index;
+            choose(mixer);
+        } else if (target.kind == TARGET_OUTSIDE) {
+            close_picker(mixer);
         }
-        if (byte >= '1' && byte <= '0' + VIEW_COUNT) {
-            handle_key(mixer, KEY_VIEW, byte - '1');
-            return;
+        return;
+    }
+    if (target.kind == TARGET_TAB) {
+        switch_view(mixer, (enum view)target.index);
+        return;
+    }
+    if (target.kind == TARGET_NONE)
+        return;
+    select_row(mixer, target.index);
+    struct node *node = node_at(mixer, target.index);
+    switch (target.kind) {
+    case TARGET_DEFAULT:
+        if (node)
+            make_default(mixer, node);
+        break;
+    case TARGET_MUTE:
+        if (node)
+            toggle_mute(mixer, node);
+        break;
+    case TARGET_SLIDER:
+        if (node && node->has_volume) {
+            /* The slider's own extent, without the grab margin. */
+            for (size_t i = mixer->hit_count; i-- > 0;)
+                if (mixer->hits[i].target.kind == TARGET_SLIDER && mixer->hits[i].target.index == target.index) {
+                    mixer->drag_left = mixer->hits[i].left + mixer->row_height / 6;
+                    mixer->drag_right = mixer->hits[i].right - mixer->row_height / 6;
+                    break;
+                }
+            mixer->dragging = true;
+            mixer->drag_id = node->index;
+            drag_to_pointer(mixer);
         }
-        for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
-            if (keys[i].byte == byte)
-                handle_key(mixer, keys[i].key, 0);
-        return;
-    }
-    if (input->state == INPUT_ESCAPE) {
-        if (byte == '[' || byte == 'O') {
-            input->state = INPUT_CSI;
-            input->count = 0;
-            input->mouse = false;
-            memset(input->params, 0, sizeof input->params);
-            return;
-        }
-        input->state = INPUT_TEXT;
-        handle_key(mixer, KEY_ESCAPE, 0);
-        input_byte(mixer, byte);
-        return;
-    }
-    if (byte == '<' && !input->count && !input->params[0]) {
-        input->mouse = true;
-        return;
-    }
-    if (byte >= '0' && byte <= '9') {
-        int *param = &input->params[input->count < 3 ? input->count : 2];
-        if (*param < 10000)
-            *param = *param * 10 + (byte - '0');
-        return;
-    }
-    if (byte == ';') {
-        if (input->count < 2)
-            input->count++;
-        return;
-    }
-    if (byte >= ' ' && byte <= '?')
-        return;
-    input->state = INPUT_TEXT;
-    if (input->mouse) {
-        /* Presses only; the wheel arrives as presses of 64 and 65. */
-        if (byte == 'M')
-            handle_mouse(mixer, input->params[0] & ~(4 | 8 | 16), input->params[1], input->params[2]);
-        return;
-    }
-    switch (byte) {
-    case 'A': handle_key(mixer, KEY_UP, 0); break;
-    case 'B': handle_key(mixer, KEY_DOWN, 0); break;
-    case 'C': handle_key(mixer, KEY_RIGHT, 0); break;
-    case 'D': handle_key(mixer, KEY_LEFT, 0); break;
-    case 'H': handle_key(mixer, KEY_HOME, 0); break;
-    case 'F': handle_key(mixer, KEY_END, 0); break;
-    case 'Z': handle_key(mixer, KEY_BACKTAB, 0); break;
-    case '~':
-        if (input->params[0] == 1 || input->params[0] == 7)
-            handle_key(mixer, KEY_HOME, 0);
-        else if (input->params[0] == 4 || input->params[0] == 8)
-            handle_key(mixer, KEY_END, 0);
+        break;
+    case TARGET_DROPDOWN:
+        open_picker(mixer, target.index);
+        break;
+    default:
         break;
     }
 }
 
-static void keyboard_ready(pa_mainloop_api *api, pa_io_event *event, int fd, pa_io_event_flags_t flags, void *data)
+static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button,
+                           uint32_t state)
+{
+    (void)pointer;
+    (void)serial;
+    (void)time;
+    struct mixer *mixer = data;
+    bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+    if (button == BTN_LEFT && pressed) {
+        click(mixer);
+    } else if (button == BTN_LEFT && mixer->dragging) {
+        mixer->dragging = false;
+        update_hover(mixer);
+        redraw(mixer);
+    } else if (button == BTN_MIDDLE && pressed && mixer->pick == PICK_NONE) {
+        /* Middle click mutes, as on bar. */
+        struct target target = target_at(mixer);
+        struct node *node = target.kind >= TARGET_ROW && target.kind <= TARGET_DROPDOWN ? node_at(mixer, target.index) : NULL;
+        if (node) {
+            select_row(mixer, target.index);
+            toggle_mute(mixer, node);
+        }
+    } else if (button == BTN_RIGHT && pressed && mixer->pick != PICK_NONE) {
+        close_picker(mixer);
+    }
+}
+
+static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value)
+{
+    (void)pointer;
+    (void)time;
+    struct mixer *mixer = data;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        mixer->scroll_pixels += wl_fixed_to_double(value);
+}
+
+/* The wheel changes the level over a slider or mute button, a step a notch,
+   and scrolls anywhere else. */
+static void pointer_frame(void *data, struct wl_pointer *pointer)
+{
+    (void)pointer;
+    struct mixer *mixer = data;
+    int steps = mixer->scroll_steps;
+    double pixels = mixer->scroll_pixels;
+    mixer->scroll_steps = 0;
+    if (!steps && pixels == 0)
+        return;
+    struct target target = target_at(mixer);
+    if (mixer->pick != PICK_NONE) {
+        if (!steps) {
+            steps = (int)(pixels / WHEEL_PIXELS);
+            mixer->scroll_pixels -= steps * WHEEL_PIXELS;
+        } else {
+            mixer->scroll_pixels = 0;
+        }
+        mixer->pick_scroll += steps;
+        if (mixer->pick_scroll < 0)
+            mixer->pick_scroll = 0;
+        redraw(mixer);
+        return;
+    }
+    struct node *node = target.kind == TARGET_SLIDER || target.kind == TARGET_MUTE ? node_at(mixer, target.index) : NULL;
+    if (node) {
+        if (!steps) {
+            steps = (int)(pixels / WHEEL_PIXELS);
+            mixer->scroll_pixels -= steps * WHEEL_PIXELS;
+        } else {
+            mixer->scroll_pixels = 0;
+        }
+        for (int i = 0; i < abs(steps) && i < 5; i++)
+            step_level(mixer, node, steps < 0);   /* Up, away from you, is louder. */
+        return;
+    }
+    double scale = desk_window_scale(&mixer->window);
+    int distance = steps ? steps * mixer->row_height / 2 : (int)lround(pixels * scale);
+    mixer->scroll_pixels = 0;
+    mixer->scroll += distance;
+    redraw(mixer);
+}
+
+static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source)
+{
+    (void)data;
+    (void)pointer;
+    (void)source;
+}
+
+static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis)
+{
+    (void)pointer;
+    (void)time;
+    struct mixer *mixer = data;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        mixer->scroll_pixels = 0;
+}
+
+static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete)
+{
+    (void)pointer;
+    struct mixer *mixer = data;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        mixer->scroll_steps += discrete;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_discrete,
+};
+
+/* Seat and registry */
+
+static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities)
+{
+    struct mixer *mixer = data;
+    bool has_keyboard = capabilities & WL_SEAT_CAPABILITY_KEYBOARD;
+    if (has_keyboard && !mixer->wl_keyboard) {
+        mixer->wl_keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(mixer->wl_keyboard, &keyboard_listener, mixer);
+    } else if (!has_keyboard && mixer->wl_keyboard) {
+        desk_repeat_cancel(&mixer->repeat);
+        wl_keyboard_release(mixer->wl_keyboard);
+        mixer->wl_keyboard = NULL;
+    }
+    bool has_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
+    if (has_pointer && !mixer->pointer) {
+        mixer->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(mixer->pointer, &pointer_listener, mixer);
+        if (mixer->cursor_shape_manager)
+            mixer->cursor_shape = wp_cursor_shape_manager_v1_get_pointer(mixer->cursor_shape_manager, mixer->pointer);
+    } else if (!has_pointer && mixer->pointer) {
+        if (mixer->cursor_shape)
+            wp_cursor_shape_device_v1_destroy(mixer->cursor_shape);
+        mixer->cursor_shape = NULL;
+        wl_pointer_release(mixer->pointer);
+        mixer->pointer = NULL;
+        mixer->pointer_inside = mixer->dragging = false;
+    }
+}
+
+static void seat_name(void *data, struct wl_seat *seat, const char *name)
+{
+    (void)data;
+    (void)seat;
+    (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_capabilities,
+    .name = seat_name,
+};
+
+static void registry_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface,
+                            uint32_t version)
+{
+    struct mixer *mixer = data;
+    if (desk_globals_bind(&mixer->globals, registry, name, interface, version))
+        return;
+    if (!strcmp(interface, wp_cursor_shape_manager_v1_interface.name)) {
+        mixer->cursor_shape_manager = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+    } else if (!strcmp(interface, wl_seat_interface.name) && !mixer->seat) {
+        /* Version 5 adds wl_keyboard.release. */
+        mixer->seat = wl_registry_bind(registry, name, &wl_seat_interface, version < 5 ? version : 5);
+        wl_seat_add_listener(mixer->seat, &seat_listener, mixer);
+    }
+}
+
+static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name)
+{
+    (void)data;
+    (void)registry;
+    (void)name;
+}
+
+static const struct wl_registry_listener registry_listener = {
+    .global = registry_global,
+    .global_remove = registry_global_remove,
+};
+
+static bool open_window(struct mixer *mixer)
+{
+    char error[256];
+    if (!(mixer->font = desk_font_open("sans-serif", FONT_POINTS * 96.0 / 72.0, error, sizeof error))) {
+        fprintf(stderr, "vol: %s\n", error);
+        return false;
+    }
+    if (desk_keyboard_open(&mixer->keyboard) != 0 || desk_repeat_open(&mixer->repeat) != 0) {
+        fprintf(stderr, "vol: out of memory\n");
+        return false;
+    }
+    mixer->display = wl_display_connect(NULL);
+    if (!mixer->display) {
+        fprintf(stderr, "vol: can't connect to the Wayland display\n");
+        return false;
+    }
+    mixer->registry = wl_display_get_registry(mixer->display);
+    wl_registry_add_listener(mixer->registry, &registry_listener, mixer);
+    if (wl_display_roundtrip(mixer->display) < 0) {
+        fprintf(stderr, "vol: lost the Wayland connection\n");
+        return false;
+    }
+    const char *missing = desk_globals_missing(&mixer->globals);
+    if (missing) {
+        fprintf(stderr, "vol: the compositor doesn't offer %s\n", missing);
+        return false;
+    }
+    /* The seat's capabilities may have arrived before the cursor shape manager. */
+    if (mixer->pointer && mixer->cursor_shape_manager && !mixer->cursor_shape)
+        mixer->cursor_shape = wp_cursor_shape_manager_v1_get_pointer(mixer->cursor_shape_manager, mixer->pointer);
+    if (!desk_window_open(&mixer->window, &mixer->globals, "vol", &window_listener, mixer)) {
+        fprintf(stderr, "vol: out of memory\n");
+        return false;
+    }
+    desk_window_set_title(&mixer->window, "Sound");
+    return true;
+}
+
+static void close_window(struct mixer *mixer)
+{
+    if (mixer->window.surface)
+        desk_window_close(&mixer->window);
+    if (mixer->wl_keyboard)
+        wl_keyboard_release(mixer->wl_keyboard);
+    if (mixer->cursor_shape)
+        wp_cursor_shape_device_v1_destroy(mixer->cursor_shape);
+    if (mixer->pointer)
+        wl_pointer_release(mixer->pointer);
+    if (mixer->cursor_shape_manager)
+        wp_cursor_shape_manager_v1_destroy(mixer->cursor_shape_manager);
+    if (mixer->seat)
+        wl_seat_destroy(mixer->seat);
+    desk_globals_finish(&mixer->globals);
+    if (mixer->registry)
+        wl_registry_destroy(mixer->registry);
+    if (mixer->display)
+        wl_display_disconnect(mixer->display);
+    desk_repeat_close(&mixer->repeat);
+    desk_keyboard_close(&mixer->keyboard);
+    if (mixer->font)
+        desk_font_close(mixer->font);
+}
+
+/* Main loop hooks */
+
+static void wayland_ready(pa_mainloop_api *api, pa_io_event *event, int fd, pa_io_event_flags_t flags, void *data)
 {
     (void)api;
     (void)event;
+    (void)fd;
     struct mixer *mixer = data;
-    unsigned char bytes[256];
-    ssize_t length = (flags & PA_IO_EVENT_INPUT) ? read(fd, bytes, sizeof bytes) : 0;
-    if (length < 0 && (errno == EINTR || errno == EAGAIN))
-        return;
-    if (length <= 0) {
-        mixer->quit = true;
-        return;
+    if (mixer->read_prepared) {
+        mixer->read_prepared = false;
+        if ((flags & PA_IO_EVENT_INPUT) ? wl_display_read_events(mixer->display) < 0 :
+                                          (wl_display_cancel_read(mixer->display), false)) {
+            mixer->running = false;
+            mixer->status = EXIT_FAILED;
+        }
     }
-    for (ssize_t i = 0; i < length && !mixer->quit; i++)
-        input_byte(mixer, bytes[i]);
+    if (flags & (PA_IO_EVENT_HANGUP | PA_IO_EVENT_ERROR)) {
+        mixer->running = false;
+        mixer->status = EXIT_FAILED;
+    }
+}
+
+static void repeat_ready(pa_mainloop_api *api, pa_io_event *event, int fd, pa_io_event_flags_t flags, void *data)
+{
+    (void)api;
+    (void)event;
+    (void)fd;
+    (void)flags;
+    struct mixer *mixer = data;
+    unsigned count = desk_repeat_fired(&mixer->repeat);
+    if (count > MAX_REPEATS)
+        count = MAX_REPEATS;
+    for (unsigned i = 0; i < count && mixer->repeat.active && mixer->running; i++)
+        handle_key(mixer, mixer->repeat.key);
 }
 
 static void palette_ready(pa_mainloop_api *api, pa_io_event *event, int fd, pa_io_event_flags_t flags, void *data)
@@ -1893,8 +2355,10 @@ static void palette_ready(pa_mainloop_api *api, pa_io_event *event, int fd, pa_i
     (void)event;
     (void)fd;
     struct mixer *mixer = data;
-    if (desk_watch_changed(&mixer->palette_watch, (flags & PA_IO_EVENT_INPUT) ? POLLIN : POLLERR))
-        apply_theme(mixer);
+    if (desk_watch_changed(&mixer->palette_watch, (flags & PA_IO_EVENT_INPUT) ? POLLIN : POLLERR)) {
+        update_colors(mixer);
+        redraw(mixer);
+    }
 }
 
 /* While meters run, redraw now and then so peaks fade when the sound stops. */
@@ -1903,7 +2367,7 @@ static void tick(pa_mainloop_api *api, pa_time_event *timer, const struct timeva
     (void)when;
     struct mixer *mixer = data;
     if (mixer->meter_count)
-        mixer->dirty = true;
+        redraw(mixer);
     struct timeval next;
     pa_gettimeofday(&next);
     pa_timeval_add(&next, (pa_usec_t)MIXER_TICK_MS * PA_USEC_PER_MSEC);
@@ -1915,12 +2379,8 @@ static void on_signal(pa_mainloop_api *api, pa_signal_event *event, int signal, 
     (void)api;
     (void)event;
     struct mixer *mixer = data;
-    if (signal == SIGWINCH) {
-        terminal_size(mixer);
-        return;
-    }
     mixer->signal = signal;
-    mixer->quit = true;
+    mixer->running = false;
 }
 
 static int run_mixer(const struct config *config, bool source)
@@ -1929,13 +2389,21 @@ static int run_mixer(const struct config *config, bool source)
         .config = *config,
         .view = source ? VIEW_INPUT : VIEW_OUTPUT,
         .palette_watch = {.fd = -1},
+        .repeat = {.fd = -1},
         .status = EXIT_OK,
+        .running = true,
     };
     setlocale(LC_CTYPE, "");
     mixer.palette_path = desk_palette_path();
     if (mixer.palette_path && !desk_watch_open(&mixer.palette_watch, mixer.palette_path))
         mixer.palette_watch.fd = -1;
-    apply_theme(&mixer);
+    update_colors(&mixer);
+    if (!open_window(&mixer)) {
+        close_window(&mixer);
+        desk_watch_close(&mixer.palette_watch);
+        free(mixer.palette_path);
+        return EXIT_FAILED;
+    }
 
     mixer.loop = pa_mainloop_new();
     if (!mixer.loop) {
@@ -1944,58 +2412,70 @@ static int run_mixer(const struct config *config, bool source)
     }
     mixer.api = pa_mainloop_get_api(mixer.loop);
     signal(SIGPIPE, SIG_IGN);
-    if (pa_signal_init(mixer.api) < 0 || terminal_enter() < 0) {
-        int error = errno;
-        terminal_restore();
-        fprintf(stderr, "vol: terminal setup: %s\n", strerror(error));
-        pa_mainloop_free(mixer.loop);
-        return EXIT_FAILED;
+    if (pa_signal_init(mixer.api) == 0) {
+        static const int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+        for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++)
+            pa_signal_new(signals[i], on_signal, &mixer);
     }
-    static const int signals[] = {SIGWINCH, SIGINT, SIGTERM, SIGHUP, SIGQUIT};
-    for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++)
-        pa_signal_new(signals[i], on_signal, &mixer);
-    mixer.keyboard = mixer.api->io_new(mixer.api, STDIN_FILENO, PA_IO_EVENT_INPUT | PA_IO_EVENT_HANGUP,
-                                       keyboard_ready, &mixer);
+    mixer.wayland_event = mixer.api->io_new(mixer.api, wl_display_get_fd(mixer.display), PA_IO_EVENT_INPUT,
+                                            wayland_ready, &mixer);
+    if (mixer.repeat.fd >= 0)
+        mixer.repeat_event = mixer.api->io_new(mixer.api, mixer.repeat.fd, PA_IO_EVENT_INPUT, repeat_ready, &mixer);
     if (mixer.palette_watch.fd >= 0)
         mixer.palette_event = mixer.api->io_new(mixer.api, mixer.palette_watch.fd, PA_IO_EVENT_INPUT,
                                                 palette_ready, &mixer);
     struct timeval when;
     pa_gettimeofday(&when);
     mixer.tick = mixer.api->time_new(mixer.api, &when, tick, &mixer);
-    terminal_size(&mixer);
     mixer_connect(&mixer);
 
+    /* Wayland's read protocol around libpulse's poll: prepare and flush, let
+       the loop wait on the display's fd with everything else, read if it
+       woke, then dispatch and draw. */
+    struct wl_display *display = mixer.display;
     int result = 0;
-    while (!mixer.quit) {
-        if (mixer.dirty && render(&mixer) < 0) {
+    while (mixer.running) {
+        while (wl_display_prepare_read(display) != 0)
+            if (wl_display_dispatch_pending(display) < 0) {
+                mixer.status = EXIT_FAILED;
+                goto done;
+            }
+        mixer.read_prepared = true;
+        if (wl_display_flush(display) < 0 && errno != EAGAIN) {
+            wl_display_cancel_read(display);
             mixer.status = EXIT_FAILED;
             break;
         }
-        if (pa_mainloop_iterate(mixer.loop, 1, &result) < 0) {
+        int iterated = pa_mainloop_iterate(mixer.loop, 1, &result);
+        if (mixer.read_prepared) {
+            wl_display_cancel_read(display);
+            mixer.read_prepared = false;
+        }
+        if (iterated < 0 || wl_display_dispatch_pending(display) < 0) {
             mixer.status = EXIT_FAILED;
             break;
         }
+        desk_window_update(&mixer.window);
     }
-
-    terminal_restore();
+done:
     mixer_disconnect(&mixer);
     free_model(&mixer.now);
     free_model(&mixer.next);
     free(mixer.meters);
-    mixer.api->io_free(mixer.keyboard);
+    free(mixer.hits);
+    mixer.api->io_free(mixer.wayland_event);
+    if (mixer.repeat_event)
+        mixer.api->io_free(mixer.repeat_event);
     if (mixer.palette_event)
         mixer.api->io_free(mixer.palette_event);
     mixer.api->time_free(mixer.tick);
-    if (mixer.escape_timer)
-        mixer.api->time_free(mixer.escape_timer);
     if (mixer.reconnect_timer)
         mixer.api->time_free(mixer.reconnect_timer);
     pa_signal_done();
     pa_mainloop_free(mixer.loop);
+    close_window(&mixer);
     desk_watch_close(&mixer.palette_watch);
     free(mixer.palette_path);
-    free(mixer.lines);
-    free(mixer.row_items);
     return mixer.signal ? 128 + mixer.signal : mixer.status;
 }
 
@@ -2010,8 +2490,8 @@ static void usage(FILE *out)
           "input, stream and card.\n"
           "\n"
           "Commands:\n"
-          "  (none)                   in a terminal, open the mixer (on Input with -s);\n"
-          "                           otherwise the same as get\n"
+          "  (none)                   in a terminal, the same as mixer; otherwise get\n"
+          "  mixer                    open the mixer window (on Input with -s)\n"
           "  get                      print the level, as wpctl does: Volume: 0.30 [MUTED]\n"
           "  up [N] | down [N]        change it by N percent (default: [volume] step, 5)\n"
           "  set N                    set it to N percent (0 to 150)\n"
@@ -2046,6 +2526,10 @@ static bool parse_command(struct app *app, int count, char **words)
     if (count == 0)
         return true;
     const char *command = words[0];
+    if (!strcmp(command, "mixer")) {
+        app->action = ACTION_MIXER;
+        return count == 1;
+    }
     if (!strcmp(command, "get")) {
         app->action = ACTION_GET;
         return count == 1;
@@ -2112,7 +2596,7 @@ int main(int argc, char **argv)
     if (follow)
         app.action = ACTION_FOLLOW;
     load_config(&app.config);
-    if (optind == argc && !follow && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
+    if (app.action == ACTION_MIXER || (optind == argc && !follow && isatty(STDOUT_FILENO)))
         return run_mixer(&app.config, app.source);
 
     app.loop = pa_mainloop_new();

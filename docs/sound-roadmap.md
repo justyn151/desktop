@@ -28,7 +28,7 @@ Plan for Bluetooth and volume control, from the terminal stopgaps to two apps: `
 | desk piece | Needed by | Phase 3 step it pre-empts |
 |---|---|---|
 | Layer-shell surface setup (anchor, margins, no input, exclusive zone 0) | Nothing here now that the OSD moved to `notify`; `notify` will need it | Step 4 (bar, run and wall still have their own) |
-| Terminal raw mode, alternate screen, key and mouse input decoding (`-DDESK_TERM`), if blue and vol share it without strain | blue 0.1, vol 0.3 | None yet. net and mark each have their own; blue and vol would be the third and fourth copies |
+| Terminal raw mode, alternate screen, key and mouse input decoding (`-DDESK_TERM`), if blue and vol share it without strain | blue 0.1 | None yet. net and mark each have their own; blue is the third copy. vol's mixer became a window, so it needs none |
 
 ---
 
@@ -135,7 +135,7 @@ What carries over to notify's roadmap:
 
 ### 0.3: The mixer
 
-`vol` with no command in a terminal opens the mixer TUI (a floating deal window, app ID `vol`, opened from bar's click). Four views, switched with Tab or by clicking:
+`vol mixer` opens the mixer, a Wayland window built on desk like files (app ID `vol`, opened from bar's click). Four views, switched with Tab or by clicking their tab:
 
 | View | Rows | Actions |
 |---|---|---|
@@ -144,7 +144,7 @@ What carries over to notify's roadmap:
 | Playback | Each application's stream | Level, mute, move to another output |
 | Devices | Each card with its profiles | Pick a profile: Bluetooth A2DP or HFP (codec named), HDMI out, Off |
 
-Keys: arrows to move, Left/Right or `h`/`l` for level, `m` mute, Enter or `d` default, `q` to quit. Mouse: click to select, the wheel over a row changes its level, click on the bar to set the level. Everything is live: streams come and go, devices appear when headphones connect.
+Keys: arrows to move, Left/Right or `h`/`l` for level, `m` mute, Enter or `d` default, `q` to quit. Mouse: sliders to click or drag, a mute button, a dot for the default, dropdowns for a stream's output and a card's profile, the wheel over a slider steps it. Everything is live: streams come and go, devices appear when headphones connect.
 
 Checks: a browser tab's stream shows up, can be moved to the headphones while it plays, and stays there; switching a headset to HFP makes its mic appear under Input; removing the default device moves its streams to the next one.
 
@@ -152,7 +152,7 @@ Checks: a browser tab's stream shows up, can be moved to the headphones while it
 
 - `~/.config/vol/vol.conf`: `[volume] step`, `max`; `[osd] enabled`, `position`, `timeout`, `width`; `[mixer] start_view`, `show_monitors`.
 - Palette colors, live, like mark.
-- `vol.desktop`, the dwl float rule for app ID `vol`, and bar's `click = deal --app-id vol -e vol`.
+- `vol.desktop`, the dwl float rule for app ID `vol`, and bar's `click = vol mixer`.
 
 ### 1.0
 
@@ -221,7 +221,7 @@ The checklists in a fresh session, a week of use, the agent's input fuzzed (D-Bu
 
 - **blue 0.2:** searching, the pairing agent (`/org/blue/agent`, KeyboardDisplay, made the default agent), trust, rename, remove and visibility, as planned. The list became items (known devices, a Nearby heading, nearby devices) so headings can't be selected. Agent questions keep BlueZ's call (`sd_bus_message_ref`, method handler returns 1) until a key answers it; Display calls are answered at once and stay on screen until Pair returns. Search has no discovery filter for now: unnamed devices are hidden in the list instead, with a count. Checked: searching, rename and reset, remove's question, and that the agent refuses callers other than BlueZ. While testing, a test script's keys made the adapter visible and renamed the nearby TV for a moment; both were put back. Pairing a real device waits for yours.
 - **blue 0.3:** bar's `[bluetooth]` module reads BlueZ's objects with GetManagedObjects on each relevant signal (adapter, battery, a device's Connected or Alias, objects removed), at most four times a second, so RSSI churn while searching costs nothing. Text labels (`BT`, `BT off`, `BT name 80%`, `+N`) instead of icons, as with the other modules. The right side became segments (volume, Bluetooth, network, clock) each drawn separately, so any of them can be dimmed or clicked. dwl matches app ID `blue` exactly and centers it like `net`. blue gained `[scan] show_unnamed`/`timeout` and `[list] show_battery`/`sort`, and `blue.desktop`. Checked with a second bar and screenshots while switching the adapter off and on; a connected device and the dwl rule wait for a restart and headphones.
-- **vol 0.3:** the mixer is in `vol.c`, on libpulse's main loop with stdin, signals (`pa_signal`), the palette watch, an Escape timer and an 80 ms tick as mainloop events, so there is one loop and no threads. All five lists (server, sinks, sources, sink inputs, cards) are read into a second model and swapped in when the last arrives; events during a read cause one more read. Levels change locally at once so held keys add up, then the server's answer replaces them. Meters are peak-detect record streams at 25 Hz on each output's monitor (not keeping it awake) or each input (keeping the mic open while Input is shown), only for the view on screen. Monitors are left out of Input (`show_monitors` in 0.4). `vol` with no command opens the mixer only when stdin and stdout are terminals, so scripts keep the old behavior, and `-s` opens it on Input. Version 0.3.0; 0.2 stays skipped. The palette colors came along now, since the mixer needs colors anyway; the config keys for them wait for 0.4.
+- **vol 0.3:** the mixer is in `vol.c`. It was first a TUI and became a desk window like files (`-DDESK_WAYLAND -DDESK_WINDOW -DDESK_KEYBOARD -DDESK_FONT`), since a mixer is mostly sliders; net and blue stay TUIs. It runs on libpulse's main loop with the Wayland fd, key repeat, signals (`pa_signal`), the palette watch and an 80 ms tick as mainloop events, so there is one loop and no threads; around `pa_mainloop_iterate` the loop does Wayland's prepare_read/flush, and the display's io callback does read_events. Hit areas are rebuilt on each paint and searched last first, so the chooser over the list wins. All five lists (server, sinks, sources, sink inputs, cards) are read into a second model and swapped in when the last arrives; events during a read cause one more read. Levels change locally at once so held keys add up, then the server's answer replaces them. Meters are peak-detect record streams at 25 Hz on each output's monitor (not keeping it awake) or each input (keeping the mic open while Input is shown), only for the view on screen. Monitors are left out of Input (`show_monitors` in 0.4). `vol mixer` always opens it; `vol` with no command opens it only when stdout is a terminal, so scripts keep the old behavior, and `-s` opens it on Input. Version 0.3.0; 0.2 stays skipped. The palette colors came along now, since the mixer needs colors anyway; the config keys for them wait for 0.4.
 
 ## Bluetooth notes
 

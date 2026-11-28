@@ -1,8 +1,8 @@
 # vol
 
 Audio and volume control: a command line that reads and changes the default
-output or input and follows it for bar, and a mixer for every output, input,
-playing stream and sound card. The popup comes with `notify`; config and the
+output or input and follows it for bar, and a mixer window for every output,
+input, playing stream and sound card. The popup comes with `notify`; config and the
 bar click come in 0.4. The plan is in
 [docs/sound-roadmap.md](../docs/sound-roadmap.md).
 
@@ -16,8 +16,9 @@ restores them per route (speakers, headphones, HDMI) as usual.
 vol [-s] [COMMAND]
 vol [-s] --follow
 
-  (none)                 in a terminal, the mixer (-s opens it on Input);
-                         in a script or pipe, the same as get
+  (none)                 in a terminal, the same as mixer; in a script or
+                         pipe, the same as get
+  mixer                  open the mixer window (-s opens it on Input)
   get                    print the level, as wpctl does: Volume: 0.30 [MUTED]
   up [N] | down [N]      change it by N percent (default: [volume] step, 5)
   set N                  set it to N percent (0 to 150)
@@ -44,17 +45,23 @@ Exit status: 0 on success, 1 when the sound server can't be reached within
 ## Mixer
 
 ```sh
-deal --app-id vol --columns 90 --rows 20 -e vol
+vol mixer
 ```
 
-Four views, switched with Tab, Shift+Tab, `1` to `4`, or a click on their name:
+A Wayland window (app ID `vol`, title "Sound"), drawn like files: tabs
+across the top, a row per device or stream. Four views, switched with a click
+on their tab, Tab, Shift+Tab, Ctrl+Page Up/Down, or `1` to `4`:
 
-| View | Rows | Enter |
+| View | Rows | Click / Enter |
 | --- | --- | --- |
-| Output | Every output; `*` marks the default | Make it the default |
-| Input | Every input except outputs' monitors | Make it the default |
-| Playback | Each application's stream, what it plays, and where | Move it to another output |
-| Devices | Each sound card and its profile | Pick a profile (HDMI, Bluetooth A2DP or HFP with its codec, Off) |
+| Output | Every output; the filled dot is the default | The dot makes it the default |
+| Input | Every input except outputs' monitors | The dot makes it the default |
+| Playback | Each application's stream, what it plays, and where | The output on the right moves it to another |
+| Devices | Each sound card and its profile | The profile box picks one (HDMI, Bluetooth A2DP or HFP with its codec, Off) |
+
+Each row with a level has a speaker (or mic) button that mutes, a slider and
+the percentage. Choices open as a list over the window; click one, or click
+outside it to close it.
 
 | Key | Action |
 | --- | --- |
@@ -64,14 +71,14 @@ Four views, switched with Tab, Shift+Tab, `1` to `4`, or a click on their name:
 | Enter, d | As in the table above |
 | Home/End, g/G | First or last row |
 | Escape | Back out of a choice, or quit |
-| q | Quit |
+| q, Ctrl+Q, Ctrl+W | Quit |
 
-With the mouse: click a row to select it, click on its bar to set the level
-there (the last cell is 100%), and scroll over a row to change its level.
-In a choice, a click picks.
+With the mouse: click or drag on a slider to set the level, use the wheel
+over a slider or mute button to step it, and the wheel anywhere else to
+scroll. Middle click on a row mutes it, as on bar.
 
-The bar shows the level as a line. On Output and Input, what's playing or
-being picked up shows over it as blocks, in the highlight color: on Input
+On Output and Input, what's playing or being picked up shows as a thin line
+under the slider, in the highlight color: on Input
 that's the mic, so speak and watch it move. The mic's meter keeps the mic
 open while the Input view is on screen; outputs' meters don't keep an idle
 output awake. Everything follows the server live: streams come and go,
@@ -96,7 +103,10 @@ Unknown keys and bad values are reported on stderr and the defaults kept.
 
 ## Build and install
 
-Needs libpulse (from `libpulse`; PipeWire serves it through `pipewire-pulse`).
+Needs libpulse (from `libpulse`; PipeWire serves it through `pipewire-pulse`),
+wayland-client, xkbcommon, freetype2 and fontconfig, wayland-scanner and
+wayland-protocols to build. The mute icons come from Symbols Nerd Font
+through fontconfig's fallback.
 
 ```sh
 make
@@ -108,16 +118,19 @@ the session's `PATH`.
 
 ## Checks
 
-Mixer (0.3), checked with two temporary null outputs and noise played into one:
+Mixer (0.3), checked with two temporary null outputs and noise played into
+one, driven by a virtual pointer:
 
-- [x] Output lists every output with the default marked; h/l, m, and a
-      click on the bar (4%, 50%, 100%) change the right output; the wheel
-      steps it
+- [x] Output lists every output with the default marked; a click on a
+      slider (50%), a drag (26%), the wheel (+10%) and the mute button
+      change the right output
 - [x] The meter shows the noise; Input shows the mic and its meter
-- [x] Playback shows the stream with its output; Enter, then choosing the
-      other output, moves it while it plays
-- [x] Devices shows both cards; the HDMI profiles show as unavailable
-- [x] Tab, a click on a tab, Escape out of a choice and out of the mixer
+- [x] Playback shows the stream with its output; the output's dropdown,
+      then the other output, moves it while it plays
+- [x] Devices shows both cards; the HDMI profiles show as unavailable; a
+      click outside closes the choice
+- [x] SIGTERM closes it with no meter streams left on the server
+- [ ] Keyboard: Tab, 1–4, j/k, h/l, m, Enter, Escape (no key injection here)
 - [x] `vol | cat`, `vol get` and `--follow` behave as before
 - [ ] A browser tab's stream moved to headphones stays there
 - [ ] Switching a headset to HFP adds its mic under Input
