@@ -13,24 +13,32 @@ Ground rules that apply to every phase:
 
 ## Where things stand (2026-11-28)
 
-**Now:** `mark`'s features are all in (0.1 to 0.5: parser, GitHub extensions, pager, links and search, config and palette), and so are `view`'s. What's left for both is 1.0, mostly live checks and a week of daily use, so they run alongside the next app instead of blocking it. The app in progress is `files`, the graphical file manager, pulled forward from Phase 5 the way view and mark were: it's the last big piece of daily use still handled by something outside the desktop. 0.1 and 0.2 are in: an explorer layout (toolbar, sidebar of places, the list), keyboard and mouse navigation and live refresh. Details for view and mark are in [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
+**Now:** `files` 0.1 to 0.6 are in: an explorer layout, file operations with progress and undo, drag and drop, properties, config, per-folder views, and the file picker (`files --pick`/`--save` plus the FileChooser portal backend, live through `xdg-desktop-portal`). What's left for files is 1.0, which runs alongside daily use. `mark` and `view` are at the same point: features in, 1.0 checks to go. Before more apps, the laptop needs the basics a daily driver can't do without: Bluetooth, working volume, and a browser. Details for the apps are in [docs/files-roadmap.md](docs/files-roadmap.md), [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
 
 **Next, in order:**
 
-1. `files`: 0.1 to 0.3 are done (0.3's "Other application…" dialog is put off). 0.4 from [docs/files-roadmap.md](docs/files-roadmap.md) is under way: selecting, thumbnails, rename, new folder, the trash, delete and undo, then copy, cut and paste with progress and the clipboard, drag and drop, and properties are in, 0.5 (config, views per folder, tooltips, the desktop entry and Super+E) and 0.6 (`files --pick`/`--save` and the FileChooser portal backend) are done. Next is 1.0: live checks and daily use. files is a mouse-first explorer, not a keyboard-first one.
-2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
-3. Alongside `files`, `view` toward 1.0:
+1. Bluetooth: `bluez` and `bluez-utils` are installed. Enable `bluetooth.service`, pair from `bluetoothctl` first, and check that headphones show up as a PipeWire output. A graphical way in (bar or its own small app) comes after it works from the terminal
+2. Volume: PipeWire and WirePlumber are installed but the keys do nothing (dwl only has `volume-up_EXAMPLE`). Bind XF86AudioRaiseVolume, LowerVolume and Mute to `wpctl` in dwl's `config.h` as the stopgap, and show the level in bar. `vol` (Phase 6's route) replaces the stopgap later
+3. A browser: none is installed. Install one, make it the default for `http`, `https` and `text/html` in `mimeapps.list`, and check its upload and download dialogs come up as files through the portal (the reason for files 0.6)
+4. `files` toward 1.0: live checks, a week of daily use, fuzzing the listing and the portal input, final README, tag `files-1.0.0`. After 1.0: dialogs as windows of their own that can be dragged. files is a mouse-first explorer, not a keyboard-first one.
+5. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
+6. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
    - 0.4 live checks once there are sample files: a portrait phone photo, a WebP, an animated GIF
    - A week as the default image viewer, with annoyances in `docs/view-papercuts.md`
    - Fuzz `desk_image_load` (PNG, JPEG, GIF, WebP, EXIF) under ASan/UBSan for a few hours, especially the hand-written GIF decoder
    - Final README pass and tag `view-1.0.0`
-4. Back to the open items: deal 0.10.4 and 0.11.0 (Phase 1), the week on deal and removing foot (Phase 1.4), shot 0.5 and 1.0 (Phase 4), then Phase 3
+7. Back to the open items: deal 0.10.4 and 0.11.0 (Phase 1), the week on deal and removing foot (Phase 1.4), shot 0.5 and 1.0 (Phase 4), then Phase 3
 
 **Recently finished:**
 
 | What | Result |
 |---|---|
+| Portal setup | `xdg-desktop-portal` installed and live: dwl sets `XDG_CURRENT_DESKTOP=dwl` and hands it and `WAYLAND_DISPLAY` to D-Bus and systemd activation at startup, the session file names `DesktopNames=dwl`, and file dialogs reach files through `~/.config/xdg-desktop-portal/dwl-portals.conf`. dwl floats the dialog (`files-picker`) centered |
+| files 0.6 | The file picker: `files --pick` (`--multiple`, `--directory`) and `--save NAME`, a bottom bar with the name, type filter, Cancel and Open/Save, exit 3 on cancel, the last folder per application. `files --portal` serves `org.freedesktop.impl.portal.FileChooser` (OpenFile, SaveFile, SaveFiles) with sd-bus, one dialog process per request. The background is 0.8 opaque by default (`[layout] opacity`) |
+| files 0.5 | `files.conf`, a view per folder, tooltips for cut-off names, single-click option, `files.desktop` as the folder handler, Super+E in dwl |
+| files 0.4 | Selecting (Ctrl, Shift, rubber band), rename, new folder, trash and restore, delete, undo; copy, cut and paste on a worker thread with progress, conflicts and cancel; the clipboard and drag and drop with other apps; properties. `/` and everything outside home are protected unless root or listed in `[safety] writable`. Apps opened from files float over it in dwl |
+| files 0.3 | Opening with double-click through `mimeapps.list`, the right-click menu and Open with, typing a path, bookmarks, the standard keys |
 | files 0.2 | An explorer layout: a toolbar (sidebar toggle, back, forward, up, clickable path) and a sidebar of places (home folders, `/`, mounted drives) beside the list; date and time on every entry. The mouse works: click, double-click, wheel, side buttons, dragging the sidebar's edge, kept between runs. Tabs, a search field beside the path, list and icon views, and zoom (Ctrl+wheel) followed in 0.2.3; in 0.2.4 zooming crosses from the list into icons and back, 0.2.5 put a Name, Type, Size, Modified header over the list, and 0.2.6 made it sort and resize, with folder sizes summed on a thread. Outside home is read-only unless root (the rule 0.4's operations follow). It began as Miller columns with previews on worker threads (`14b4e7f`), replaced in 0.2.2. desk gained `desk_canvas_blit` |
 | files 0.1 | One directory: keyboard navigation, selection remembered per directory, live refresh, Nerd Font icons, palette colors. desk gained fonts with fallback (`-DDESK_FONT`), the keyboard and an xdg-shell window; view moved onto the last two. Key checks pending |
 | shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
@@ -245,7 +253,7 @@ A graphical file manager that works like a normal explorer, mouse first with the
 | 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Done, but for the "Other application…" dialog (put off) |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Done, but for the slow second click to rename and the trash on other drives |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Done in 0.5.0 |
-| 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Not started |
+| 0.6 | File picker: `--pick` and `--save`, the FileChooser portal backend so browsers' upload and download dialogs are files | Done in 0.6.0, live through xdg-desktop-portal |
 | 1.0 | Checklists, a week of use, fuzzing, README, tag | Not started |
 
 ### mark
@@ -288,11 +296,13 @@ These are the pieces a laptop daily driver needs that aren't one of the 29 proje
 
 | Gap | Current state | Route |
 |---|---|---|
-| Volume keys | **Not working** (dwl config only has `volume-up_EXAMPLE`) | `vol` + XF86Audio bindings in dwl. Optional stopgap: bind `wpctl` in `config.h` |
+| Volume keys | **Not working** (dwl config only has `volume-up_EXAMPLE`). Pulled forward: the `wpctl` stopgap is next | `vol` + XF86Audio bindings in dwl. Stopgap: bind `wpctl` in `config.h` |
+| Bluetooth | `bluez` installed, not set up. Pulled forward: next | `bluetooth.service`, `bluetoothctl` to start; a bar menu or small app later |
+| Browser | None installed. Pulled forward: next | Install one, default for web links, file dialogs through the portal |
 | Brightness keys + OSD | Missing | backlight via logind `SetBrightness`, layer-shell popup |
 | Idle dim/lock/suspend | Missing | `ext-idle-notify-v1` (dwl supports it) → `lock` |
 | Polkit agent | Missing (net's README notes one may be needed) | polkit over D-Bus (sd-bus) |
-| Portals | Missing | `xdg-desktop-portal-wlr` for screen sharing. The FileChooser backend comes earlier, with `files` 0.6 (which installs `xdg-desktop-portal` and sets `XDG_CURRENT_DESKTOP`) |
+| Portals | `xdg-desktop-portal` running with files as the FileChooser (files 0.6) | `xdg-desktop-portal-wlr` for screen sharing |
 | Display configuration | Missing | `wlr-output-management` (dwl supports it) |
 | Night light | Missing | `wlr-gamma-control` (dwl supports it) |
 | Battery in bar | Missing | `/sys/class/power_supply` |
