@@ -117,7 +117,9 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 - **Toolbar:** a sidebar button, back, forward and up, then the path as pieces to click, with `read-only` or `root` at its end. Back and forward keep the last 100 directories and skip any deleted since. A path too long for the box folds its start into `…`.
 - **Sidebar:** Home, then the user folders that exist (Desktop, Documents, Downloads, Music, Pictures, Videos, from `user-dirs.dirs` or the usual names), File system (`/`), and under a Drives heading whatever is mounted in `/run/media`, `/media` or `/mnt`. It follows `/proc/self/mountinfo`, so a drive shows up when it's mounted and goes when it's unmounted. The place you're in is highlighted. Bookmarks join it in 0.3.
 - The sidebar is 180 logical pixels wide to begin with. Its edge can be dragged (no narrower than 100, no wider than half the window), and the width and whether it's shown are kept in `~/.local/state/files/state`. Under 60 cells of width it hides itself.
-- **The list:** the current directory under a column header, Name, Type, Size and Modified, the last three where there's room. Type comes from the extension (`PNG image`, `C source`, `Folder`); folders have no size. Added in 0.2.5; clicking a heading to sort by it stays in 0.3.
+- **The list:** the current directory under a column header, Name, Type, Size and Modified (0.2.5). Type comes from the extension (`PNG image`, `C source`, `Folder`).
+- **Sorting and columns** (0.2.6, brought forward from 0.3): clicking a heading sorts by it and clicking again reverses, with an arrow on the sorted one; Size and Modified start biggest and newest first. Directories stay first. Dragging the edge between headings resizes a column, and double-clicking it resets it. When the window is too narrow the Type, Size and Modified columns narrow in proportion instead of disappearing. The sort and widths are kept in the state file.
+- **Folder sizes** (0.2.6): a thread sums each folder's contents (regular files' apparent sizes, not following links or crossing into other file systems), showing `…` until it's done, so a big tree never holds up the window. Moving to another directory stops the walk. A refresh keeps the old sizes on screen until the new ones arrive.
 - **Mouse** (brought forward from 0.5): click selects, double-click enters a directory, a place goes there, and the wheel scrolls the list without moving the selection. The mouse's side buttons go back and forward.
 - **Tabs** along the top, each with its own directory, selection, history and search: Ctrl+T, Ctrl+W (the last tab closes the window), Ctrl+Tab, Alt+1–9, a × on each and a `+`, and middle-click on a directory, place or path piece to open it in a background tab.
 - **Search** in a field beside the path (Ctrl+F): it filters the current directory as you type, ignoring ASCII case. Going elsewhere ends it. Brought forward from 0.3.
@@ -178,11 +180,6 @@ A popup menu (desk's new `xdg_popup` piece) at the pointer. Keyboard users reach
 - **Search** in the current directory is in since 0.2. Searching below it, recursively, comes after 1.0 if it's wanted.
 - **Type to select:** typing letters in the list jumps to the first name that starts with them, as in other explorers. The typed text resets after a second without a key.
 - **Bookmarks:** "Add to sidebar" in the menu, or dragging a folder onto the sidebar (0.4), adds it under a Bookmarks heading. They're kept in GTK's bookmarks file (`~/.config/gtk-3.0/bookmarks`), so GTK file dialogs and other file managers show the same ones.
-
-### Sorting and the details view
-
-- The header row (Name, Type, Size, Modified, there since 0.2) becomes clickable: clicking a heading sorts by it, clicking again reverses, and an arrow marks the sorted column. Dragging between headings resizes the columns. Directories stay first either way.
-- The sort and column widths are kept in the state file.
 
 ### Keys
 
@@ -440,8 +437,8 @@ How applications pick up the portal (to confirm against the installed versions):
 | Version | Theme | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, sorting by column headers, standard keys | Not started |
+| 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | Not started |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |

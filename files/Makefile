@@ -9,7 +9,7 @@ PACKAGES = wayland-client xkbcommon freetype2 fontconfig
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PKG_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 CFLAGS ?= -O2
-FILES_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_WINDOW -DDESK_KEYBOARD -DDESK_FONT \
+FILES_CFLAGS = -std=c11 -pthread -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_WINDOW -DDESK_KEYBOARD -DDESK_FONT \
 	-I$(BUILD) -I$(DESK)
 
 DESK = ../desk
@@ -30,7 +30,7 @@ OBJECTS = $(BUILD)/files.o $(BUILD)/desk.o $(PROTOCOLS:.c=.o)
 all: files
 
 files: $(OBJECTS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PKG_LIBS) -lm $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PKG_LIBS) -lm -pthread $(LDLIBS)
 
 $(BUILD)/files.o: files.c files.h $(HEADERS) $(DESK)/desk.h
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(FILES_CFLAGS) -c -o $@ files.c

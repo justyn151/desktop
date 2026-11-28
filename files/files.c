@@ -2,6 +2,9 @@
 #include "files.h"
 
 #include <ctype.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/eventfd.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +40,12 @@
 #define SIDEBAR_STEP 20       /* < and > change the width by this. */
 #define DIVIDER_GRAB 5        /* Logical pixels either side of a divider that grab it. */
 #define DOUBLE_CLICK_MS 400
+#define NAME_MIN 150          /* Logical pixels the name column keeps before the others narrow. */
+#define COLUMN_MIN 40         /* Logical pixels: no column is dragged narrower. */
+
+/* Type, size and modified to begin with, logical pixels at zoom 1. */
+static const double default_column_width[COLUMN_COUNT] = {0, 120, 75, 135};
+static const char *const column_titles[COLUMN_COUNT] = {"Name", "Type", "Size", "Modified"};
 
 /* Zoom levels: the list's text size as a multiple of the window's, and the
    icon view's icon size in logical pixels. Together they make one scale:
@@ -169,12 +178,60 @@ static int natural_compare(const char *a, const char *b)
     return strcmp(a, b);
 }
 
+static void entry_type(const struct entry *entry, char *out, size_t length);
+
+/* The order qsort sorts by, set by listing_sort. */
+static enum column sort_column;
+static bool sort_descending;
+
+static int compare_numbers(long long a, long long b)
+{
+    return a < b ? -1 : a > b;
+}
+
+/* Directories first, then by the sorted column, ties by name. Directories
+   are sized by their contents; ones still being summed count as smallest. */
 static int entry_order(const void *left, const void *right)
 {
     const struct entry *a = left, *b = right;
     if (a->directory != b->directory)
         return a->directory ? -1 : 1;
-    return natural_compare(a->name, b->name);
+    int order = 0;
+    switch (sort_column) {
+    case COLUMN_TYPE: {
+        char x[48], y[48];
+        entry_type(a, x, sizeof x);
+        entry_type(b, y, sizeof y);
+        order = natural_compare(x, y);
+        break;
+    }
+    case COLUMN_SIZE:
+        order = compare_numbers(a->directory ? a->total : (long long)a->size,
+                                b->directory ? b->total : (long long)b->size);
+        break;
+    case COLUMN_MODIFIED:
+        order = compare_numbers(a->modified.tv_sec, b->modified.tv_sec);
+        if (!order)
+            order = compare_numbers(a->modified.tv_nsec, b->modified.tv_nsec);
+        break;
+    case COLUMN_NAME:
+    case COLUMN_COUNT:
+        break;
+    }
+    if (!order) {
+        order = natural_compare(a->name, b->name);
+        if (sort_column != COLUMN_NAME)
+            return order; /* Ties by name stay A to Z either way. */
+    }
+    return sort_descending ? -order : order;
+}
+
+static void listing_sort(struct listing *listing, enum column column, bool descending)
+{
+    sort_column = column;
+    sort_descending = descending;
+    if (listing->count)
+        qsort(listing->entries, listing->count, sizeof *listing->entries, entry_order);
 }
 
 /* Listing */
@@ -253,12 +310,14 @@ static int listing_read(struct listing *listing, const char *path)
             listing->capacity = capacity;
         }
         struct entry *entry = &listing->entries[listing->count];
-        *entry = (struct entry){.name = strdup(name), .hidden = name[0] == '.'};
+        *entry = (struct entry){.name = strdup(name), .hidden = name[0] == '.', .total = TOTAL_NONE};
         if (!entry->name) {
             errno = ENOMEM;
             break;
         }
         entry_stat(dirfd(directory), entry, item->d_type);
+        if (entry->directory && !entry->link)
+            entry->total = TOTAL_PENDING;
         listing->count++;
         errno = 0;
     }
@@ -269,8 +328,6 @@ static int listing_read(struct listing *listing, const char *path)
         listing->error = error;
         return error;
     }
-    if (listing->count)
-        qsort(listing->entries, listing->count, sizeof *listing->entries, entry_order);
     listing->shown = malloc((listing->count ? listing->count : 1) * sizeof *listing->shown);
     if (!listing->shown) {
         listing_free(listing);
@@ -430,6 +487,24 @@ static void state_entry(void *data, const char *section, const char *key, const 
             files->sidebar_width = width;
     } else if (strcmp(key, "show_sidebar") == 0) {
         files->show_sidebar = strcmp(value, "no") != 0;
+    } else if (strcmp(key, "sort") == 0) {
+        for (int c = 0; c < COLUMN_COUNT; ++c) {
+            if (strcasecmp(value, column_titles[c]) == 0)
+                files->sort = (enum column)c;
+        }
+    } else if (strcmp(key, "sort_reverse") == 0) {
+        files->sort_reverse = strcmp(value, "yes") == 0;
+    } else if (strcmp(key, "columns") == 0) {
+        const char *at = value;
+        for (int c = COLUMN_TYPE; c < COLUMN_COUNT; ++c) {
+            char *end;
+            double width = strtod(at, &end);
+            if (end == at)
+                break;
+            if (width >= COLUMN_MIN && width <= 2000)
+                files->column_width[c] = width;
+            at = end;
+        }
     } else if (strcmp(key, "view") == 0) {
         files->view = strcmp(value, "icons") == 0 ? VIEW_ICONS : VIEW_LIST;
     } else if (strcmp(key, "list_zoom") == 0 || strcmp(key, "icon_size") == 0) {
@@ -450,6 +525,9 @@ static void load_state(struct files *files)
     files->show_sidebar = true;
     files->view = VIEW_LIST;
     memcpy(files->zoom, default_zoom, sizeof files->zoom);
+    files->sort = COLUMN_NAME;
+    files->sort_reverse = false;
+    memcpy(files->column_width, default_column_width, sizeof files->column_width);
     if (files->state_path)
         desk_ini_load(files->state_path, state_entry, files);
 }
@@ -469,10 +547,13 @@ static void save_state(struct files *files)
     if (desk_atomic_open(&atomic, files->state_path, 0600) != 0)
         return;
     fprintf(atomic.file,
-            "# Written by files. The sidebar's width and the icon size in logical pixels.\n[layout]\n"
-            "sidebar = %.0f\nshow_sidebar = %s\nview = %s\nlist_zoom = %.3f\nicon_size = %.0f\n",
+            "# Written by files. Widths and the icon size in logical pixels.\n[layout]\n"
+            "sidebar = %.0f\nshow_sidebar = %s\nview = %s\nlist_zoom = %.3f\nicon_size = %.0f\n"
+            "sort = %s\nsort_reverse = %s\ncolumns = %.0f %.0f %.0f\n",
             files->sidebar_width, files->show_sidebar ? "yes" : "no", files->view == VIEW_ICONS ? "icons" : "list",
-            list_zooms[files->zoom[VIEW_LIST]], icon_zooms[files->zoom[VIEW_ICONS]]);
+            list_zooms[files->zoom[VIEW_LIST]], icon_zooms[files->zoom[VIEW_ICONS]], column_titles[files->sort],
+            files->sort_reverse ? "yes" : "no", files->column_width[COLUMN_TYPE], files->column_width[COLUMN_SIZE],
+            files->column_width[COLUMN_MODIFIED]);
     desk_atomic_commit(&atomic, true);
     desk_atomic_abort(&atomic); /* Frees what's left, after success or failure. */
 }
@@ -637,6 +718,201 @@ static void build_places(struct files *files)
     files->place_count = count;
 }
 
+/* Folder sizes
+
+   A thread sums each directory's contents, apparent sizes of regular files
+   without following links or leaving the file system, so the window never
+   waits on a big tree. Moving to another directory starts a new job: the
+   generation goes up and a walk in progress for the old one stops. */
+
+struct size_result {
+    unsigned long generation;
+    char *name;
+    long long total;
+};
+
+struct sizer {
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    int event;                      /* eventfd: results are waiting. */
+    _Atomic unsigned long generation;
+    bool quit;
+    char *directory;                /* The job: these names in this directory. */
+    char **names;
+    size_t count, next;
+    struct size_result *results;
+    size_t result_count, result_capacity;
+};
+
+/* Sum what's under the open directory fd (taken over), on this device. */
+static long long sum_tree(struct sizer *sizer, unsigned long generation, int fd, dev_t device)
+{
+    DIR *directory = fdopendir(fd);
+    if (!directory) {
+        close(fd);
+        return 0;
+    }
+    long long total = 0;
+    struct dirent *item;
+    while ((item = readdir(directory)) && atomic_load(&sizer->generation) == generation) {
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
+            continue;
+        struct stat info;
+        if (fstatat(dirfd(directory), item->d_name, &info, AT_SYMLINK_NOFOLLOW) != 0)
+            continue;
+        if (S_ISREG(info.st_mode)) {
+            total += info.st_size;
+        } else if (S_ISDIR(info.st_mode) && info.st_dev == device) {
+            int child = openat(dirfd(directory), item->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child >= 0)
+                total += sum_tree(sizer, generation, child, device);
+        }
+    }
+    closedir(directory);
+    return total;
+}
+
+static long long sum_directory(struct sizer *sizer, unsigned long generation, const char *parent, const char *name)
+{
+    int base = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int fd = base >= 0 ? openat(base, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
+    if (base >= 0)
+        close(base);
+    struct stat info;
+    if (fd < 0 || fstat(fd, &info) != 0) {
+        if (fd >= 0)
+            close(fd);
+        return TOTAL_UNREADABLE;
+    }
+    return sum_tree(sizer, generation, fd, info.st_dev);
+}
+
+static void *sizer_main(void *data)
+{
+    struct sizer *sizer = data;
+    pthread_mutex_lock(&sizer->lock);
+    while (!sizer->quit) {
+        if (sizer->next >= sizer->count) {
+            pthread_cond_wait(&sizer->wake, &sizer->lock);
+            continue;
+        }
+        unsigned long generation = atomic_load(&sizer->generation);
+        char *directory = strdup(sizer->directory);
+        char *name = strdup(sizer->names[sizer->next++]);
+        pthread_mutex_unlock(&sizer->lock);
+        long long total = directory && name ? sum_directory(sizer, generation, directory, name) : TOTAL_UNREADABLE;
+        free(directory);
+        pthread_mutex_lock(&sizer->lock);
+        if (generation != atomic_load(&sizer->generation) || !name) {
+            free(name);
+            continue;
+        }
+        if (sizer->result_count == sizer->result_capacity) {
+            size_t capacity = sizer->result_capacity ? sizer->result_capacity * 2 : 32;
+            struct size_result *results = realloc(sizer->results, capacity * sizeof *results);
+            if (!results) {
+                free(name);
+                continue;
+            }
+            sizer->results = results;
+            sizer->result_capacity = capacity;
+        }
+        sizer->results[sizer->result_count++] = (struct size_result){generation, name, total};
+        uint64_t one = 1;
+        (void)!write(sizer->event, &one, sizeof one);
+    }
+    pthread_mutex_unlock(&sizer->lock);
+    return NULL;
+}
+
+static void sizer_clear_job(struct sizer *sizer)
+{
+    for (size_t i = 0; i < sizer->count; ++i)
+        free(sizer->names[i]);
+    free(sizer->names);
+    free(sizer->directory);
+    sizer->names = NULL;
+    sizer->directory = NULL;
+    sizer->count = sizer->next = 0;
+}
+
+static struct sizer *sizer_create(void)
+{
+    struct sizer *sizer = calloc(1, sizeof *sizer);
+    if (!sizer)
+        return NULL;
+    sizer->event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    pthread_mutex_init(&sizer->lock, NULL);
+    pthread_cond_init(&sizer->wake, NULL);
+    if (sizer->event < 0 || pthread_create(&sizer->thread, NULL, sizer_main, sizer) != 0) {
+        if (sizer->event >= 0)
+            close(sizer->event);
+        pthread_mutex_destroy(&sizer->lock);
+        pthread_cond_destroy(&sizer->wake);
+        free(sizer);
+        return NULL;
+    }
+    return sizer;
+}
+
+static void sizer_destroy(struct sizer *sizer)
+{
+    if (!sizer)
+        return;
+    pthread_mutex_lock(&sizer->lock);
+    sizer->quit = true;
+    atomic_fetch_add(&sizer->generation, 1); /* Stops a walk in progress. */
+    pthread_cond_signal(&sizer->wake);
+    pthread_mutex_unlock(&sizer->lock);
+    pthread_join(sizer->thread, NULL);
+    sizer_clear_job(sizer);
+    for (size_t i = 0; i < sizer->result_count; ++i)
+        free(sizer->results[i].name);
+    free(sizer->results);
+    close(sizer->event);
+    pthread_mutex_destroy(&sizer->lock);
+    pthread_cond_destroy(&sizer->wake);
+    free(sizer);
+}
+
+/* Start summing the current listing's directories, dropping any earlier job. */
+static void sizer_start(struct files *files)
+{
+    free(files->sized_path);
+    files->sized_path = strdup(files->path);
+    struct sizer *sizer = files->sizer;
+    struct listing *listing = &files->listing;
+    size_t count = 0;
+    for (size_t i = 0; i < listing->count; ++i)
+        count += listing->entries[i].total != TOTAL_NONE;
+    char **names = count ? calloc(count, sizeof *names) : NULL;
+    size_t named = 0;
+    for (size_t i = 0; names && i < listing->count; ++i) {
+        if (listing->entries[i].total != TOTAL_NONE && (names[named] = strdup(listing->entries[i].name)))
+            ++named;
+    }
+    if (!sizer || (count && !names)) {
+        /* Nothing will sum them: don't leave them waiting. */
+        for (size_t i = 0; i < listing->count; ++i) {
+            if (listing->entries[i].total == TOTAL_PENDING)
+                listing->entries[i].total = TOTAL_NONE;
+        }
+        for (size_t i = 0; i < named; ++i)
+            free(names[i]);
+        free(names);
+        return;
+    }
+    pthread_mutex_lock(&sizer->lock);
+    atomic_fetch_add(&sizer->generation, 1);
+    sizer_clear_job(sizer);
+    sizer->directory = strdup(files->path);
+    sizer->names = names;
+    sizer->count = sizer->directory ? named : 0;
+    pthread_cond_signal(&sizer->wake);
+    pthread_mutex_unlock(&sizer->lock);
+}
+
 /* Navigation */
 
 static void update_title(struct files *files)
@@ -655,8 +931,22 @@ static void filter(struct files *files)
    it's still there, else near the old position. */
 static void load(struct files *files, const char *keep, size_t near)
 {
-    listing_free(&files->listing);
+    struct listing old = files->listing;
     listing_read(&files->listing, files->path);
+    /* Rereading the same directory: show the sizes summed last time until
+       the new ones come in. */
+    if (files->sized_path && strcmp(files->sized_path, files->path) == 0) {
+        for (size_t i = 0; i < files->listing.count; ++i) {
+            struct entry *entry = &files->listing.entries[i];
+            for (size_t j = 0; entry->total == TOTAL_PENDING && j < old.count; ++j) {
+                if (old.entries[j].total >= 0 && strcmp(old.entries[j].name, entry->name) == 0)
+                    entry->total = old.entries[j].total;
+            }
+        }
+    }
+    listing_free(&old);
+    listing_sort(&files->listing, files->sort, files->sort_reverse);
+    sizer_start(files);
     filter(files);
     build_places(files);
     files->writable = may_modify(files, files->path);
@@ -927,6 +1217,86 @@ static void refilter(struct files *files)
     }
     files->free_scroll = false;
     desk_window_redraw(&files->window);
+}
+
+/* Sort again, keeping the cursor on the same entry. */
+static void resort(struct files *files)
+{
+    struct entry *entry = cursor_entry(files);
+    char *keep = entry ? strdup(entry->name) : NULL;
+    listing_sort(&files->listing, files->sort, files->sort_reverse);
+    filter(files);
+    if (!select_name(files, keep))
+        files->cursor = 0;
+    free(keep);
+    desk_window_redraw(&files->window);
+}
+
+/* A heading clicked: sort by it, or the other way when it's already sorted
+   by it. Size and modified start with the biggest and newest. */
+static void sort_by(struct files *files, enum column column)
+{
+    if (files->sort == column) {
+        files->sort_reverse = !files->sort_reverse;
+    } else {
+        files->sort = column;
+        files->sort_reverse = column == COLUMN_SIZE || column == COLUMN_MODIFIED;
+    }
+    files->free_scroll = false;
+    save_state(files);
+    resort(files);
+}
+
+/* Take the sizes the thread has summed. */
+static void sizes_arrived(struct files *files)
+{
+    struct sizer *sizer = files->sizer;
+    uint64_t count;
+    (void)!read(sizer->event, &count, sizeof count);
+    pthread_mutex_lock(&sizer->lock);
+    struct size_result *results = sizer->results;
+    size_t result_count = sizer->result_count;
+    sizer->results = NULL;
+    sizer->result_count = sizer->result_capacity = 0;
+    unsigned long generation = atomic_load(&sizer->generation);
+    pthread_mutex_unlock(&sizer->lock);
+    bool changed = false;
+    struct listing *listing = &files->listing;
+    for (size_t i = 0; i < result_count; ++i) {
+        for (size_t j = 0; results[i].generation == generation && j < listing->count; ++j) {
+            struct entry *entry = &listing->entries[j];
+            if (entry->directory && strcmp(entry->name, results[i].name) == 0) {
+                changed |= entry->total != results[i].total;
+                entry->total = results[i].total;
+                break;
+            }
+        }
+        free(results[i].name);
+    }
+    free(results);
+    if (!changed)
+        return;
+    if (files->sort == COLUMN_SIZE)
+        resort(files);
+    else
+        desk_window_redraw(&files->window);
+}
+
+/* Drag column's left edge to the pointer: its right edge stays put. */
+static void resize_column(struct files *files, int column)
+{
+    const struct panes *panes = &files->panes;
+    double unit = desk_window_scale(&files->window) * list_zooms[files->zoom[VIEW_LIST]] *
+                  (panes->squeeze > 0.05 ? panes->squeeze : 0.05);
+    double width = (panes->column_right[column] - files->pointer_x * desk_window_scale(&files->window)) / unit;
+    if (width < COLUMN_MIN)
+        width = COLUMN_MIN;
+    if (width > 2000)
+        width = 2000;
+    if (width != files->column_width[column]) {
+        files->column_width[column] = width;
+        desk_window_redraw(&files->window);
+    }
 }
 
 static void toggle_hidden(struct files *files)
@@ -1567,7 +1937,6 @@ struct layout {
     DeskFont *font, *italic, *mono;
     int row_height, baseline;   /* baseline: from the top of a row. */
     int padding, gap, icon_width;
-    int type_width, size_width, date_width;
 };
 
 static struct layout make_layout(DeskFont *font, DeskFont *italic, DeskFont *mono, double scale)
@@ -1581,9 +1950,6 @@ static struct layout make_layout(DeskFont *font, DeskFont *italic, DeskFont *mon
         .padding = (int)lround(PADDING * scale),
         .gap = (int)lround(GAP * scale),
         .icon_width = (int)lround(metrics.height * 1.4),
-        .type_width = desk_text_width(font, "Markdown file", 13),
-        .size_width = desk_text_width(mono, "1023 K", 6),
-        .date_width = desk_text_width(mono, "2026-11-28 14:03", 16),
     };
     layout.baseline = (layout.row_height - (metrics.ascent + metrics.descent)) / 2 + metrics.ascent;
     return layout;
@@ -1704,67 +2070,119 @@ static void entry_type(const struct entry *entry, char *out, size_t length)
         snprintf(out, length, "%s %s", extension, kind);
 }
 
-/* Where the list's columns go between x0 and x1: name, then type, size
-   and modified on the right when there's room for them. */
-struct columns {
-    bool details;
-    int name_x, name_right;
-    int type_x, type_right;
-    int size_right;
-    int date_x;
-};
-
-static struct columns list_columns(const struct layout *layout, int x0, int x1)
+static bool hovering(const struct files *files, enum target_kind kind, size_t index)
 {
-    int inner = layout->padding / 2, right = x1 - inner;
-    int details = layout->type_width + layout->size_width + layout->date_width + 3 * layout->gap;
-    struct columns columns = {.name_x = x0 + inner + layout->icon_width, .name_right = right};
-    columns.details = columns.name_right - columns.name_x > 2 * details;
-    if (columns.details) {
-        columns.date_x = right - layout->date_width;
-        columns.size_right = columns.date_x - layout->gap;
-        columns.type_right = columns.size_right - layout->size_width - layout->gap;
-        columns.type_x = columns.type_right - layout->type_width;
-        columns.name_right = columns.type_x - layout->gap;
-    }
-    return columns;
+    return !files->drag && !files->resizing && files->hover.kind == kind && files->hover.index == index;
 }
 
-/* Text clipped to [left, right). */
+/* Lay out the list's columns for this frame: type, size and modified at
+   their widths from the right, the name taking the rest. When the window
+   is too narrow for them and a name, all three are narrowed in proportion
+   rather than dropped. */
+static void layout_columns(struct files *files, const struct layout *layout)
+{
+    struct panes *panes = &files->panes;
+    double unit = desk_window_scale(&files->window) * list_zooms[files->zoom[VIEW_LIST]];
+    int inner = layout->padding / 2, gap = layout->gap;
+    int left = panes->list_left + inner, right = panes->list_right - inner;
+    int wanted = 0;
+    for (int c = COLUMN_TYPE; c < COLUMN_COUNT; ++c)
+        wanted += (int)lround(files->column_width[c] * unit) + gap;
+    int room = right - left - (int)lround(NAME_MIN * unit);
+    panes->squeeze = wanted > room && wanted > 0 ? fmax(room, 0) / wanted : 1;
+    int x = right;
+    for (int c = COLUMN_COUNT - 1; c > COLUMN_NAME; --c) {
+        int width = (int)lround(files->column_width[c] * unit * panes->squeeze);
+        int space = (int)lround(gap * panes->squeeze);
+        panes->column_right[c] = x;
+        panes->column_left[c] = x - width;
+        panes->edge[c] = x - width - space / 2;
+        x -= width + space;
+    }
+    panes->column_left[COLUMN_NAME] = left;
+    panes->column_right[COLUMN_NAME] = x;
+    panes->edge[COLUMN_NAME] = panes->list_left;
+    panes->edge[COLUMN_COUNT] = panes->list_right;
+}
+
+/* Text in [left, right), cut at the end with … when it doesn't fit. */
 static void draw_clipped(DeskFont *font, DeskCanvas *canvas, int left, int right, int baseline, const char *text,
                          uint32_t color)
 {
+    if (right - left < 2)
+        return;
     DeskCanvas clipped = *canvas;
     desk_canvas_clip(&clipped, left > canvas->clip_left ? left : canvas->clip_left, canvas->clip_top,
                      right < canvas->clip_right ? right : canvas->clip_right, canvas->clip_bottom);
-    draw_name(font, &clipped, left, baseline, right - left, text, false, color);
+    draw_name(font, &clipped, left, baseline, right - left, text, true, color);
 }
 
-/* The column header over the list: Name, Type, Size, Modified, in the
-   window's font, lined up with the list's columns at its zoom. */
-static void paint_header(struct files *files, DeskCanvas *canvas, const struct layout *ui,
-                         const struct layout *list, int x0, int x1, int y)
+/* Text right-aligned in [left, right), or from left, cut, when it's too long. */
+static void draw_right(DeskFont *font, DeskCanvas *canvas, int left, int right, int baseline, const char *text,
+                       uint32_t color)
 {
-    const struct colors *colors = &files->colors;
-    struct columns columns = list_columns(list, x0, x1);
-    int baseline = y + ui->baseline, inner = list->padding / 2;
-    uint32_t color = colors->muted;
-    draw_clipped(ui->font, canvas, x0 + inner, columns.name_right, baseline, "Name", color);
-    if (columns.details) {
-        draw_clipped(ui->font, canvas, columns.type_x, columns.type_right, baseline, "Type", color);
-        int size = desk_text_width(ui->font, "Size", 4);
-        desk_text_draw(ui->font, canvas, columns.size_right - size, baseline, "Size", 4, color);
-        draw_clipped(ui->font, canvas, columns.date_x, x1, baseline, "Modified", color);
+    int width = desk_text_width(font, text, strlen(text));
+    draw_clipped(font, canvas, width <= right - left ? right - width : left, right, baseline, text, color);
+}
+
+/* A small solid triangle pointing up or down, centered on x, y. */
+static void draw_arrow(DeskCanvas *canvas, int x, int y, int half, bool up, uint32_t color)
+{
+    for (int row = 0; row <= half; ++row) {
+        int reach = up ? row : half - row;
+        desk_canvas_fill(canvas, x - reach, y - half / 2 + row, 2 * reach + 1, 1, color);
     }
-    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
-    desk_canvas_fill(canvas, x0, y + ui->row_height - line, x1 - x0, line, mix(colors->background, colors->muted, 70));
 }
 
-/* One row of the list between x0 and x1, in columns. */
-static void draw_row(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct entry *entry,
-                     int x0, int x1, int y, bool selected, const struct columns *columns)
+/* The column header over the list, in the window's font, lined up with the
+   list's columns at its zoom: each heading sorts by it, the sorted one with
+   an arrow, and the edges between them resize the columns. */
+static void paint_header(struct files *files, DeskCanvas *canvas, const struct layout *ui, int y)
 {
     const struct colors *colors = &files->colors;
+    const struct panes *panes = &files->panes;
+    int baseline = y + ui->baseline, height = ui->row_height;
+    int line = desk_window_scale(&files->window) >= 2 ? (int)desk_window_scale(&files->window) : 1;
+    int half = (int)lround(desk_font_metrics(ui->font).height * 0.18);
+    uint32_t rule = mix(colors->background, colors->muted, 70);
+    for (int c = 0; c < COLUMN_COUNT; ++c) {
+        if (hovering(files, TARGET_HEADING, (size_t)c))
+            desk_canvas_fill(canvas, panes->edge[c], y, panes->edge[c + 1] - panes->edge[c], height - line,
+                             mix(colors->background, colors->muted, 35));
+        bool sorted = files->sort == (enum column)c;
+        uint32_t color = sorted ? colors->foreground : colors->muted;
+        int left = panes->column_left[c], right = panes->column_right[c];
+        int arrow = sorted ? 2 * half + ui->gap / 4 : 0; /* Room for the arrow. */
+        const char *title = column_titles[c];
+        int width = desk_text_width(ui->font, title, strlen(title));
+        if (c == COLUMN_SIZE) {
+            /* Right-aligned like the sizes, the arrow before it. */
+            draw_right(ui->font, canvas, left + arrow, right, baseline, title, color);
+            if (sorted && right - left > width + arrow)
+                draw_arrow(canvas, right - width - arrow / 2 - ui->gap / 8, y + height / 2, half,
+                           !files->sort_reverse, color);
+        } else {
+            draw_clipped(ui->font, canvas, left, right - arrow, baseline, title, color);
+            if (sorted && right - left > width + arrow)
+                draw_arrow(canvas, left + width + arrow / 2 + ui->gap / 8, y + height / 2, half,
+                           !files->sort_reverse, color);
+        }
+        if (c > COLUMN_NAME) {
+            bool active = files->resizing == c || hovering(files, TARGET_COLUMN_EDGE, (size_t)c);
+            int width_line = active ? 3 * line : line;
+            desk_canvas_fill(canvas, panes->edge[c] - width_line / 2, y + height / 5, width_line, height * 3 / 5,
+                             active ? colors->directory : rule);
+        }
+    }
+    desk_canvas_fill(canvas, panes->list_left, y + height - line, panes->list_right - panes->list_left, line, rule);
+}
+
+/* One row of the list between x0 and x1, in the columns laid out. */
+static void draw_row(struct files *files, DeskCanvas *canvas, const struct layout *layout, struct entry *entry,
+                     int x0, int x1, int y, bool selected)
+{
+    const struct colors *colors = &files->colors;
+    const struct panes *panes = &files->panes;
     if (selected)
         desk_canvas_fill(canvas, x0, y, x1 - x0, layout->row_height, colors->selection_background);
     uint32_t color = entry_color(files, entry, selected);
@@ -1772,25 +2190,33 @@ static void draw_row(struct files *files, DeskCanvas *canvas, const struct layou
     draw_icon(layout->font, canvas, x0 + inner / 2, x0 + inner / 2 + layout->icon_width, baseline,
               entry_icon(entry), color);
 
-    int name_x = columns->name_x, name_right = columns->name_right;
-    DeskCanvas clipped = *canvas;
-    desk_canvas_clip(&clipped, name_x > canvas->clip_left ? name_x : canvas->clip_left, canvas->clip_top,
-                     name_right < canvas->clip_right ? name_right : canvas->clip_right, canvas->clip_bottom);
-    draw_name(entry->link ? layout->italic : layout->font, &clipped, name_x, baseline, name_right - name_x,
-              entry->name, entry->directory, color);
-    if (!columns->details)
-        return;
+    int name_x = x0 + inner + layout->icon_width, name_right = panes->column_right[COLUMN_NAME];
+    if (name_right > name_x) {
+        DeskCanvas clipped = *canvas;
+        desk_canvas_clip(&clipped, name_x > canvas->clip_left ? name_x : canvas->clip_left, canvas->clip_top,
+                         name_right < canvas->clip_right ? name_right : canvas->clip_right, canvas->clip_bottom);
+        draw_name(entry->link ? layout->italic : layout->font, &clipped, name_x, baseline, name_right - name_x,
+                  entry->name, entry->directory, color);
+    }
 
     uint32_t detail_color = selected ? colors->selection_foreground : colors->muted;
     char type[48], size[32] = "", date[32];
     entry_type(entry, type, sizeof type);
-    if (!entry->directory && !entry->broken)
-        format_size(entry->size, size, sizeof size); /* Folders have no size. */
+    if (entry->directory && entry->total >= 0)
+        format_size((off_t)entry->total, size, sizeof size);
+    else if (entry->directory && entry->total == TOTAL_PENDING)
+        snprintf(size, sizeof size, "…");
+    else if (entry->directory && entry->total == TOTAL_UNREADABLE)
+        snprintf(size, sizeof size, "?");
+    else if (!entry->directory && !entry->broken)
+        format_size(entry->size, size, sizeof size);
     format_date(&entry->modified, date, sizeof date);
-    draw_clipped(layout->font, canvas, columns->type_x, columns->type_right, baseline, type, detail_color);
-    int size_x = columns->size_right - desk_text_width(layout->mono, size, strlen(size));
-    desk_text_draw(layout->mono, canvas, size_x, baseline, size, strlen(size), detail_color);
-    desk_text_draw(layout->mono, canvas, columns->date_x, baseline, date, strlen(date), detail_color);
+    draw_clipped(layout->font, canvas, panes->column_left[COLUMN_TYPE], panes->column_right[COLUMN_TYPE], baseline,
+                 type, detail_color);
+    draw_right(layout->mono, canvas, panes->column_left[COLUMN_SIZE], panes->column_right[COLUMN_SIZE], baseline,
+               size, detail_color);
+    draw_clipped(layout->mono, canvas, panes->column_left[COLUMN_MODIFIED], panes->column_right[COLUMN_MODIFIED],
+                 baseline, date, detail_color);
 }
 
 /* Why there's nothing to show, or NULL when there is. */
@@ -1812,11 +2238,10 @@ static void paint_list(struct files *files, DeskCanvas *canvas, const struct lay
                        int y, int rows)
 {
     struct listing *listing = &files->listing;
-    struct columns columns = list_columns(layout, x0, x1);
     for (int row = 0; row < rows && files->top + (size_t)row < listing->shown_count; ++row) {
         size_t index = files->top + (size_t)row;
         draw_row(files, canvas, layout, &listing->entries[listing->shown[index]], x0, x1,
-                 y + row * layout->row_height, index == files->cursor, &columns);
+                 y + row * layout->row_height, index == files->cursor);
     }
 }
 
@@ -1895,11 +2320,6 @@ static void paint_icons(struct files *files, DeskCanvas *canvas, const struct la
 #define ELLIPSIS "\xe2\x80\xa6"
 #define SEARCH_WIDTH 240 /* Logical pixels, at most. */
 #define TAB_WIDTH 220    /* Logical pixels, at most. */
-
-static bool hovering(const struct files *files, enum target_kind kind, size_t index)
-{
-    return !files->drag && files->hover.kind == kind && files->hover.index == index;
-}
 
 static bool button_enabled(const struct files *files, int button)
 {
@@ -2276,6 +2696,8 @@ static void paint(struct files *files, DeskCanvas *canvas)
         panes->line_height = list.row_height;
     }
     /* The list view has a column header over the entries. */
+    if (files->view == VIEW_LIST)
+        layout_columns(files, &list);
     panes->entries_top = files->view == VIEW_LIST ? top + ui.row_height + ui.padding / 4 : top;
     int rows = (bottom - panes->entries_top) / panes->line_height;
     panes->rows = rows < 1 ? 1 : rows;
@@ -2299,7 +2721,7 @@ static void paint(struct files *files, DeskCanvas *canvas)
     if (files->view == VIEW_LIST) {
         DeskCanvas header = *canvas;
         desk_canvas_clip(&header, panes->list_left, top, panes->list_right, panes->entries_top);
-        paint_header(files, &header, &ui, &list, panes->list_left, panes->list_right, top);
+        paint_header(files, &header, &ui, top);
     }
     top = panes->entries_top;
     DeskCanvas area = *canvas;
@@ -2424,7 +2846,8 @@ static const struct wl_keyboard_listener keyboard_listener = {
 
 static uint32_t cursor_shape(const struct files *files)
 {
-    if (files->drag || files->hover.kind == TARGET_DIVIDER)
+    if (files->drag || files->resizing || files->hover.kind == TARGET_DIVIDER ||
+        files->hover.kind == TARGET_COLUMN_EDGE)
         return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE;
     if (files->hover.kind == TARGET_SEARCH)
         return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
@@ -2507,8 +2930,19 @@ static struct target target_at(const struct files *files)
         if (row >= 0 && (size_t)row < files->place_count && files->places[row].path)
             return (struct target){TARGET_PLACE, (size_t)row};
     } else if (x >= panes->list_left && x < panes->list_right && panes->line_height > 0 && panes->tile_width > 0) {
-        if (y < panes->entries_top)
-            return (struct target){TARGET_NONE, 0}; /* The column header. */
+        if (y < panes->entries_top) {
+            /* The column header: an edge to drag, or a heading to sort by. */
+            int reach = (int)lround(DIVIDER_GRAB * desk_window_scale(&files->window));
+            for (int c = COLUMN_TYPE; c < COLUMN_COUNT; ++c) {
+                if (abs(x - panes->edge[c]) <= reach)
+                    return (struct target){TARGET_COLUMN_EDGE, (size_t)c};
+            }
+            for (int c = 0; c < COLUMN_COUNT; ++c) {
+                if (x >= panes->edge[c] && x < panes->edge[c + 1])
+                    return (struct target){TARGET_HEADING, (size_t)c};
+            }
+            return (struct target){TARGET_NONE, 0};
+        }
         size_t line = files->top + (size_t)((y - panes->entries_top) / panes->line_height);
         size_t column = (size_t)((x - panes->list_left) / panes->tile_width);
         size_t index = line * columns(files) + column;
@@ -2641,6 +3075,19 @@ static void click(struct files *files, uint32_t time)
         search_clear(files);
         search_focus(files, true);
         break;
+    case TARGET_HEADING:
+        sort_by(files, (enum column)target.index);
+        break;
+    case TARGET_COLUMN_EDGE:
+        if (twice) {
+            files->press.kind = TARGET_NONE;
+            files->column_width[target.index] = default_column_width[target.index];
+            save_state(files);
+            desk_window_redraw(&files->window);
+        } else {
+            files->resizing = (int)target.index;
+        }
+        break;
     case TARGET_NONE:
         break;
     }
@@ -2688,9 +3135,10 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     (void)serial;
     (void)surface;
     struct files *files = data;
-    if (files->drag)
+    if (files->drag || files->resizing)
         save_state(files);
     files->drag = false;
+    files->resizing = 0;
     files->hover = (struct target){TARGET_NONE, 0};
     files->scroll_pixels = files->zoom_pixels = 0;
     desk_window_redraw(&files->window);
@@ -2705,6 +3153,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     files->pointer_y = wl_fixed_to_double(y);
     if (files->drag)
         set_sidebar_width(files, files->pointer_x - PADDING * 1.5);
+    else if (files->resizing)
+        resize_column(files, files->resizing);
     else
         update_hover(files, false);
 }
@@ -2729,8 +3179,9 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
         /* Right-click opens a menu in 0.3. */
     } else if (pressed) {
         click(files, time);
-    } else if (files->drag) {
+    } else if (files->drag || files->resizing) {
         files->drag = false;
+        files->resizing = 0;
         save_state(files);
         update_hover(files, true);
         desk_window_redraw(&files->window);
@@ -2976,15 +3427,16 @@ static bool run(struct files *files)
             wl_display_cancel_read(display);
             return false;
         }
-        struct pollfd fds[6] = {
+        struct pollfd fds[7] = {
             {.fd = wl_display_get_fd(display), .events = POLLIN},
             {.fd = files->repeat.fd, .events = POLLIN},
             {.fd = files->inotify, .events = POLLIN},
             {.fd = files->refresh, .events = POLLIN},
             {.fd = files->palette_watch.fd, .events = POLLIN},
             {.fd = files->mounts, .events = POLLPRI},
+            {.fd = files->sizer ? files->sizer->event : -1, .events = POLLIN},
         };
-        if (poll(fds, 6, -1) < 0) {
+        if (poll(fds, 7, -1) < 0) {
             wl_display_cancel_read(display);
             if (errno == EINTR)
                 continue;
@@ -3021,6 +3473,8 @@ static bool run(struct files *files)
             update_colors(files);
             desk_window_redraw(&files->window);
         }
+        if (files->sizer && fds[6].revents & POLLIN)
+            sizes_arrived(files);
         if (files->mounts >= 0 && fds[5].revents & (POLLPRI | POLLERR)) {
             build_places(files); /* A drive came or went. */
             desk_window_redraw(&files->window);
@@ -3134,6 +3588,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "files: no key repeat: %s\n", strerror(error));
 
     files.mounts = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+    files.sizer = sizer_create(); /* Without it, directories just show no size. */
     files.tabs = calloc(1, sizeof *files.tabs);
     if (!files.tabs) {
         fprintf(stderr, "files: out of memory\n");
@@ -3158,6 +3613,8 @@ int main(int argc, char **argv)
         close(files.inotify);
     if (files.refresh >= 0)
         close(files.refresh);
+    sizer_destroy(files.sizer);
+    free(files.sized_path);
     listing_free(&files.listing);
     places_free(files.places, files.place_count);
     free(files.toolbar.crumbs);

@@ -117,10 +117,14 @@ The sidebar is 180 pixels wide to begin with. Drag its edge (the pointer turns i
 
 ### The list
 
-A header over the list names its columns: Name, Type, Size and Modified. Each row has an icon and the name; where the list is wide enough the type, size and the date and time (`2026-11-28 14:03`) follow. The header stays in the window's font when the list is zoomed, lined up with the columns. Clicking a heading to sort comes in 0.3.
+A header over the list names its columns: Name, Type, Size and Modified. Each row has an icon and the name; where the list is wide enough the type, size and the date and time (`2026-11-28 14:03`) follow. The header stays in the window's font when the list is zoomed, lined up with the columns.
+
+- **Sorting:** click a heading to sort by it, again to reverse; an arrow marks the sorted one. Size and Modified start biggest and newest first. Folders always come before files. Ties go by name.
+- **Column widths:** drag the edge between two headings (the pointer turns into a resize arrow) to resize the column on its right; double-click the edge to reset it. The name takes what's left. In a narrow window Type, Size and Modified shrink in proportion rather than disappear.
+- The sort and the widths are kept in the state file.
 
 - **Type** comes from the extension: `Folder`, `PNG image`, `MP4 video`, `ZIP archive`, `C source`, `Markdown file`, `PDF document`, `Program` for executables, or `TXT file` and plain `File` for the rest. Symlinks to folders say `Folder link` and broken links `Broken link`.
-- **Size** is left blank for folders.
+- **Size** of a folder is everything inside it, summed on a separate thread: the apparent size of regular files, without following symlinks or crossing into another file system (so `/` doesn't count `/proc` or a USB stick). It shows `…` while it's being summed and `?` when the folder can't be read; a folder you can only partly read counts what it can. Links to folders have no size. Sorting by size reorders as the sums come in.
 
 - Directories come first, then files, in natural order (`file2` before `file10`) and case-insensitively. Letters fold by ASCII case only; other characters compare by code point.
 - Directories are in the palette's accent color and hidden entries are muted. Symlinks are in italic and broken links in the urgent color.
@@ -162,7 +166,10 @@ files will only change things inside your home directory: that's the rule every 
 - [ ] A mounted USB stick shows under Drives and goes when it's unmounted.
 - [ ] Narrowing the window hides the sidebar.
 - [x] The tab strip, search field and view buttons draw; the icon view lays out a grid.
-- [x] The list has a Name, Type, Size, Modified header lined up with its columns; folders have no size.
+- [x] The list has a Name, Type, Size, Modified header lined up with its columns.
+- [x] Folders show their summed size, and sorting by Size orders them by it.
+- [ ] Clicking headings sorts and reverses; dragging an edge resizes, double-clicking resets, and both come back after a restart.
+- [ ] Narrowing the window narrows the columns instead of hiding them.
 - [ ] Tabs open, close and switch by clicking, middle-click and keys, each keeping its place.
 - [ ] Typing in the search field filters as you type; its × clears it.
 - [ ] Ctrl+wheel zooms the list and the icons, crossing from one to the other at the ends, and the zoom comes back after a restart.

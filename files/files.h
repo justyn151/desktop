@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.2.5"
+#define FILES_VERSION "0.2.6"
 
 /* Exit statuses. */
 enum {
@@ -25,6 +25,13 @@ struct colors {
     uint32_t selection_background, selection_foreground, urgent;
 };
 
+/* A directory's total size while it's unknown or unknowable. */
+enum {
+    TOTAL_PENDING = -1,     /* Being summed. */
+    TOTAL_UNREADABLE = -2,
+    TOTAL_NONE = -3,        /* Not a directory, or a link to one: not summed. */
+};
+
 /* One directory entry. Names are kept as the bytes on disk, valid UTF-8 or
    not, so they can always be opened again. */
 struct entry {
@@ -35,6 +42,7 @@ struct entry {
     gid_t group;
     off_t size;            /* Of the target, for links. */
     struct timespec modified;
+    long long total;       /* A directory's contents in bytes, or a TOTAL_ value. */
     bool directory;        /* A directory, or a link to one. */
     bool link, broken, hidden, executable;
 };
@@ -55,6 +63,11 @@ struct place {
     uint32_t icon;
 };
 
+enum view { VIEW_LIST, VIEW_ICONS, VIEW_COUNT };
+
+/* The list view's columns, left to right. */
+enum column { COLUMN_NAME, COLUMN_TYPE, COLUMN_SIZE, COLUMN_MODIFIED, COLUMN_COUNT };
+
 /* Where the sidebar and the list were drawn in the last frame, in buffer
    pixels, for the pointer. */
 struct panes {
@@ -67,9 +80,13 @@ struct panes {
     int place_height;       /* A sidebar row. */
     int line_height;        /* A list row, or a row of icons. */
     int columns, tile_width; /* Icons per row and their width; 1 and the list's width in the list view. */
+    /* The list view's columns: where each was drawn, and the edges between
+       them, edge[c] being column c's left edge (edge[0] the list's left,
+       edge[COLUMN_COUNT] its right). squeeze < 1 when they were narrowed to fit. */
+    int column_left[COLUMN_COUNT], column_right[COLUMN_COUNT];
+    int edge[COLUMN_COUNT + 1];
+    double squeeze;
 };
-
-enum view { VIEW_LIST, VIEW_ICONS, VIEW_COUNT };
 
 /* One piece of the path in the toolbar: a directory to go to. */
 struct crumb {
@@ -108,6 +125,8 @@ enum target_kind {
     TARGET_NEW_TAB,
     TARGET_SEARCH,
     TARGET_SEARCH_CLEAR,
+    TARGET_HEADING,         /* index: COLUMN_, sorts by it */
+    TARGET_COLUMN_EDGE,     /* index: the COLUMN_ to its right, resized by dragging */
 };
 
 struct target {
@@ -137,6 +156,7 @@ struct tab {
 
 #define SEARCH_MAX 256
 
+struct sizer;
 struct wl_pointer;
 struct wp_cursor_shape_manager_v1;
 struct wp_cursor_shape_device_v1;
@@ -161,6 +181,12 @@ struct files {
 
     enum view view;
     int zoom[VIEW_COUNT];     /* Index into each view's zoom levels. */
+    enum column sort;         /* The list's order; directories always come first. */
+    bool sort_reverse;        /* Descending. */
+    double column_width[COLUMN_COUNT]; /* Type, size and modified, logical pixels at zoom 1. */
+    int resizing;             /* The COLUMN_ whose left edge is being dragged, or 0. */
+    struct sizer *sizer;      /* Sums directories' sizes on a thread. */
+    char *sized_path;         /* The directory whose sizes it's summing. */
     char search[SEARCH_MAX];  /* Filters the list as it's typed. */
     size_t search_cursor;     /* Byte offset in search. */
     bool search_focus;        /* Keys go to the search field. */
