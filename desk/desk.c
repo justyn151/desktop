@@ -619,6 +619,32 @@ void desk_canvas_fill(DeskCanvas *canvas, int x, int y, int width, int height, u
     }
 }
 
+void desk_canvas_blit(DeskCanvas *canvas, int x, int y, const uint32_t *pixels, int width, int height)
+{
+    int left = x > canvas->clip_left ? x : canvas->clip_left;
+    int top = y > canvas->clip_top ? y : canvas->clip_top;
+    int right = x + width < canvas->clip_right ? x + width : canvas->clip_right;
+    int bottom = y + height < canvas->clip_bottom ? y + height : canvas->clip_bottom;
+    for (int row = top; row < bottom; ++row) {
+        uint32_t *line = canvas->pixels + (size_t)row * (size_t)canvas->stride;
+        const uint32_t *source = pixels + (size_t)(row - y) * (size_t)width - x;
+        for (int column = left; column < right; ++column) {
+            uint32_t pixel = source[column];
+            unsigned alpha = pixel >> 24;
+            if (alpha == 255) {
+                line[column] = pixel;
+            } else if (alpha) {
+                uint32_t dst = line[column], out = 0;
+                for (int shift = 0; shift < 32; shift += 8) {
+                    unsigned value = ((pixel >> shift) & 0xff) + (((dst >> shift) & 0xff) * (255 - alpha) + 127) / 255;
+                    out |= (uint32_t)(value > 255 ? 255 : value) << shift;
+                }
+                line[column] = out;
+            }
+        }
+    }
+}
+
 #ifdef DESK_KEYBOARD
 /* Keyboard */
 

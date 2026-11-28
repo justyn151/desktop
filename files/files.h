@@ -1,6 +1,7 @@
 #ifndef FILES_H
 #define FILES_H
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -10,7 +11,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.1.0"
+#define FILES_VERSION "0.2.0"
 
 /* Exit statuses. */
 enum {
@@ -35,6 +36,9 @@ enum {
 struct entry {
     char *name;
     mode_t mode;           /* From lstat: the link itself for symlinks. */
+    mode_t target_mode;    /* What a link points to; mode otherwise. 0 when broken. */
+    uid_t owner;
+    gid_t group;
     off_t size;            /* Of the target, for links. */
     struct timespec modified;
     long items;            /* Entries in a directory, or a COUNT_ value. */
@@ -52,6 +56,58 @@ struct listing {
     int error;         /* errno when the directory couldn't be read, else 0. */
 };
 
+enum preview_kind {
+    PREVIEW_DIRECTORY, /* listing */
+    PREVIEW_IMAGE,     /* pixels */
+    PREVIEW_TEXT,      /* text, possibly empty */
+    PREVIEW_BINARY,    /* Not text: the entry's details are shown. */
+    PREVIEW_ERROR,     /* message */
+};
+
+/* A finished preview of one version of a file or directory, built by a
+   worker thread and then owned by the main thread's cache. */
+struct preview {
+    char *path;
+    struct timespec modified;
+    off_t size;
+    int box_width, box_height; /* Images: the box, in buffer pixels, it was scaled to fit. */
+    enum preview_kind kind;
+    struct listing listing;
+    uint32_t *pixels;          /* Premultiplied ARGB, width × height. */
+    int width, height;
+    int image_width, image_height; /* As decoded, before fitting. */
+    char *text;
+    size_t text_length;
+    char message[192];
+    unsigned long used;        /* For evicting the least recently used. */
+    struct preview *next;      /* In the list of finished previews. */
+};
+
+/* A request to a worker: what to preview and how big an image may be. */
+struct job {
+    char *path;
+    struct timespec modified;
+    off_t size;
+    bool directory;
+    int box_width, box_height;
+};
+
+#define PREVIEW_CACHE 16
+
+/* Worker 0 reads directories and text, worker 1 decodes images, so a large
+   image never holds up a directory preview. A new request replaces one the
+   worker hasn't started. */
+enum { WORKER_GENERAL, WORKER_IMAGE, WORKER_COUNT };
+
+struct worker {
+    pthread_t thread;
+    pthread_cond_t wake;
+    struct job *pending;   /* Guarded by files.lock. */
+    bool started;
+    struct files *files;
+    char *sent;            /* Main thread: the key of the last request, until its result arrives. */
+};
+
 /* The entry last selected in a directory, for coming back to it. */
 struct memory {
     char *path, *name;
@@ -64,6 +120,20 @@ struct files {
     size_t cursor;            /* Index into listing.shown. */
     size_t top;               /* First row on screen. */
     bool show_hidden;
+    struct listing parent;    /* The parent directory, for the left column. */
+    size_t parent_cursor;     /* The current directory in it, or SIZE_MAX. */
+    unsigned long long free_space; /* Bytes available here, or ULLONG_MAX when unknown. */
+
+    bool show_preview;
+    long preview_scroll;      /* Lines or rows scrolled with J and K. */
+    char *preview_path;       /* What the scroll applies to. */
+    struct preview *cache[PREVIEW_CACHE];
+    unsigned long preview_clock;
+    pthread_mutex_t lock;     /* Guards the workers' pending jobs, done and stopping. */
+    struct worker workers[WORKER_COUNT];
+    struct preview *done;     /* Finished, waiting for the main thread. */
+    int done_fd;              /* eventfd, written when done grows. */
+    bool stopping;
 
     struct memory *memories;
     size_t memory_count, memory_capacity;
@@ -71,6 +141,7 @@ struct files {
     /* The current directory, watched for changes. */
     int inotify;              /* -1 when unavailable. */
     int watch;                /* The directory's watch descriptor, or -1. */
+    int parent_watch;         /* The parent's, or -1. */
     int refresh;              /* timerfd that coalesces bursts of changes. */
     bool refresh_armed;
 

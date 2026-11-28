@@ -5,11 +5,12 @@ WAYLAND_PROTOCOLS_DIR ?= $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-pro
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
-PACKAGES = wayland-client xkbcommon freetype2 fontconfig
+PACKAGES = wayland-client xkbcommon freetype2 fontconfig libpng libjpeg libwebp
 PKG_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PKG_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 CFLAGS ?= -O2
 FILES_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -DDESK_WAYLAND -DDESK_WINDOW -DDESK_KEYBOARD -DDESK_FONT \
+	-DDESK_IMAGE -DDESK_IMAGE_GIF -DDESK_IMAGE_WEBP -pthread \
 	-I$(BUILD) -I$(DESK)
 
 DESK = ../desk
@@ -27,7 +28,7 @@ OBJECTS = $(BUILD)/files.o $(BUILD)/desk.o $(PROTOCOLS:.c=.o)
 all: files
 
 files: $(OBJECTS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PKG_LIBS) -lm $(LDLIBS)
+	$(CC) $(LDFLAGS) -pthread -o $@ $(OBJECTS) $(PKG_LIBS) -lm $(LDLIBS)
 
 $(BUILD)/files.o: files.c files.h $(HEADERS) $(DESK)/desk.h
 	$(CC) $(CPPFLAGS) $(PKG_CFLAGS) $(CFLAGS) $(FILES_CFLAGS) -c -o $@ files.c

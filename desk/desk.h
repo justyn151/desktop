@@ -188,6 +188,10 @@ void desk_canvas_clip(DeskCanvas *canvas, int left, int top, int right, int bott
    Alpha 0xff replaces. */
 void desk_canvas_fill(DeskCanvas *canvas, int x, int y, int width, int height, uint32_t argb);
 
+/* Composite premultiplied ARGB pixels (rows packed) over the canvas with
+   their top-left corner at x, y. */
+void desk_canvas_blit(DeskCanvas *canvas, int x, int y, const uint32_t *pixels, int width, int height);
+
 #ifdef DESK_KEYBOARD
 /* Layer 1: needs xkbcommon, but not wayland-client. */
 #include <xkbcommon/xkbcommon.h>

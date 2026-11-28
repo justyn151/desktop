@@ -13,11 +13,11 @@ Ground rules that apply to every phase:
 
 ## Where things stand (2026-11-28)
 
-**Now:** `mark`'s features are all in (0.1 to 0.5: parser, GitHub extensions, pager, links and search, config and palette), and so are `view`'s. What's left for both is 1.0, mostly live checks and a week of daily use, so they run alongside the next app instead of blocking it. The app in progress is `files`, the graphical file manager, pulled forward from Phase 5 the way view and mark were: it's the last big piece of daily use still handled by something outside the desktop. Its 0.1 is in: one directory, keyboard navigation and live refresh. Details for view and mark are in [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
+**Now:** `mark`'s features are all in (0.1 to 0.5: parser, GitHub extensions, pager, links and search, config and palette), and so are `view`'s. What's left for both is 1.0, mostly live checks and a week of daily use, so they run alongside the next app instead of blocking it. The app in progress is `files`, the graphical file manager, pulled forward from Phase 5 the way view and mark were: it's the last big piece of daily use still handled by something outside the desktop. 0.1 and 0.2 are in: Miller columns with previews, keyboard navigation and live refresh. Details for view and mark are in [docs/view-roadmap.md](docs/view-roadmap.md) and [docs/mark-roadmap.md](docs/mark-roadmap.md).
 
 **Next, in order:**
 
-1. `files`: 0.1 is done apart from its key checks (`files/README.md`). Next is 0.2 from [docs/files-roadmap.md](docs/files-roadmap.md): Miller columns, previews of directories, images and text, and a status line. Worth installing `shared-mime-info` before 0.3, which reads its MIME globs to pick applications.
+1. `files`: 0.1 and 0.2 are done apart from their live key checks (`files/README.md`). Next is 0.3 from [docs/files-roadmap.md](docs/files-roadmap.md): opening files with the default application, Open with, filtering, path entry, bookmarks and sorting. Worth installing `shared-mime-info` before 0.3, which reads its MIME globs to pick applications.
 2. Alongside `files`, `mark` toward 1.0: the 0.1 to 0.5 live checks in deal (`mark/README.md`), a week of daily use, fuzzing the parser and the pager's input, final README, tag `mark-1.0.0`
 3. Alongside `files`, `view` toward 1.0:
    - 0.5 live checks: `make -C view install`, `make -C dwl install`, restart dwl, then the four checks in `view/README.md` (floating, `run`, wallpaper recolor; `xdg-open` waits for xdg-utils)
@@ -31,6 +31,7 @@ Ground rules that apply to every phase:
 
 | What | Result |
 |---|---|
+| files 0.2 | Miller columns (parent, current, preview), previews of directories, images and text made on worker threads and cached, details for everything else, a status line; date and time on every entry. desk gained `desk_canvas_blit` |
 | files 0.1 | One directory: keyboard navigation, selection remembered per directory, live refresh, Nerd Font icons, palette colors. desk gained fonts with fallback (`-DDESK_FONT`), the keyboard and an xdg-shell window; view moved onto the last two. Key checks pending |
 | shot 0.1–0.3, 0.5 binding | Monitor and region capture to PNG and the clipboard, Super+Shift+S. 0.4 (window capture) skipped |
 | view 0.1 | One image fitted to the window, sharp at any scale |
@@ -236,7 +237,7 @@ A graphical file manager with Miller columns (parent, current, preview) and H/J/
 | Version | Milestone | Status |
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
-| 0.2 | Miller columns, previews of directories, images and text, status line | Not started |
+| 0.2 | Miller columns, previews of directories, images and text, status line | Done (live key checks pending) |
 | 0.3 | Opening with the default application, Open with, filter, path entry, bookmarks, sorting | Not started |
 | 0.4 | Selection, copy, cut, paste, rename, new, trash, undo, progress, shared clipboard | Not started |
 | 0.5 | Mouse and drag and drop, thumbnail grid, config, palette, desktop entry | Not started |

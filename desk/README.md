@@ -48,7 +48,7 @@ This is Phase 3 step 2's parser. The other apps still have their own.
 
 `desk_utf8_next(&text, end)` decodes one code point and advances past it. Every byte of an invalid, truncated, overlong or surrogate sequence decodes as U+FFFD, so any byte string, such as a file name, can be drawn.
 
-`DeskCanvas` is a premultiplied ARGB buffer with a clip rectangle. `desk_canvas(pixels, width, height)` covers a whole buffer, `desk_canvas_clip` sets the clip (intersected with the buffer, not with the previous clip), and `desk_canvas_fill(&canvas, x, y, width, height, 0xAARRGGBB)` blends a rectangle in, replacing when alpha is `0xff`. Text drawing (below) draws into the same canvas.
+`DeskCanvas` is a premultiplied ARGB buffer with a clip rectangle. `desk_canvas(pixels, width, height)` covers a whole buffer, `desk_canvas_clip` sets the clip (intersected with the buffer, not with the previous clip), `desk_canvas_fill(&canvas, x, y, width, height, 0xAARRGGBB)` blends a rectangle in, replacing when alpha is `0xff`, and `desk_canvas_blit(&canvas, x, y, pixels, width, height)` composites premultiplied ARGB pixels, such as a decoded image. Text drawing (below) draws into the same canvas.
 
 ## Keyboard (`-DDESK_KEYBOARD`)
 
@@ -96,6 +96,6 @@ This covers Phase 3 step 4 for toplevels; layer-shell setup is still in each app
 | shot | Atomic files and shared memory since 0.1; config, INI and shm buffers since 0.2 |
 | wall | Image decoding (its own decoders moved here for view) |
 | view | Image decoding and shm buffers since 0.1; key repeat since 0.2; file watch since 0.3; GIF, WebP and EXIF orientation since 0.4; palette, INI config and paths since 0.5; window and keyboard since files 0.1 |
-| files | Window, keyboard, fonts, canvas, key repeat, palette and file watch since 0.1 |
+| files | Window, keyboard, fonts, canvas, key repeat, palette and file watch since 0.1; image decoding since 0.2 |
 
 net, dwl, bar, run and wall still have their own palette parsers. Moving them is Phase 3 step 1.
