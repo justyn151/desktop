@@ -312,6 +312,8 @@ void desk_buffer_pool_finish(DeskBufferPool *pool);
 struct xdg_wm_base;
 struct xdg_surface;
 struct xdg_toplevel;
+struct xdg_popup;
+struct wl_seat;
 struct wp_viewporter;
 struct wp_viewport;
 struct wp_fractional_scale_manager_v1;
@@ -355,6 +357,7 @@ struct DeskWindow {
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
+    struct xdg_popup *popup;                 /* Instead of toplevel, for a popup. */
     struct wp_viewport *viewport;            /* NULL without wp_viewporter. */
     struct wp_fractional_scale_v1 *fractional;
     struct wl_callback *frame_callback;
@@ -375,6 +378,17 @@ struct DeskWindow {
    Return false when memory runs out. */
 bool desk_window_open(DeskWindow *window, const DeskGlobals *globals, const char *app_id,
                       const DeskWindowListener *listener, void *data);
+
+/* A popup such as a menu, placed against parent (a window or another
+   popup): its top-left at x, y (logical, in parent's surface) or, where
+   that doesn't fit on screen, flipped or slid by the compositor. It takes
+   an explicit grab with seat and serial (of the click or key that opened
+   it), so a click outside closes it: then listener->close is called and
+   the popup should be closed with desk_window_close. Its listener's draw
+   paints it like a window's. Return false when memory runs out. */
+bool desk_popup_open(DeskWindow *popup, const DeskGlobals *globals, DeskWindow *parent, int x, int y, int width,
+                     int height, struct wl_seat *seat, uint32_t serial, const DeskWindowListener *listener,
+                     void *data);
 
 /* Set the title, sending it only when it changed. */
 void desk_window_set_title(DeskWindow *window, const char *title);

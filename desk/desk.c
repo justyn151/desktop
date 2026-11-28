@@ -1333,8 +1333,9 @@ static const struct wl_surface_listener window_surface_scale_listener = {
     .preferred_buffer_transform = surface_preferred_buffer_transform,
 };
 
-bool desk_window_open(DeskWindow *window, const DeskGlobals *globals, const char *app_id,
-                      const DeskWindowListener *listener, void *data)
+/* The surface, its scale objects and its xdg_surface, for a window or a popup. */
+static bool window_surface(DeskWindow *window, const DeskGlobals *globals, const DeskWindowListener *listener,
+                           void *data)
 {
     *window = (DeskWindow){.shm = globals->shm, .buffer_scale = 1, .listener = listener, .data = data};
     window->surface = wl_compositor_create_surface(globals->compositor);
@@ -1343,7 +1344,6 @@ bool desk_window_open(DeskWindow *window, const DeskGlobals *globals, const char
     wl_surface_add_listener(window->surface, &window_surface_scale_listener, window);
     if (globals->viewporter) {
         window->viewport = wp_viewporter_get_viewport(globals->viewporter, window->surface);
-        /* Fractional scale is only usable through a viewport. */
         if (globals->fractional_manager) {
             window->fractional = wp_fractional_scale_manager_v1_get_fractional_scale(globals->fractional_manager,
                                                                                       window->surface);
@@ -1352,6 +1352,75 @@ bool desk_window_open(DeskWindow *window, const DeskGlobals *globals, const char
     }
     window->xdg_surface = xdg_wm_base_get_xdg_surface(globals->wm_base, window->surface);
     xdg_surface_add_listener(window->xdg_surface, &window_surface_listener, window);
+    return true;
+}
+
+static void popup_configure(void *data, struct xdg_popup *popup, int32_t x, int32_t y, int32_t width,
+                            int32_t height)
+{
+    (void)popup;
+    (void)x;
+    (void)y;
+    DeskWindow *window = data;
+    window->pending_width = width;
+    window->pending_height = height;
+}
+
+static void popup_done(void *data, struct xdg_popup *popup)
+{
+    (void)popup;
+    DeskWindow *window = data;
+    if (window->listener->close)
+        window->listener->close(window->data, window);
+}
+
+static void popup_repositioned(void *data, struct xdg_popup *popup, uint32_t token)
+{
+    (void)data;
+    (void)popup;
+    (void)token;
+}
+
+static const struct xdg_popup_listener window_popup_listener = {
+    .configure = popup_configure,
+    .popup_done = popup_done,
+    .repositioned = popup_repositioned,
+};
+
+bool desk_popup_open(DeskWindow *popup, const DeskGlobals *globals, DeskWindow *parent, int x, int y, int width,
+                     int height, struct wl_seat *seat, uint32_t serial, const DeskWindowListener *listener,
+                     void *data)
+{
+    if (!window_surface(popup, globals, listener, data))
+        return false;
+    /* Start at the parent's scale so the first frame is already sharp. */
+    popup->fraction = parent->fraction;
+    popup->buffer_scale = parent->buffer_scale;
+    struct xdg_positioner *positioner = xdg_wm_base_create_positioner(globals->wm_base);
+    xdg_positioner_set_size(positioner, width > 0 ? width : 1, height > 0 ? height : 1);
+    xdg_positioner_set_anchor_rect(positioner, x, y, 1, 1);
+    xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+    xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    xdg_positioner_set_constraint_adjustment(positioner, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
+                                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+                                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+                                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+    popup->popup = xdg_surface_get_popup(popup->xdg_surface, parent->xdg_surface, positioner);
+    xdg_positioner_destroy(positioner);
+    xdg_popup_add_listener(popup->popup, &window_popup_listener, popup);
+    if (seat)
+        xdg_popup_grab(popup->popup, seat, serial);
+    popup->width = width;
+    popup->height = height;
+    wl_surface_commit(popup->surface);
+    return true;
+}
+
+bool desk_window_open(DeskWindow *window, const DeskGlobals *globals, const char *app_id,
+                      const DeskWindowListener *listener, void *data)
+{
+    if (!window_surface(window, globals, listener, data))
+        return false;
     window->toplevel = xdg_surface_get_toplevel(window->xdg_surface);
     xdg_toplevel_add_listener(window->toplevel, &window_toplevel_listener, window);
     xdg_toplevel_set_app_id(window->toplevel, app_id);
@@ -1440,6 +1509,8 @@ void desk_window_close(DeskWindow *window)
     desk_buffer_pool_finish(&window->buffers);
     if (window->toplevel)
         xdg_toplevel_destroy(window->toplevel);
+    if (window->popup)
+        xdg_popup_destroy(window->popup);
     if (window->xdg_surface)
         xdg_surface_destroy(window->xdg_surface);
     if (window->fractional)

@@ -10,7 +10,7 @@
 
 #include "desk.h"
 
-#define FILES_VERSION "0.3.0"
+#define FILES_VERSION "0.3.1"
 
 /* Exit statuses. */
 enum {
@@ -61,6 +61,7 @@ struct place {
     char *name;
     char *path;             /* NULL for a heading. */
     uint32_t icon;
+    bool bookmark;          /* From GTK's bookmarks: can be removed. */
 };
 
 enum view { VIEW_LIST, VIEW_ICONS, VIEW_COUNT };
@@ -156,8 +157,41 @@ struct tab {
 
 #define SEARCH_MAX 256
 
+/* A line in a right-click menu. */
+struct menu_item {
+    char label[160];
+    int action;             /* What choosing it does: a MENU_ value in files.c. */
+    int index;              /* Which application, column... for the action. */
+    bool enabled;
+    bool separator;         /* A line between groups, not an item. */
+    bool submenu;           /* Opens another menu to the right. */
+    bool check, checked;    /* Shows a check mark when checked. */
+};
+
+#define MENU_ITEMS 40
+#define MENU_APPS 16
+
+/* A menu in a popup: the right-click menu, or its submenu. */
+struct menu {
+    DeskWindow window;
+    bool open;
+    struct menu_item items[MENU_ITEMS];
+    size_t count;
+    int hover;              /* Item under the pointer or chosen by keys, or -1. */
+    int width, height;      /* Logical pixels. */
+    int item_height, separator_height, padding;
+    int parent_item;        /* For the submenu: the item it opened from. */
+};
+
+/* What a menu was opened on. */
+enum menu_context { CONTEXT_ENTRY, CONTEXT_BACKGROUND, CONTEXT_PLACE };
+
 struct sizer;
 struct wl_pointer;
+struct wl_data_device_manager;
+struct wl_data_device;
+struct wl_data_source;
+struct wl_data_offer;
 struct wp_cursor_shape_manager_v1;
 struct wp_cursor_shape_device_v1;
 
@@ -191,6 +225,22 @@ struct files {
     uint64_t typed_at;        /* ...and when, monotonic ms. */
     char notice[256];         /* Shown over the list's foot until the next click or key, or "". */
     char *terminal;           /* Runs Terminal=true applications: run's setting, or "deal -e". */
+
+    struct menu menus[2];     /* The right-click menu and its submenu. */
+    enum menu_context menu_context;
+    char *menu_path;          /* What it was opened on: an entry, a place or the directory. */
+    bool menu_directory;      /* menu_path is a directory. */
+    char *menu_apps[MENU_APPS]; /* Open with's applications, by id. */
+    size_t menu_app_count;
+    struct wl_surface *pointer_surface; /* The window's or a menu's. */
+    uint32_t input_serial;    /* The last click or key, for grabs and the clipboard. */
+
+    struct wl_data_device_manager *data_manager;
+    struct wl_data_device *data_device;
+    struct wl_data_source *clip_source; /* What Copy path put on the clipboard... */
+    char *clip_text;          /* ...and its text. */
+    struct wl_data_offer *selection_offer; /* Others' clipboard, unused but released. */
+    char *bookmarks_path;     /* GTK's bookmarks file. */
     char search[SEARCH_MAX];  /* Filters the list as it's typed. */
     size_t search_cursor;     /* Byte offset in search. */
     bool search_focus;        /* Keys go to the search field. */

@@ -50,6 +50,7 @@ With no argument files opens the home directory. A `FILE` opens its directory wi
 | Ctrl+H | Show or hide hidden files |
 | F5, Ctrl+R | Refresh |
 | F9 | Show or hide the sidebar |
+| Menu, Shift+F10 | The right-click menu for the selected entry |
 | Ctrl+T | New tab, in the same directory |
 | Ctrl+W | Close the tab; the last one closes the window |
 | Ctrl+Tab, Ctrl+Shift+Tab (or Ctrl+Page Down, Page Up) | Next, previous tab |
@@ -75,7 +76,22 @@ Double-click or Enter opens a file the way other Linux desktops do:
 3. It starts in the file's directory, in its own session, so closing files doesn't close it. An application with `Terminal=true` (like mark) runs inside the terminal set in run's config (`[applications] terminal`), `deal -e` by default.
 4. Text that nothing claims opens in `editor` in that terminal. Anything else shows a line at the foot of the list saying nothing is set up to open it, until the next click or key.
 
-Programs aren't run by double-clicking: an executable opens like any other file of its type. Running one comes with the right-click menu.
+Programs aren't run by double-clicking: an executable opens like any other file of its type. The right-click menu's Run runs it.
+
+## The right-click menu
+
+| Right-click on | Menu |
+|---|---|
+| A file | Open, Open with ▸ (the applications for its type, the default first), Run (executables), Copy path |
+| A folder | Open, Open in new tab, Copy path, Add to sidebar |
+| A place in the sidebar | Open, Open in new tab, Copy path, Remove from sidebar (bookmarks) |
+| The empty part of the list | Show hidden files, Sort by ▸ (Name, Type, Size, Modified, Descending), Refresh, Copy path (of the folder) |
+
+It's a popup the compositor places, so it flips or slides to stay on screen; a click outside closes it. Hovering an item with ▸ opens its submenu. From the keyboard: Up and Down choose, Right opens a submenu, Left or Escape closes it, Enter or Space picks.
+
+- **Run** starts a script (text with `#!`) in the terminal so its output shows, and a program on its own.
+- **Copy path** puts the full path on the clipboard as text, until something else is copied.
+- **Add to sidebar** adds the folder to GTK's bookmarks (`~/.config/gtk-3.0/bookmarks`), so GTK file dialogs and other file managers show it too. Bookmarks appear under a Bookmarks heading in the sidebar.
 
 ## Mouse
 
@@ -90,6 +106,7 @@ Programs aren't run by double-clicking: an executable opens like any other file 
 | The search field | Focuses it, with the cursor where you clicked; its × clears it |
 | The list and icon buttons (right end) | Switch the view |
 | An entry | Selects it; double-click opens it (goes into a directory, or opens a file) |
+| Right-click | The menu for an entry, a place, or the empty part of the list (see below) |
 | Middle-click on a directory, place or path piece | Opens it in a new tab behind this one |
 | The wheel over the entries | Scrolls them, three rows a notch (a row of icons in the icon view), without moving the selection. Touchpads scroll by distance |
 | Ctrl+wheel | Zooms; past the biggest list it turns into icons, and past the smallest icons back into the list |
@@ -121,6 +138,7 @@ The two make one scale: zooming in past the biggest list switches to the smalles
 |---|---|
 | Home | `$HOME` |
 | Desktop, Documents, Downloads, Music, Pictures, Videos | From `~/.config/user-dirs.dirs` when it names them, else `~/Desktop` and so on; only the ones that exist |
+| Bookmarks | GTK's bookmarks, ones that still exist, by their label or folder name |
 | File system | `/` |
 | Drives | Whatever is mounted under `/run/media`, `/media` or `/mnt`, by its mount point's name |
 
@@ -187,6 +205,9 @@ files will only change things inside your home directory: that's the rule every 
 - [x] Opening a file starts the application mimeapps.list or a desktop entry gives it, expanding `%f`, `%F` and `%c` (checked with test entries).
 - [x] Text nothing claims opens in `editor`; a file nothing opens says so.
 - [x] Typing letters selects by name; the same letter again cycles.
+- [x] The menus for a file, a folder, a place and the empty list have the right items, and their actions work (checked headlessly: Open with lists the type's applications, Sort by sorts, Add to sidebar writes GTK's bookmarks).
+- [ ] Right-click opens the menu at the pointer, a submenu opens on hover, a click outside closes it, and the Menu key works.
+- [ ] Copy path pastes into another application.
 - [ ] Double-clicking a PNG opens view and a `.md` opens mark in deal, once both are installed (`make install` and their desktop entries).
 - [ ] Clicking headings sorts and reverses; dragging an edge resizes, double-clicking resets, and both come back after a restart.
 - [ ] Narrowing the window narrows the columns instead of hiding them.

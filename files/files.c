@@ -614,7 +614,7 @@ static void add_place(struct place **places, size_t *count, const char *name, co
         free(path_copy);
         return;
     }
-    grown[(*count)++] = (struct place){name_copy, path_copy, icon};
+    grown[(*count)++] = (struct place){name_copy, path_copy, icon, false};
 }
 
 /* A folder from user-dirs.dirs (XDG_key_DIR="$HOME/..."), else ~/fallback. */
@@ -716,6 +716,177 @@ static void add_drives(struct place **places, size_t *count)
 /* The sidebar: home and the usual folders in it that exist, the whole file
    system, then mounted drives. Made again on every load, so new folders
    and drives show up. */
+/* Bookmarks: GTK's file, one "file:///path Label" a line, shared with GTK
+   file dialogs and other file managers. */
+
+static char *bookmarks_file(void)
+{
+    const char *config = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    char *path = NULL;
+    if (config && config[0] == '/')
+        return asprintf(&path, "%s/gtk-3.0/bookmarks", config) < 0 ? NULL : path;
+    if (home && *home)
+        return asprintf(&path, "%s/.config/gtk-3.0/bookmarks", home) < 0 ? NULL : path;
+    return NULL;
+}
+
+static int hex_digit(char c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* The path in a file:// URI, decoded, or NULL for other URIs. */
+static char *uri_path(const char *uri, size_t length)
+{
+    if (length < 8 || strncmp(uri, "file://", 7) != 0)
+        return NULL;
+    uri += 7, length -= 7;
+    if (length >= 9 && strncmp(uri, "localhost", 9) == 0)
+        uri += 9, length -= 9;
+    if (!length || uri[0] != '/')
+        return NULL;
+    char *path = malloc(length + 1), *out = path;
+    for (size_t i = 0; path && i < length; ++i) {
+        int high, low;
+        if (uri[i] == '%' && i + 2 < length && (high = hex_digit(uri[i + 1])) >= 0 &&
+            (low = hex_digit(uri[i + 2])) >= 0) {
+            *out++ = (char)(high << 4 | low);
+            i += 2;
+        } else {
+            *out++ = uri[i];
+        }
+    }
+    if (path)
+        *out = 0;
+    return path;
+}
+
+/* file:// and the path with everything but unreserved characters and /
+   percent-encoded. */
+static char *path_uri(const char *path)
+{
+    size_t length = strlen(path);
+    char *uri = malloc(7 + 3 * length + 1);
+    if (!uri)
+        return NULL;
+    char *out = uri + sprintf(uri, "file://");
+    for (const unsigned char *at = (const unsigned char *)path; *at; ++at) {
+        if (isalnum(*at) || strchr("/-._~", *at))
+            *out++ = (char)*at;
+        else
+            out += sprintf(out, "%%%02X", *at);
+    }
+    *out = 0;
+    return uri;
+}
+
+/* Call each(path, label, data) for each bookmark; label may be NULL. */
+static void each_bookmark(const struct files *files, void (*each)(const char *, const char *, void *), void *data)
+{
+    FILE *file = files->bookmarks_path ? fopen(files->bookmarks_path, "re") : NULL;
+    if (!file)
+        return;
+    char *line = NULL;
+    size_t capacity = 0;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, file)) > 0) {
+        while (length && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+            line[--length] = 0;
+        size_t uri_length = strcspn(line, " ");
+        char *path = uri_path(line, uri_length);
+        if (path)
+            each(path, line[uri_length] && line[uri_length + 1] ? line + uri_length + 1 : NULL, data);
+        free(path);
+    }
+    free(line);
+    fclose(file);
+}
+
+struct bookmark_places {
+    struct place **places;
+    size_t *count;
+    bool heading;
+};
+
+static void add_bookmark_place(const char *path, const char *label, void *data)
+{
+    struct bookmark_places *state = data;
+    if (!is_directory(path))
+        return;
+    if (!state->heading) {
+        add_place(state->places, state->count, "Bookmarks", NULL, 0);
+        state->heading = true;
+    }
+    size_t before = *state->count;
+    add_place(state->places, state->count, label ? label : strcmp(path, "/") == 0 ? "/" : base_name(path), path,
+              ICON_FOLDER);
+    if (*state->count > before)
+        (*state->places)[before].bookmark = true;
+}
+
+struct bookmark_search {
+    const char *path;
+    bool found;
+};
+
+static void find_bookmark(const char *path, const char *label, void *data)
+{
+    (void)label;
+    struct bookmark_search *search = data;
+    search->found |= strcmp(path, search->path) == 0;
+}
+
+static bool is_bookmarked(const struct files *files, const char *path)
+{
+    struct bookmark_search search = {path, false};
+    each_bookmark(files, find_bookmark, &search);
+    return search.found;
+}
+
+/* Add path to the bookmarks, or with add false remove it, rewriting the
+   file atomically and keeping every other line as it was. */
+static int change_bookmark(struct files *files, const char *path, bool add)
+{
+    if (!files->bookmarks_path)
+        return ENOENT;
+    FILE *in = fopen(files->bookmarks_path, "re");
+    char *directory = parent_path(files->bookmarks_path);
+    int error = directory ? desk_mkdirs(directory, 0700) : ENOMEM;
+    free(directory);
+    DeskAtomic atomic;
+    if (!error)
+        error = desk_atomic_open(&atomic, files->bookmarks_path, 0644);
+    if (error) {
+        if (in)
+            fclose(in);
+        return error;
+    }
+    char *line = NULL;
+    size_t capacity = 0;
+    ssize_t length;
+    while (in && (length = getline(&line, &capacity, in)) > 0) {
+        char *path_here = uri_path(line, strcspn(line, " \r\n"));
+        bool same = path_here && strcmp(path_here, path) == 0;
+        free(path_here);
+        if (!same)
+            fputs(line, atomic.file);
+        if (line[length - 1] != '\n' && !same)
+            fputc('\n', atomic.file);
+    }
+    free(line);
+    if (in)
+        fclose(in);
+    if (add) {
+        char *uri = path_uri(path);
+        if (uri)
+            fprintf(atomic.file, "%s\n", uri);
+        free(uri);
+    }
+    error = desk_atomic_commit(&atomic, true);
+    desk_atomic_abort(&atomic);
+    return error;
+}
+
 static void build_places(struct files *files)
 {
     struct place *places = NULL;
@@ -737,6 +908,8 @@ static void build_places(struct files *files)
             free(path);
         }
     }
+    struct bookmark_places bookmarks = {&places, &count, false};
+    each_bookmark(files, add_bookmark_place, &bookmarks);
     add_place(&places, &count, "File system", "/", ICON_DISK);
     add_drives(&places, &count);
     places_free(files->places, files->place_count);
@@ -1134,18 +1307,19 @@ static bool text_like(const char *mime)
 /* Open a file with its type's default application, as other desktops do:
    mimeapps.list, then the applications that declare the type. Text nothing
    claims goes to editor in the terminal. Programs aren't run. */
-static void open_file(struct files *files, const struct entry *entry)
+static void open_file(struct files *files, const char *path_in)
 {
-    char *path = join_path(files->path, entry->name);
+    char *path = strdup(path_in);
     if (!path)
         return;
+    const char *name = base_name(path);
     DeskApps apps;
     if (desk_apps_load(&apps) != 0) {
         notify(files, "Out of memory");
         free(path);
         return;
     }
-    const char *mime = desk_mime_type(&apps, path, entry->name);
+    const char *mime = desk_mime_type(&apps, path, name);
     const DeskApp *app = NULL;
     desk_apps_for(&apps, mime, &app, 1);
     int error = 0;
@@ -1158,7 +1332,7 @@ static void open_file(struct files *files, const struct entry *entry)
         if ((error = desk_spawn(argv, files->terminal, files->path)))
             notify(files, "Couldn't start editor: %s", strerror(error));
     } else {
-        notify(files, "No application is set up to open %s (%s)", entry->name, mime);
+        notify(files, "No application is set up to open %s (%s)", name, mime);
     }
     desk_apps_free(&apps);
     free(path);
@@ -1170,16 +1344,18 @@ static void go_in(struct files *files)
     struct entry *entry = cursor_entry(files);
     if (!entry)
         return;
-    if (!entry->directory) {
-        if (!entry->broken)
-            open_file(files, entry);
-        else
-            notify(files, "%s is a broken link", entry->name);
+    char *path = join_path(files->path, entry->name);
+    if (!path)
+        return;
+    if (entry->directory) {
+        go_to(files, path, NULL);
         return;
     }
-    char *path = join_path(files->path, entry->name);
-    if (path)
-        go_to(files, path, NULL);
+    if (!entry->broken)
+        open_file(files, path);
+    else
+        notify(files, "%s is a broken link", entry->name);
+    free(path);
 }
 
 static void go_home(struct files *files)
@@ -1732,6 +1908,9 @@ static int search_key(struct files *files, uint32_t key, xkb_keysym_t sym, unsig
 
 /* Keys */
 
+static void menu_key(struct files *files, xkb_keysym_t sym);
+static void context_key(struct files *files);
+
 /* Act on a key. Return whether it repeats while held. */
 static bool key_action(struct files *files, xkb_keysym_t sym, unsigned mods)
 {
@@ -1883,6 +2062,14 @@ static bool handle_key(struct files *files, uint32_t key)
     xkb_keysym_t sym = desk_keyboard_sym(&files->keyboard, key);
     unsigned mods = desk_keyboard_mods(&files->keyboard);
     clear_notice(files);
+    if (files->menus[0].open) {
+        menu_key(files, sym);
+        return false;
+    }
+    if (sym == XKB_KEY_Menu || (sym == XKB_KEY_F10 && (mods & DESK_MOD_SHIFT))) {
+        context_key(files);
+        return false;
+    }
     if (files->search_focus) {
         int repeats = search_key(files, key, sym, mods);
         if (repeats >= 0)
@@ -2929,13 +3116,13 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
                          uint32_t key, uint32_t state)
 {
     (void)keyboard;
-    (void)serial;
     (void)time;
     struct files *files = data;
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
         desk_repeat_release(&files->repeat, key);
         return;
     }
+    files->input_serial = serial;
     if (!files->keyboard.state)
         return;
     bool repeats = handle_key(files, key);
@@ -3081,6 +3268,730 @@ static struct target target_at(const struct files *files)
             return (struct target){TARGET_ROW, index};
     }
     return (struct target){TARGET_NONE, 0};
+}
+
+/* Clipboard: Copy path offers text until something else takes the
+   clipboard. */
+
+static void clip_target(void *data, struct wl_data_source *source, const char *mime)
+{
+    (void)data;
+    (void)source;
+    (void)mime;
+}
+
+static void clip_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd)
+{
+    (void)source;
+    (void)mime;
+    struct files *files = data;
+    const char *text = files->clip_text ? files->clip_text : "";
+    size_t left = strlen(text);
+    while (left) {
+        ssize_t written = write(fd, text, left);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            break;
+        text += written;
+        left -= (size_t)written;
+    }
+    close(fd);
+}
+
+static void clip_cancelled(void *data, struct wl_data_source *source)
+{
+    struct files *files = data;
+    if (files->clip_source == source) {
+        files->clip_source = NULL;
+        free(files->clip_text);
+        files->clip_text = NULL;
+    }
+    wl_data_source_destroy(source);
+}
+
+static void clip_dnd_drop_performed(void *data, struct wl_data_source *source)
+{
+    (void)data;
+    (void)source;
+}
+
+static void clip_dnd_finished(void *data, struct wl_data_source *source)
+{
+    (void)data;
+    (void)source;
+}
+
+static void clip_action(void *data, struct wl_data_source *source, uint32_t action)
+{
+    (void)data;
+    (void)source;
+    (void)action;
+}
+
+static const struct wl_data_source_listener clip_listener = {
+    .target = clip_target,
+    .send = clip_send,
+    .cancelled = clip_cancelled,
+    .dnd_drop_performed = clip_dnd_drop_performed,
+    .dnd_finished = clip_dnd_finished,
+    .action = clip_action,
+};
+
+static void copy_text(struct files *files, const char *text)
+{
+    if (!files->data_device) {
+        notify(files, "The compositor has no clipboard to copy to");
+        return;
+    }
+    char *copy = strdup(text);
+    if (!copy)
+        return;
+    struct wl_data_source *source = wl_data_device_manager_create_data_source(files->data_manager);
+    wl_data_source_add_listener(source, &clip_listener, files);
+    static const char *const types[] = {"text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING"};
+    for (size_t i = 0; i < sizeof types / sizeof *types; ++i)
+        wl_data_source_offer(source, types[i]);
+    wl_data_device_set_selection(files->data_device, source, files->input_serial);
+    if (files->clip_source)
+        wl_data_source_destroy(files->clip_source);
+    free(files->clip_text);
+    files->clip_source = source;
+    files->clip_text = copy;
+}
+
+/* Other clients' clipboard and drags: nothing is read from them yet, but
+   their offers are released. */
+static void device_data_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
+{
+    (void)data;
+    (void)device;
+    (void)offer;
+}
+
+static void device_enter(void *data, struct wl_data_device *device, uint32_t serial, struct wl_surface *surface,
+                         wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *offer)
+{
+    (void)data;
+    (void)device;
+    (void)serial;
+    (void)surface;
+    (void)x;
+    (void)y;
+    if (offer)
+        wl_data_offer_destroy(offer); /* Drops onto files come in 0.4. */
+}
+
+static void device_leave(void *data, struct wl_data_device *device)
+{
+    (void)data;
+    (void)device;
+}
+
+static void device_motion(void *data, struct wl_data_device *device, uint32_t time, wl_fixed_t x, wl_fixed_t y)
+{
+    (void)data;
+    (void)device;
+    (void)time;
+    (void)x;
+    (void)y;
+}
+
+static void device_drop(void *data, struct wl_data_device *device)
+{
+    (void)data;
+    (void)device;
+}
+
+static void device_selection(void *data, struct wl_data_device *device, struct wl_data_offer *offer)
+{
+    (void)device;
+    struct files *files = data;
+    if (files->selection_offer)
+        wl_data_offer_destroy(files->selection_offer);
+    files->selection_offer = offer;
+}
+
+static const struct wl_data_device_listener device_listener = {
+    .data_offer = device_data_offer,
+    .enter = device_enter,
+    .leave = device_leave,
+    .motion = device_motion,
+    .drop = device_drop,
+    .selection = device_selection,
+};
+
+/* Menus */
+
+enum {
+    MENU_OPEN,
+    MENU_OPEN_WITH,       /* index: into menu_apps */
+    MENU_OPEN_WITH_LIST,  /* The submenu of applications. */
+    MENU_RUN,
+    MENU_NEW_TAB,
+    MENU_COPY_PATH,
+    MENU_ADD_BOOKMARK,
+    MENU_REMOVE_BOOKMARK,
+    MENU_HIDDEN,
+    MENU_SORT_LIST,       /* The submenu of columns. */
+    MENU_SORT,            /* index: COLUMN_ */
+    MENU_DESCENDING,
+    MENU_REFRESH,
+    MENU_NOTHING,         /* A disabled line such as "No applications". */
+};
+
+static struct menu_item *menu_add(struct menu *menu, int action, int index, const char *label)
+{
+    static struct menu_item spare;
+    if (menu->count == MENU_ITEMS)
+        return &spare;
+    struct menu_item *item = &menu->items[menu->count++];
+    *item = (struct menu_item){.action = action, .index = index, .enabled = true};
+    snprintf(item->label, sizeof item->label, "%s", label);
+    return item;
+}
+
+static void menu_separator(struct menu *menu)
+{
+    if (menu->count && !menu->items[menu->count - 1].separator && menu->count < MENU_ITEMS)
+        menu->items[menu->count++] = (struct menu_item){.separator = true};
+}
+
+/* Sizes in logical pixels, from the longest label. */
+static void menu_measure(struct files *files, struct menu *menu)
+{
+    double scale = desk_window_scale(&files->window);
+    double font = font_pixels(files) / scale;
+    menu->item_height = (int)lround(font * 1.9);
+    menu->separator_height = (int)lround(font * 0.7);
+    menu->padding = 4;
+    int widest = 0;
+    for (size_t i = 0; i < menu->count; ++i) {
+        int width = desk_text_width(files->font, menu->items[i].label, strlen(menu->items[i].label));
+        if (width > widest)
+            widest = width;
+    }
+    /* A check column, the label, a gap and the submenu arrow. */
+    int text = (int)lround(widest / scale);
+    menu->width = text + 2 * menu->item_height + 24;
+    if (menu->width < 180)
+        menu->width = 180;
+    menu->height = 2 * menu->padding;
+    for (size_t i = 0; i < menu->count; ++i)
+        menu->height += menu->items[i].separator ? menu->separator_height : menu->item_height;
+}
+
+static int menu_item_top(const struct menu *menu, int index)
+{
+    int y = menu->padding;
+    for (int i = 0; i < index; ++i)
+        y += menu->items[i].separator ? menu->separator_height : menu->item_height;
+    return y;
+}
+
+/* The item at logical y, or -1. */
+static int menu_item_at(const struct menu *menu, double y)
+{
+    int top = menu->padding;
+    for (size_t i = 0; i < menu->count; ++i) {
+        int height = menu->items[i].separator ? menu->separator_height : menu->item_height;
+        if (y >= top && y < top + height)
+            return menu->items[i].separator ? -1 : (int)i;
+        top += height;
+    }
+    return -1;
+}
+
+static bool menu_choosable(const struct menu *menu, int index)
+{
+    return index >= 0 && (size_t)index < menu->count && !menu->items[index].separator &&
+           menu->items[index].enabled;
+}
+
+/* A check mark: two strokes, smoothed like the magnifier. */
+static void draw_check(DeskCanvas *canvas, int x, int y, int size, uint32_t color, uint32_t background)
+{
+    double points[3][2] = {{x + size * 0.15, y + size * 0.55}, {x + size * 0.4, y + size * 0.8},
+                           {x + size * 0.85, y + size * 0.2}};
+    double stroke = fmax(1.2, size * 0.12);
+    for (int py = y; py < y + size; ++py) {
+        for (int px = x; px < x + size; ++px) {
+            int hits = 0;
+            for (int i = 0; i < 16; ++i) {
+                double qx = px + (i % 4 + 0.5) / 4, qy = py + (i / 4 + 0.5) / 4;
+                for (int s = 0; s < 2; ++s) {
+                    double ax = points[s][0], ay = points[s][1], dx = points[s + 1][0] - ax,
+                           dy = points[s + 1][1] - ay;
+                    double t = ((qx - ax) * dx + (qy - ay) * dy) / (dx * dx + dy * dy);
+                    t = t < 0 ? 0 : t > 1 ? 1 : t;
+                    if (hypot(qx - (ax + t * dx), qy - (ay + t * dy)) <= stroke / 2) {
+                        ++hits;
+                        break;
+                    }
+                }
+            }
+            if (hits)
+                desk_canvas_fill(canvas, px, py, 1, 1, mix(background, color, (unsigned)(hits * 255 / 16)));
+        }
+    }
+}
+
+static void paint_menu(struct files *files, struct menu *menu, DeskCanvas *canvas)
+{
+    const struct colors *colors = &files->colors;
+    double scale = desk_window_scale(&menu->window);
+    int line = scale >= 2 ? (int)scale : 1;
+    uint32_t background = mix(colors->background, colors->muted, 25);
+    desk_canvas_fill(canvas, 0, 0, canvas->width, canvas->height, background);
+    uint32_t border = mix(colors->background, colors->muted, 110);
+    desk_canvas_fill(canvas, 0, 0, canvas->width, line, border);
+    desk_canvas_fill(canvas, 0, canvas->height - line, canvas->width, line, border);
+    desk_canvas_fill(canvas, 0, 0, line, canvas->height, border);
+    desk_canvas_fill(canvas, canvas->width - line, 0, line, canvas->height, border);
+    DeskFontMetrics metrics = desk_font_metrics(files->font);
+    int item_height = (int)lround(menu->item_height * scale);
+    int column = item_height; /* The check column's width. */
+    for (size_t i = 0; i < menu->count; ++i) {
+        const struct menu_item *item = &menu->items[i];
+        int top = (int)lround(menu_item_top(menu, (int)i) * scale);
+        if (item->separator) {
+            int height = (int)lround(menu->separator_height * scale);
+            desk_canvas_fill(canvas, column / 2, top + height / 2, canvas->width - column, line, border);
+            continue;
+        }
+        bool lit = (int)i == menu->hover && item->enabled;
+        if (lit)
+            desk_canvas_fill(canvas, line * 2, top, canvas->width - line * 4, item_height,
+                             colors->selection_background);
+        uint32_t color = !item->enabled ? colors->muted : lit ? colors->selection_foreground : colors->foreground;
+        uint32_t behind = lit ? colors->selection_background : background;
+        int baseline = top + (item_height - (metrics.ascent + metrics.descent)) / 2 + metrics.ascent;
+        if (item->checked) {
+            int size = item_height / 2;
+            draw_check(canvas, (column - size) / 2 + line * 2, top + (item_height - size) / 2, size, color, behind);
+        }
+        draw_clipped(files->font, canvas, column, canvas->width - column, baseline, item->label, color);
+        if (item->submenu) {
+            int half = item_height / 6, x = canvas->width - column / 2, y = top + item_height / 2;
+            for (int row = -half; row <= half; ++row) {
+                int reach = half - abs(row);
+                desk_canvas_fill(canvas, x - half / 2, y + row, reach + 1, 1, color);
+            }
+        }
+    }
+}
+
+static struct menu *menu_of(struct files *files, const DeskWindow *window)
+{
+    for (int i = 0; i < 2; ++i) {
+        if (files->menus[i].open && window == &files->menus[i].window)
+            return &files->menus[i];
+    }
+    return NULL;
+}
+
+/* The menu a pointer surface belongs to, or NULL for the window. */
+static struct menu *menu_at_surface(struct files *files, const struct wl_surface *surface)
+{
+    for (int i = 0; i < 2; ++i) {
+        if (files->menus[i].open && surface && files->menus[i].window.surface == surface)
+            return &files->menus[i];
+    }
+    return NULL;
+}
+
+static void menu_draw(void *data, DeskWindow *window)
+{
+    struct files *files = data;
+    struct menu *menu = menu_of(files, window);
+    DeskBuffer *buffer = desk_window_buffer(window, WL_SHM_FORMAT_XRGB8888);
+    if (!menu || !buffer)
+        return;
+    DeskCanvas canvas = desk_canvas(buffer->pixels, buffer->width, buffer->height);
+    paint_menu(files, menu, &canvas);
+    desk_window_commit(window, buffer);
+}
+
+static void close_menus(struct files *files);
+
+static void menu_dismissed(void *data, DeskWindow *window)
+{
+    (void)window;
+    close_menus(data);
+}
+
+static const DeskWindowListener menu_listener = {
+    .draw = menu_draw,
+    .close = menu_dismissed,
+};
+
+static void close_submenu(struct files *files)
+{
+    struct menu *sub = &files->menus[1];
+    if (sub->open) {
+        desk_window_close(&sub->window);
+        sub->open = false;
+    }
+}
+
+static void close_menus(struct files *files)
+{
+    close_submenu(files);
+    if (files->menus[0].open) {
+        desk_window_close(&files->menus[0].window);
+        files->menus[0].open = false;
+    }
+    free(files->menu_path);
+    files->menu_path = NULL;
+    for (size_t i = 0; i < files->menu_app_count; ++i)
+        free(files->menu_apps[i]);
+    files->menu_app_count = 0;
+}
+
+static bool menu_show(struct files *files, struct menu *menu, DeskWindow *parent, int x, int y)
+{
+    menu_measure(files, menu);
+    if (!desk_popup_open(&menu->window, &files->globals, parent, x, y, menu->width, menu->height, files->seat,
+                         files->input_serial, &menu_listener, files))
+        return false;
+    menu->open = true;
+    return true;
+}
+
+static void menu_first(struct menu *menu)
+{
+    menu->hover = -1;
+    for (size_t i = 0; i < menu->count && menu->hover < 0; ++i) {
+        if (menu_choosable(menu, (int)i))
+            menu->hover = (int)i;
+    }
+}
+
+/* Open with's applications for the file at path: the default first. */
+static void fill_open_with(struct files *files, struct menu *menu)
+{
+    DeskApps apps;
+    if (desk_apps_load(&apps) != 0)
+        return;
+    const char *mime = desk_mime_type(&apps, files->menu_path, base_name(files->menu_path));
+    const DeskApp *found[MENU_APPS];
+    size_t count = desk_apps_for(&apps, mime, found, MENU_APPS);
+    if (count > MENU_APPS)
+        count = MENU_APPS;
+    for (size_t i = 0; i < count; ++i) {
+        char *id = strdup(found[i]->id);
+        if (!id)
+            break;
+        files->menu_apps[files->menu_app_count] = id;
+        char label[160];
+        snprintf(label, sizeof label, i == 0 ? "%s (default)" : "%s", found[i]->name);
+        menu_add(menu, MENU_OPEN_WITH, (int)files->menu_app_count++, label);
+    }
+    if (!files->menu_app_count)
+        menu_add(menu, MENU_NOTHING, 0, "No applications for this type")->enabled = false;
+    desk_apps_free(&apps);
+}
+
+static void build_submenu(struct files *files, int item_index)
+{
+    struct menu *sub = &files->menus[1];
+    const struct menu_item *item = &files->menus[0].items[item_index];
+    *sub = (struct menu){.hover = -1, .parent_item = item_index};
+    if (item->action == MENU_OPEN_WITH_LIST) {
+        for (size_t i = 0; i < files->menu_app_count; ++i)
+            free(files->menu_apps[i]);
+        files->menu_app_count = 0;
+        fill_open_with(files, sub);
+    } else if (item->action == MENU_SORT_LIST) {
+        for (int c = 0; c < COLUMN_COUNT; ++c)
+            menu_add(sub, MENU_SORT, c, column_titles[c])->checked = files->sort == (enum column)c;
+        menu_separator(sub);
+        menu_add(sub, MENU_DESCENDING, 0, "Descending")->checked = files->sort_reverse;
+    }
+}
+
+static void open_submenu(struct files *files, int item_index, bool keyboard)
+{
+    struct menu *parent = &files->menus[0], *sub = &files->menus[1];
+    if (sub->open && sub->parent_item == item_index)
+        return;
+    close_submenu(files);
+    build_submenu(files, item_index);
+    if (keyboard)
+        menu_first(sub);
+    menu_show(files, sub, &parent->window, parent->width - 4, menu_item_top(parent, item_index) - sub->padding);
+}
+
+/* Fill the right-click menu for context. Return false when out of memory. */
+static bool build_menu(struct files *files, enum menu_context context, const char *path, bool directory,
+                       bool executable)
+{
+    struct menu *menu = &files->menus[0];
+    *menu = (struct menu){.hover = -1};
+    files->menu_context = context;
+    files->menu_path = strdup(path);
+    files->menu_directory = directory;
+    if (!files->menu_path)
+        return false;
+    if (context == CONTEXT_BACKGROUND) {
+        menu_add(menu, MENU_HIDDEN, 0, "Show hidden files")->checked = files->show_hidden;
+        menu_add(menu, MENU_SORT_LIST, 0, "Sort by")->submenu = true;
+        menu_separator(menu);
+        menu_add(menu, MENU_REFRESH, 0, "Refresh");
+        menu_add(menu, MENU_COPY_PATH, 0, "Copy path");
+    } else {
+        menu_add(menu, MENU_OPEN, 0, "Open");
+        if (directory) {
+            menu_add(menu, MENU_NEW_TAB, 0, "Open in new tab");
+        } else {
+            menu_add(menu, MENU_OPEN_WITH_LIST, 0, "Open with")->submenu = true;
+            if (executable)
+                menu_add(menu, MENU_RUN, 0, "Run");
+        }
+        menu_separator(menu);
+        menu_add(menu, MENU_COPY_PATH, 0, "Copy path");
+        if (directory) {
+            bool bookmarked = is_bookmarked(files, path);
+            if (!bookmarked)
+                menu_add(menu, MENU_ADD_BOOKMARK, 0, "Add to sidebar");
+            else if (context == CONTEXT_PLACE)
+                menu_add(menu, MENU_REMOVE_BOOKMARK, 0, "Remove from sidebar");
+        }
+    }
+    return true;
+}
+
+/* Build and open the right-click menu for context at x, y in the window. */
+static void open_menu(struct files *files, enum menu_context context, const char *path, bool directory,
+                      bool executable, int x, int y, bool keyboard)
+{
+    close_menus(files);
+    if (!build_menu(files, context, path, directory, executable))
+        return;
+    if (keyboard)
+        menu_first(&files->menus[0]);
+    menu_show(files, &files->menus[0], &files->window, x, y);
+}
+
+/* Run an executable: a script in the terminal, so its output can be
+   seen; a program on its own. */
+static void run_file(struct files *files, const char *path)
+{
+    DeskApps none = {0};
+    bool script = strcmp(desk_mime_type(&none, path, ""), "text/plain") == 0;
+    char *argv[] = {(char *)path, NULL};
+    char *directory = parent_path(path);
+    int error = desk_spawn(argv, script ? files->terminal : NULL, directory ? directory : files->path);
+    free(directory);
+    if (error)
+        notify(files, "Couldn't run %s: %s", base_name(path), strerror(error));
+}
+
+static void open_with(struct files *files, const char *path, const char *id)
+{
+    DeskApps apps;
+    if (desk_apps_load(&apps) != 0)
+        return;
+    const DeskApp *app = desk_app_find(&apps, id);
+    char *paths[] = {(char *)path};
+    char *directory = parent_path(path);
+    int error = app ? desk_app_launch(app, paths, 1, files->terminal, directory ? directory : files->path) : ENOENT;
+    free(directory);
+    if (error)
+        notify(files, "Couldn't start %s: %s", app ? app->name : id, strerror(error));
+    desk_apps_free(&apps);
+}
+
+static void menu_choose(struct files *files, struct menu *menu, int index, bool keyboard)
+{
+    if (!menu_choosable(menu, index))
+        return;
+    const struct menu_item *item = &menu->items[index];
+    if (item->submenu) {
+        open_submenu(files, index, keyboard);
+        return;
+    }
+    int action = item->action, which = item->index;
+    char *path = files->menu_path ? strdup(files->menu_path) : NULL;
+    char *app = action == MENU_OPEN_WITH && (size_t)which < files->menu_app_count ? strdup(files->menu_apps[which])
+                                                                                  : NULL;
+    bool directory = files->menu_directory;
+    close_menus(files);
+    if (!path)
+        return;
+    switch (action) {
+    case MENU_OPEN:
+        if (directory)
+            go_to(files, strdup(path), NULL);
+        else
+            open_file(files, path);
+        break;
+    case MENU_OPEN_WITH:
+        if (app)
+            open_with(files, path, app);
+        break;
+    case MENU_RUN:
+        run_file(files, path);
+        break;
+    case MENU_NEW_TAB:
+        new_tab(files, strdup(path), true);
+        break;
+    case MENU_COPY_PATH:
+        copy_text(files, path);
+        break;
+    case MENU_ADD_BOOKMARK:
+    case MENU_REMOVE_BOOKMARK: {
+        int error = change_bookmark(files, path, action == MENU_ADD_BOOKMARK);
+        if (error)
+            notify(files, "Couldn't change the bookmarks: %s", strerror(error));
+        build_places(files);
+        desk_window_redraw(&files->window);
+        break;
+    }
+    case MENU_HIDDEN:
+        toggle_hidden(files);
+        break;
+    case MENU_SORT:
+        if (files->sort != (enum column)which)
+            sort_by(files, (enum column)which);
+        break;
+    case MENU_DESCENDING:
+        files->sort_reverse = !files->sort_reverse;
+        save_state(files);
+        resort(files);
+        break;
+    case MENU_REFRESH:
+        refresh(files);
+        break;
+    default:
+        break;
+    }
+    free(app);
+    free(path);
+}
+
+/* The pointer moved over a menu: light the item, and open or close the
+   submenu to follow it. */
+static void menu_motion(struct files *files, struct menu *menu)
+{
+    int index = menu_item_at(menu, files->pointer_y);
+    if (index != menu->hover) {
+        menu->hover = index;
+        desk_window_redraw(&menu->window);
+    }
+    if (menu == &files->menus[0] && index >= 0) {
+        if (menu_choosable(menu, index) && menu->items[index].submenu)
+            open_submenu(files, index, false);
+        else
+            close_submenu(files);
+    }
+}
+
+static void menu_leave(struct files *files, struct menu *menu)
+{
+    /* The parent keeps its item lit while its submenu is open. */
+    if (menu == &files->menus[0] && files->menus[1].open)
+        return;
+    if (menu->hover >= 0) {
+        menu->hover = -1;
+        desk_window_redraw(&menu->window);
+    }
+}
+
+/* Keys while a menu is open. */
+static void menu_key(struct files *files, xkb_keysym_t sym)
+{
+    struct menu *main = &files->menus[0], *sub = &files->menus[1];
+    /* Keys go to the submenu once it has an item chosen. */
+    struct menu *menu = sub->open && sub->hover >= 0 ? sub : main;
+    switch (sym) {
+    case XKB_KEY_Up:
+    case XKB_KEY_Down: {
+        int step = sym == XKB_KEY_Down ? 1 : -1, count = (int)menu->count;
+        if (!count)
+            return;
+        int index = menu->hover;
+        for (int tries = 0; tries < count; ++tries) {
+            index = index < 0 ? (step > 0 ? 0 : count - 1) : (index + step + count) % count;
+            if (menu_choosable(menu, index))
+                break;
+        }
+        if (menu_choosable(menu, index)) {
+            menu->hover = index;
+            desk_window_redraw(&menu->window);
+            if (menu == main && sub->open && sub->parent_item != index)
+                close_submenu(files);
+        }
+        return;
+    }
+    case XKB_KEY_Right:
+        if (menu == main && menu_choosable(main, main->hover) && main->items[main->hover].submenu)
+            open_submenu(files, main->hover, true);
+        return;
+    case XKB_KEY_Left:
+        if (menu == sub)
+            close_submenu(files);
+        return;
+    case XKB_KEY_Escape:
+        if (menu == sub)
+            close_submenu(files);
+        else
+            close_menus(files);
+        return;
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+    case XKB_KEY_space:
+        menu_choose(files, menu, menu->hover, true);
+        return;
+    default:
+        return;
+    }
+}
+
+/* The right-click menu for what's at the pointer in the window. */
+static void context_click(struct files *files, struct target target)
+{
+    int x = (int)lround(files->pointer_x), y = (int)lround(files->pointer_y);
+    if (target.kind == TARGET_ROW) {
+        files->cursor = target.index;
+        files->free_scroll = false;
+        desk_window_redraw(&files->window);
+        struct entry *entry = cursor_entry(files);
+        char *path = entry ? join_path(files->path, entry->name) : NULL;
+        if (path)
+            open_menu(files, CONTEXT_ENTRY, path, entry->directory, entry->executable && !entry->directory, x, y,
+                      false);
+        free(path);
+    } else if (target.kind == TARGET_PLACE) {
+        const struct place *place = &files->places[target.index];
+        open_menu(files, CONTEXT_PLACE, place->path, true, false, x, y, false);
+    } else if (target.kind == TARGET_NONE && in_list(files) && pointer_buffer_y(files) >= files->panes.entries_top) {
+        open_menu(files, CONTEXT_BACKGROUND, files->path, true, false, x, y, false);
+    }
+}
+
+/* Menu or Shift+F10: the menu for the selected entry, at its row. */
+static void context_key(struct files *files)
+{
+    const struct panes *panes = &files->panes;
+    double scale = desk_window_scale(&files->window);
+    struct entry *entry = cursor_entry(files);
+    size_t per_line = columns(files);
+    if (!entry) {
+        open_menu(files, CONTEXT_BACKGROUND, files->path, true, false, (int)lround(panes->list_left / scale),
+                  (int)lround(panes->entries_top / scale), true);
+        return;
+    }
+    long line = (long)(files->cursor / per_line) - (long)files->top;
+    if (line < 0 || line >= panes->rows)
+        line = 0;
+    int x = panes->list_left + (int)(files->cursor % per_line) * panes->tile_width + panes->line_height;
+    int y = panes->entries_top + (int)(line + 1) * panes->line_height;
+    char *path = join_path(files->path, entry->name);
+    if (path)
+        open_menu(files, CONTEXT_ENTRY, path, entry->directory, entry->executable && !entry->directory,
+                  (int)lround(x / scale), (int)lround(y / scale), true);
+    free(path);
 }
 
 /* Everything clickable lights up under the pointer except entries. */
@@ -3253,11 +4164,18 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
                           wl_fixed_t x, wl_fixed_t y)
 {
     (void)pointer;
-    (void)surface;
     struct files *files = data;
     files->pointer_serial = serial;
+    files->pointer_surface = surface;
     files->pointer_x = wl_fixed_to_double(x);
     files->pointer_y = wl_fixed_to_double(y);
+    struct menu *menu = menu_at_surface(files, surface);
+    if (menu) {
+        if (files->cursor_shape)
+            wp_cursor_shape_device_v1_set_shape(files->cursor_shape, serial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+        menu_motion(files, menu);
+        return;
+    }
     update_hover(files, true);
 }
 
@@ -3265,8 +4183,15 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
 {
     (void)pointer;
     (void)serial;
-    (void)surface;
     struct files *files = data;
+    struct menu *menu = menu_at_surface(files, surface);
+    files->pointer_surface = NULL;
+    if (menu) {
+        menu_leave(files, menu);
+        return;
+    }
+    if (surface != files->window.surface)
+        return; /* A menu that has closed. */
     if (files->drag || files->resizing)
         save_state(files);
     files->drag = false;
@@ -3283,7 +4208,10 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     struct files *files = data;
     files->pointer_x = wl_fixed_to_double(x);
     files->pointer_y = wl_fixed_to_double(y);
-    if (files->drag)
+    struct menu *menu = menu_at_surface(files, files->pointer_surface);
+    if (menu)
+        menu_motion(files, menu);
+    else if (files->drag)
         set_sidebar_width(files, files->pointer_x - PADDING * 1.5);
     else if (files->resizing)
         resize_column(files, files->resizing);
@@ -3295,9 +4223,16 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
                            uint32_t button, uint32_t state)
 {
     (void)pointer;
-    (void)serial;
     struct files *files = data;
     bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+    if (pressed)
+        files->input_serial = serial;
+    struct menu *menu = menu_at_surface(files, files->pointer_surface);
+    if (menu) {
+        if (pressed && (button == BTN_LEFT || button == BTN_RIGHT))
+            menu_choose(files, menu, menu_item_at(menu, files->pointer_y), false);
+        return;
+    }
     if (button == BTN_SIDE || button == BTN_BACK) {
         if (pressed)
             go_back(files);
@@ -3307,8 +4242,11 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     } else if (button == BTN_MIDDLE) {
         if (pressed)
             middle_click(files);
+    } else if (button == BTN_RIGHT) {
+        if (pressed)
+            context_click(files, target_at(files));
     } else if (button != BTN_LEFT) {
-        /* Right-click opens a menu in 0.3. */
+        /* Other buttons do nothing. */
     } else if (pressed) {
         click(files, time);
     } else if (files->drag || files->resizing) {
@@ -3339,6 +4277,10 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
     int steps = files->scroll_steps;
     double pixels = files->scroll_pixels;
     files->scroll_steps = 0;
+    if (menu_at_surface(files, files->pointer_surface)) {
+        files->scroll_pixels = 0; /* Menus don't scroll. */
+        return;
+    }
     if (desk_keyboard_mods(&files->keyboard) & DESK_MOD_CTRL) {
         files->scroll_pixels = 0;
         if (!steps) {
@@ -3452,7 +4394,10 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     struct files *files = data;
     if (desk_globals_bind(&files->globals, registry, name, interface, version))
         return;
-    if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
+    if (strcmp(interface, wl_data_device_manager_interface.name) == 0 && !files->data_manager) {
+        files->data_manager = wl_registry_bind(registry, name, &wl_data_device_manager_interface,
+                                               version < 3 ? version : 3);
+    } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
         files->cursor_shape_manager = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (strcmp(interface, wl_seat_interface.name) == 0 && !files->seat) {
         /* Version 5 adds wl_keyboard.release. */
@@ -3510,6 +4455,10 @@ static bool open_window(struct files *files)
     /* The seat's capabilities may have arrived before the cursor shape manager. */
     if (files->pointer && files->cursor_shape_manager && !files->cursor_shape)
         files->cursor_shape = wp_cursor_shape_manager_v1_get_pointer(files->cursor_shape_manager, files->pointer);
+    if (files->data_manager && files->seat) {
+        files->data_device = wl_data_device_manager_get_data_device(files->data_manager, files->seat);
+        wl_data_device_add_listener(files->data_device, &device_listener, files);
+    }
     if (!desk_window_open(&files->window, &files->globals, "files", &window_listener, files)) {
         fprintf(stderr, "files: out of memory\n");
         return false;
@@ -3520,7 +4469,17 @@ static bool open_window(struct files *files)
 
 static void close_window(struct files *files)
 {
+    close_menus(files);
     desk_window_close(&files->window);
+    if (files->clip_source)
+        wl_data_source_destroy(files->clip_source);
+    free(files->clip_text);
+    if (files->selection_offer)
+        wl_data_offer_destroy(files->selection_offer);
+    if (files->data_device)
+        wl_data_device_release(files->data_device);
+    if (files->data_manager)
+        wl_data_device_manager_destroy(files->data_manager);
     if (files->wl_keyboard)
         wl_keyboard_release(files->wl_keyboard);
     if (files->cursor_shape)
@@ -3723,6 +4682,7 @@ int main(int argc, char **argv)
     files.mounts = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
     files.sizer = sizer_create(); /* Without it, directories just show no size. */
     files.terminal = terminal_command();
+    files.bookmarks_path = bookmarks_file();
     signal(SIGCHLD, SIG_IGN); /* Applications started are left to themselves. */
     files.tabs = calloc(1, sizeof *files.tabs);
     if (!files.tabs) {
@@ -3751,6 +4711,7 @@ int main(int argc, char **argv)
     sizer_destroy(files.sizer);
     free(files.sized_path);
     free(files.terminal);
+    free(files.bookmarks_path);
     listing_free(&files.listing);
     places_free(files.places, files.place_count);
     free(files.toolbar.crumbs);

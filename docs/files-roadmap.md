@@ -44,7 +44,7 @@ dwl already supports everything files needs: xdg-shell, viewporter, fractional s
 | A plain xdg-shell window with scale tracking (`DeskWindow`: surface, toplevel, viewport, fractional scale, configure and close) | 1 | 0.1 | Step 4, for toplevels. view moves onto it |
 | Desktop entries, `mimeapps.list` and launching (`-DDESK_APPS`: `desk_apps_load`, `desk_apps_for`, `desk_app_launch` with field codes and a detached spawn, `desk_mimeapps_set_default`) | 0 | 0.3 (done) | None yet. run moves onto the parser later |
 | MIME type of a file (`desk_mime_type`: globs2, built-in table, sniffing) | 0 | 0.3 (done) | None |
-| Popup menus (`xdg_popup` with a grab, positioned against the window, closing on a click outside) | 1 | 0.3 | Step 4, for popups. bar's menus could move onto it |
+| Popup menus (`xdg_popup` with a grab, positioned against the window, closing on a click outside) | 1 | 0.3 (done: `desk_popup_open`) | Step 4, for popups. bar's menus could move onto it |
 | A one-line text field (cursor, selection, word movement, clipboard paste), for the path, search, rename and the picker's name | 2 | 0.3 | None. run's prompt could move onto it |
 
 Moving view onto the keyboard and window pieces happens in the same milestone that adds them, so there are never two copies. bar, run and wall move to the font layer in Phase 3 step 5, not here.
@@ -155,7 +155,7 @@ Like a file explorer: a toolbar along the top, a sidebar of places on the left, 
 
 ## 0.3: Opening, menus and finding
 
-Progress: opening files, the standard keys and type to select are in (0.3.0), with desk's new `DESK_APPS` piece (desktop entries, `mimeapps.list`, MIME types, launching). The menu, Open with, typing a path and bookmarks are next. Sorting moved into 0.2.
+Progress: opening files, the standard keys and type to select are in (0.3.0), with desk's new `DESK_APPS` piece (desktop entries, `mimeapps.list`, MIME types, launching). The right-click menu with Open with, Run, Copy path and bookmarks followed (0.3.1), on desk's new popups. Left: the "Other application…" dialog and typing a path. Sorting moved into 0.2.
 
 ### Opening files
 
@@ -440,7 +440,7 @@ How applications pick up the portal (to confirm against the installed versions):
 |---|---|---|
 | 0.1 | One directory, keyboard navigation, live refresh; desk gains the font layer, keyboard and window, view moves onto them | Done (key checks and fractional scale pending) |
 | 0.2 | Sidebar of places, toolbar with back, forward, up and the path, mouse, tabs, search, list and icon views, zoom, sortable resizable columns, folder sizes | Done (live key and mouse checks pending) |
-| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | In progress: opening, keys and type to select done |
+| 0.3 | Double-click to open, the right-click menu and Open with, typing a path, bookmarks, standard keys | In progress: all but the Open with dialog and typing a path |
 | 0.4 | Selecting with Ctrl/Shift/rubber band, cut, copy, paste, rename, new folder, trash, undo, drag and drop, dialogs, progress, properties | Not started |
 | 0.5 | Thumbnails in the icon view, drag and drop with other apps, hover, config, palette, desktop entry | Not started |
 | 0.6 | File picker: `--pick` and `--save` with Open and Cancel buttons, the FileChooser portal backend for browsers and other apps | Not started |
